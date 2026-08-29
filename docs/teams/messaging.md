@@ -4,7 +4,7 @@ This document defines the only approved way for B-2 teams to communicate about b
 
 All teams must follow this system.
 
-Valid team keys: `interpreter`, `baseline_noir`, `ir`, `passes`, `regalloc`, `codegen`, `aot`, and `all`.
+Valid team keys: `frontend`, `interpreter`, `baseline_noir`, `ir`, `passes`, `regalloc`, `codegen`, `aot`, and `all`.
 
 ---
 

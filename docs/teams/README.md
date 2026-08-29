@@ -61,6 +61,37 @@ Tier-to-team mapping:
 - T1 belongs to the **Baseline No-IR Team** (no IR graph — Amendment A).
 - T2 belongs to the **IR, Passes, RegAlloc, and Codegen Teams** jointly, each inside its owned area.
 - T3 belongs to the **AOT Team** as driver; it reuses the same T2 optimizer pipeline (Amendment B).
+- The source path (Java source -> AST -> RBC) belongs to the **Frontend Team**. It is tier-independent: it lowers source into RBC, the same level the classfile Loader/Verifier/Quickener path delivers to, and the tiers take over from there.
+
+---
+
+## Macro Structure
+
+The user-facing build order for B-2, in three macro stages:
+
+```text
+Java source (.java)
+      |
+      v
+Frontend (source -> AST: lexer, parser, diagnostics)
+      |
+      v  (future: AST -> RBC lowering)
+Middle End (RBC, IR Team, Passes Team, Interpreter Team,
+            Baseline No-IR Team; tiers T0/T1/T2)
+      |
+      v
+Backend (RegAlloc Team, Codegen Team; AOT Team drives T3 offline)
+```
+
+Java classfiles enter the same pipeline at the Register Bytecode (RBC) level via the Loader/Verifier/Quickener path (see the Tier Model above). The source path joins them there once AST-to-RBC lowering lands.
+
+---
+
+## Current Status
+
+- Frontend (v0) is in implementation now: lexer, recursive-descent parser, lossless position-annotated AST, diagnostics with error recovery, the `b2parse` driver, and `tests/frontend/` (unit + corpus tests). See `docs/teams/frontend-team.md` and `docs/frontend_contract.md`.
+- Middle end (RBC, IR, passes, interpreter and baseline tiers) comes next.
+- Backend (regalloc, codegen, AOT) follows.
 
 ---
 
@@ -92,6 +123,7 @@ The reviewer does **not** rewrite the implementation unless explicitly reassigne
 
 | Team | Implementer | Reviewer | Tier | Primary Ownership |
 |---|---|---|---|---|
+| Frontend Team | `FRONTEND-IMPL` | `FRONTEND-REV` | source path | Java-source frontend: lexer, parser, lossless AST, diagnostics, `b2parse`; future AST-to-RBC lowering |
 | Interpreter Team | `INTERP-IMPL` | `INTERP-REV` | T0 | Direct-threaded register interpreter, RBC execution, profiling, T0 state contract |
 | Baseline No-IR Team | `BASELINE-IMPL` | `BASELINE-REV` | T1 | Template/copy-and-patch no-IR baseline JIT |
 | IR Team | `IR-IMPL` | `IR-REV` | T2/T3 | Sea-of-nodes IR core, node kinds, effect model, verifier data structures |
@@ -100,7 +132,7 @@ The reviewer does **not** rewrite the implementation unless explicitly reassigne
 | Codegen Team | `CODEGEN-IMPL` | `CODEGEN-REV` | T2/T3 | Lowering, machine code emission, safepoints, deopt stubs, ABI output |
 | AOT Team | `AOT-IMPL` | `AOT-REV` | T3 | AOT driver, manifests, artifact validation |
 
-Seven teams of two.
+Eight teams of two.
 
 If fewer teams are desired initially, AOT can be merged into Passes/Codegen — but for a real compiler experiment, a separate AOT team is preferred.
 
@@ -122,6 +154,7 @@ Forbidden examples:
 - IR Team changing optimization budgets
 - Baseline No-IR Team building any IR graph or running any optimization pass (Amendment A)
 - AOT Team forking the optimizer instead of driving the shared T2 pipeline (Amendment B)
+- Frontend Team constructing IR graphs or emitting machine code (the frontend stops at the AST until AST-to-RBC lowering is contracted)
 - Interpreter Team changing the RBC encoding without an advisory to all compiled tiers
 
 Cross-area work without an approved message is a rule violation.
@@ -170,6 +203,7 @@ Test ownership:
 
 | Team | Test Path |
 |---|---|
+| Frontend Team | `tests/frontend/` |
 | Interpreter Team | `tests/interp/` |
 | Baseline No-IR Team | `tests/baseline/` |
 | IR Team | `tests/ir/` |
@@ -204,6 +238,7 @@ No team may unilaterally change another team's contract.
 
 Each team has its own charter:
 
+- `docs/teams/frontend-team.md`
 - `docs/teams/interpreter-team.md`
 - `docs/teams/baseline-noir-team.md`
 - `docs/teams/ir-team.md`

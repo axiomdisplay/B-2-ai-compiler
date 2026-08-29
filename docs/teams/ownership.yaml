@@ -1,6 +1,6 @@
 # B-2 Path Ownership Map
 #
-# Machine-readable ownership for the seven B-2 AI teams.
+# Machine-readable ownership for the eight B-2 AI teams.
 # CI must fail any PR that touches paths outside the submitting team's write list.
 # Team doc reference: docs/teams/README.md
 # Message system:     docs/teams/messaging.md
@@ -14,8 +14,17 @@
 #
 # The T1 baseline (baseline_noir) intentionally owns no IR paths (Amendment A).
 # The AOT team drives the shared T2 pipeline; it must not fork it (Amendment B).
+# The frontend owns the Java-source path (source -> AST); AST -> RBC lowering
+# will be contracted via messages before it lands.
 
 teams:
+  frontend:
+    write:
+      - compiler/frontend/
+      - include/b2/frontend/
+      - tests/frontend/
+      - docs/frontend_contract.md
+
   interpreter:
     write:
       - compiler/interp/
