@@ -1,0 +1,30 @@
+# Lazy class initialization (JVMS 5.5): the first getstatic of Main.value
+# pushes <clinit>()V, which stores 41 and bumps it to 42; the getstatic then
+# re-executes and reads 42.
+# NOTE: the text grammar accepts <clinit> as a plain method-name word token
+# (it is not a label, so the identifier rule does not apply to it).
+
+.class Main
+
+.method static <clinit> ()V
+.regs 1
+.locals 0
+.const c0 = field Main value I
+iconst r0 41
+iinc r0 1
+putstatic r0 c0
+return
+.end
+
+.method static main ()V
+.regs 4
+.locals 0
+.const c0 = field Main value I
+.const c1 = field java/lang/System out Ljava/io/PrintStream;
+.const c2 = method java/io/PrintStream println (I)V
+getstatic r0 c0
+getstatic r1 c1
+imove r2 r0
+invokevirtual r3 r1 r2 c2
+return
+.end

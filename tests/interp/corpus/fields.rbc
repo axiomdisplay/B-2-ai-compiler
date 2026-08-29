@@ -1,0 +1,41 @@
+# new + putfield/getfield counter accumulated across three calls to
+# bump(Object): the field slot grows lazily on first store (the instance is
+# allocated before the field is ever resolved).
+
+.class Main
+
+.method static main ()V
+.regs 5
+.locals 1
+.const c0 = class "Main"
+.const c1 = method Main bump (Ljava/lang/Object;)V
+.const c2 = field java/lang/System out Ljava/io/PrintStream;
+.const c3 = method java/io/PrintStream println (I)V
+.const c4 = field Main count I
+new r0 c0
+astore r0 l0
+aload r0 l0
+invokestatic r1 r0 r1 c1
+aload r0 l0
+invokestatic r1 r0 r1 c1
+aload r0 l0
+invokestatic r1 r0 r1 c1
+getstatic r0 c2
+aload r1 l0
+getfield r1 r1 c4
+invokevirtual r2 r0 r2 c3
+return
+.end
+
+.method static bump (Ljava/lang/Object;)V
+.regs 4
+.locals 1
+.const c0 = field Main count I
+aload r0 l0
+getfield r1 r0 c0
+iconst r2 1
+iadd r3 r1 r2
+aload r0 l0
+putfield r0 r0 r3 c0
+return
+.end

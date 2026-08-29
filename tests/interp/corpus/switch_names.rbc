@@ -1,0 +1,35 @@
+# tableswitch over the dense range 0..2 with the pinned fall-through
+# default (pc+1): "two" is selected.
+
+.class Main
+
+.method static main ()V
+.regs 4
+.locals 0
+.const c0 = field java/lang/System out Ljava/io/PrintStream;
+.const c1 = method java/io/PrintStream println (Ljava/lang/String;)V
+.const c2 = string "zero"
+.const c3 = string "one"
+.const c4 = string "two"
+.const c5 = string "many"
+.const c6 = switch { 0:Lzero 1:Lone 2:Ltwo default:Ldflt }
+getstatic r0 c0
+iconst r1 2
+tableswitch r1 c6
+Ldflt:
+ldc r1 c5
+invokevirtual r2 r0 r2 c1
+return
+Lzero:
+ldc r1 c2
+invokevirtual r2 r0 r2 c1
+return
+Lone:
+ldc r1 c3
+invokevirtual r2 r0 r2 c1
+return
+Ltwo:
+ldc r1 c4
+invokevirtual r2 r0 r2 c1
+return
+.end

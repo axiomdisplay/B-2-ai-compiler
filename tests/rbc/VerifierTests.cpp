@@ -324,6 +324,35 @@ B2_TEST(rbc_verify_reject_uninitialized_register_use) {
   checkReject(m, "found bottom");
 }
 
+B2_TEST(rbc_verify_accept_wide_range_r0_delivery) {
+  // Regression pin (interpreter-team bug report, BE-4): a protected range
+  // covering >= 2 instructions must still deliver the exception in r0 at
+  // handler entry (rbc_spec.md SS5.3). The exception-edge join used to
+  // reset r0 to Bottom on every re-join into a visited handler block, so
+  // any realistic try block whose handler reads r0 failed verification
+  // with "astore expects ref in r0, found bottom".
+  Method m = makeMethod("wide", "(I)I", method_flags::Static, 2, 2);
+  m.code.push_back(Ins(Op::Iconst, 1, 0, 0, 0));    // pc0: r1 = 0
+  m.code.push_back(Ins(Op::Istore, 0, 1, 0, 0));    // pc1: l0 = Int (stable)
+  m.code.push_back(Ins(Op::Iload, 0, 0, 0, 0));     // pc2 <- range start
+  m.code.push_back(Ins(Op::Iconst, 1, 0, 0, 7));    // pc3
+  m.code.push_back(Ins(Op::Idiv, 1, 1, 0, 0));      // pc4 (traps)
+  m.code.push_back(Ins(Op::Ireturn, 0, 1, 0, 0));   // pc5 <- range end
+  m.code.push_back(Ins(Op::Astore, 0, 0, 0, 1));    // pc6: handler reads r0
+  m.code.push_back(Ins(Op::Iload, 0, 0, 0, 0));     // pc7: discard, return 0
+  m.code.push_back(Ins(Op::Ireturn, 0, 0, 0, 0));   // pc8
+  ExceptionHandler h;
+  h.start = 2;
+  h.end = 6;
+  h.handler = 6;
+  h.catchType = -1;
+  m.handlers.push_back(h);
+  const auto r = verify(m);
+  CHECK_MSG(r.ok, r.diags.empty() ? "wide-range handler must verify"
+                                  : "wide-range handler must verify: " +
+                                        r.diags.front().message);
+}
+
 B2_TEST(rbc_verify_reject_local_type_instability) {
   // l1 is Int at the start of the protected range but becomes Null inside
   // it (astore at pc5): the handler could observe either type, which the

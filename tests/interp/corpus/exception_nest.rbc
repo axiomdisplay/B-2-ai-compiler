@@ -1,0 +1,43 @@
+# Throw at depth 2 (leaf), unwind through mid, catch at depth 0 via the
+# builtin hierarchy (catch java/lang/Exception catches ArithmeticException).
+
+.class Main
+
+.method static main ()V
+.regs 5
+.locals 1
+.const c0 = method Main mid ()V
+.const c1 = class "java/lang/Exception"
+.const c2 = field java/lang/System out Ljava/io/PrintStream;
+.const c3 = method java/io/PrintStream println (I)V
+Ltry:
+invokestatic r1 r0 r1 c0
+Lend:
+getstatic r2 c2
+iconst r3 0
+invokevirtual r4 r2 r2 c3
+return
+Lh:
+getstatic r2 c2
+iconst r3 1
+invokevirtual r4 r2 r2 c3
+return
+.catch c1 from Ltry to Lend handler Lh
+.end
+
+.method static mid ()V
+.regs 2
+.locals 0
+.const c0 = method Main leaf ()V
+invokestatic r1 r0 r1 c0
+return
+.end
+
+.method static leaf ()V
+.regs 2
+.locals 0
+.const c0 = class "java/lang/ArithmeticException"
+new r0 c0
+athrow r0
+return
+.end

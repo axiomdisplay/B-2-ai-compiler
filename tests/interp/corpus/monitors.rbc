@@ -1,0 +1,25 @@
+# monitorenter/monitorexit bracketing a computation (balanced; the frame's
+# monitor record is empty again by the time main returns).
+
+.class Main
+
+.method static main ()V
+.regs 5
+.locals 1
+.const c0 = class "Main"
+.const c1 = field java/lang/System out Ljava/io/PrintStream;
+.const c2 = method java/io/PrintStream println (I)V
+new r0 c0
+astore r0 l0
+aload r0 l0
+monitorenter r0
+iconst r1 20
+iconst r2 22
+iadd r3 r1 r2
+aload r0 l0
+monitorexit r0
+getstatic r0 c1
+imove r1 r3
+invokevirtual r2 r0 r2 c2
+return
+.end

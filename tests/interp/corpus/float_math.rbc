@@ -1,0 +1,37 @@
+# Float/double printing uses Java's exact formatting rules (JDK
+# Double.toString / Float.toString):
+#   1.5f + 2.25f            -> 3.75
+#   1.0 / 3.0               -> 0.3333333333333333
+#   (float) 0.1             -> 0.1
+# fconst carries IEEE 754 bit patterns (rbc_spec.md SS3.2):
+#   1.5f = 0x3FC00000 = 1069547520, 2.25f = 0x40100000 = 1074790400,
+#   0.1f = 0x3DCCCCCD = 1036831949.
+
+.class Main
+
+.method static main ()V
+.regs 6
+.locals 0
+.const c0 = field java/lang/System out Ljava/io/PrintStream;
+.const c1 = method java/io/PrintStream println (F)V
+.const c2 = method java/io/PrintStream println (D)V
+.const c3 = double 1.0
+.const c4 = double 3.0
+fconst r0 1069547520
+fconst r1 1074790400
+fadd r2 r0 r1
+getstatic r3 c0
+fmove r4 r2
+invokevirtual r5 r3 r2 c1
+dconst r0 c3
+dconst r1 c4
+ddiv r2 r0 r1
+getstatic r3 c0
+dmove r4 r2
+invokevirtual r5 r3 r2 c2
+fconst r0 1036831949
+getstatic r3 c0
+fmove r4 r0
+invokevirtual r5 r3 r2 c1
+return
+.end

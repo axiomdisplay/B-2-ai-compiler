@@ -89,9 +89,10 @@ Java classfiles enter the same pipeline at the Register Bytecode (RBC) level via
 
 ## Current Status
 
-- Frontend (v0) is in implementation now: lexer, recursive-descent parser, lossless position-annotated AST, diagnostics with error recovery, the `b2parse` driver, and `tests/frontend/` (unit + corpus tests). See `docs/teams/frontend-team.md` and `docs/frontend_contract.md`.
-- Middle end (RBC, IR, passes, interpreter and baseline tiers) comes next.
-- Backend (regalloc, codegen, AOT) follows.
+- Frontend (v0) complete: lexer, recursive-descent parser, lossless position-annotated AST, diagnostics with error recovery, the `b2parse` driver, and `tests/frontend/` (46 unit tests + 24-file corpus, all green). See `docs/teams/frontend-team.md` and `docs/frontend_contract.md`.
+- Middle end (v0) complete: RBC specification, 150-opcode core, builder, structural/type verifier, deterministic text format, the `b2rbc` driver, and `tests/rbc/` (79 tests + corpus, all green). See `docs/rbc_spec.md`.
+- Backend kickoff (T0 interpreter v0) complete: direct-threaded register interpreter executing all 150 RBC opcodes, the v0 reference runtime (object model, monitors, exceptions with JVM messages, builtin println with JDK-exact float formatting, string interning, lazy class init), inline caches, safepoint polls, saturating profile counters, the deopt entry point (`resume`), the `b2run` driver, and `tests/interp/` (125 tests + 14-program runnable corpus, all green). The published T0 state contract is `docs/interp_contract.md` (v1.0.0) — normative for every compiled tier's deopt path.
+- Next: T1 baseline kickoff (stencil selection/plan per `docs/stencils.md`), frontend semantic binding, then AST -> RBC lowering.
 
 ---
 

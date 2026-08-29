@@ -1,0 +1,36 @@
+# String interning (JVMS 5.1): two ldc of the same constant are the same
+# object (if_acmpeq true); different constants are different objects.
+
+.class Main
+
+.method static main ()V
+.regs 6
+.locals 0
+.const c0 = field java/lang/System out Ljava/io/PrintStream;
+.const c1 = method java/io/PrintStream println (I)V
+.const c2 = string "same"
+.const c3 = string "other"
+ldc r0 c2
+ldc r1 c2
+if_acmpeq r0 r1 Leq
+iconst r2 0
+goto Lp1
+Leq:
+iconst r2 1
+Lp1:
+getstatic r3 c0
+imove r4 r2
+invokevirtual r5 r3 r2 c1
+ldc r0 c2
+ldc r1 c3
+if_acmpeq r0 r1 Leq2
+iconst r2 0
+goto Lp2
+Leq2:
+iconst r2 1
+Lp2:
+getstatic r3 c0
+imove r4 r2
+invokevirtual r5 r3 r2 c1
+return
+.end

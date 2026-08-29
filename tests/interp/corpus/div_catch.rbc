@@ -1,0 +1,33 @@
+# 10 / 0 caught: print the exception's detailMessage (a real String field
+# readable via getfield) and the caught-status code.
+# The protected range covers exactly the idiv: handler entry sees r0 = the
+# exception (rbc_spec.md SS5.3) while every other register dies.
+
+.class Main
+
+.method static main ()V
+.regs 5
+.locals 1
+.const c0 = field java/lang/System out Ljava/io/PrintStream;
+.const c1 = method java/io/PrintStream println (Ljava/lang/String;)V
+.const c2 = method java/io/PrintStream println (I)V
+.const c3 = field java/lang/Throwable detailMessage Ljava/lang/String;
+.const c4 = class "java/lang/ArithmeticException"
+iconst r0 10
+iconst r1 0
+Ltry:
+idiv r2 r0 r1
+Lend:
+return
+Lh:
+astore r0 l0
+getstatic r0 c0
+aload r1 l0
+getfield r1 r1 c3
+invokevirtual r2 r0 r2 c1
+getstatic r0 c0
+iconst r1 1
+invokevirtual r2 r0 r2 c2
+return
+.catch c4 from Ltry to Lend handler Lh
+.end

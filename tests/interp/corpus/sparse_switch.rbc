@@ -1,0 +1,34 @@
+# lookupswitch with sparse keys {10, 20, 35}: key 20 dispatches to "twenty".
+
+.class Main
+
+.method static main ()V
+.regs 4
+.locals 0
+.const c0 = field java/lang/System out Ljava/io/PrintStream;
+.const c1 = method java/io/PrintStream println (Ljava/lang/String;)V
+.const c2 = string "ten"
+.const c3 = string "twenty"
+.const c4 = string "thirtyfive"
+.const c5 = string "other"
+.const c6 = switch { 10:Lten 20:Ltwenty 35:Lthirtyfive default:Ldflt }
+getstatic r0 c0
+iconst r1 20
+lookupswitch r1 c6
+Ldflt:
+ldc r1 c5
+invokevirtual r2 r0 r2 c1
+return
+Lten:
+ldc r1 c2
+invokevirtual r2 r0 r2 c1
+return
+Ltwenty:
+ldc r1 c3
+invokevirtual r2 r0 r2 c1
+return
+Lthirtyfive:
+ldc r1 c4
+invokevirtual r2 r0 r2 c1
+return
+.end

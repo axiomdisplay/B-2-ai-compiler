@@ -1070,12 +1070,22 @@ void verifyImpl(const Method& m, VerifyResult& r) {
             enq(hb);
           } else {
             bool changed = false;
-            // join(X, Bottom) == Bottom for every X: setting the handler's
-            // registers to all-Bottom IS the exact element-wise join.
+            // The exception edge's register state is r0 = Ref (the delivered
+            // exception, rbc_spec.md SS5.3 spec pin) with every other
+            // register Bottom. Join against THAT edge state - joining against
+            // all-Bottom would clobber the r0 delivery pin whenever a second
+            // edge (any later pc of a multi-instruction protected range)
+            // joins into an already-visited handler, which is every realistic
+            // try block. For i > 0, join(X, Bottom) == Bottom (exact
+            // element-wise join, unchanged); r0 stays Ref across pure
+            // exception edges and degrades to Bottom only when a normal edge
+            // brought an incompatible r0 type (conservative and sound).
             for (std::size_t i = 0; i < inStates[hb].regs.size(); ++i) {
               tick();
-              if (inStates[hb].regs[i] != RType::Bottom) {
-                inStates[hb].regs[i] = RType::Bottom;
+              const RType edgeReg = (i == 0) ? RType::Ref : RType::Bottom;
+              const RType j = join(inStates[hb].regs[i], edgeReg);
+              if (j != inStates[hb].regs[i]) {
+                inStates[hb].regs[i] = j;
                 changed = true;
               }
             }

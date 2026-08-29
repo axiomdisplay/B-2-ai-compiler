@@ -23,8 +23,10 @@ enable_testing()
 
 add_subdirectory(compiler/frontend)
 add_subdirectory(compiler/rbc)
+add_subdirectory(compiler/interp)
 
 if(B2_BUILD_TESTS)
   add_subdirectory(tests/frontend)
   add_subdirectory(tests/rbc)
+  add_subdirectory(tests/interp)
 endif()

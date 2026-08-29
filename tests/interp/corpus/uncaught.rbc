@@ -1,0 +1,14 @@
+# Uncaught ArithmeticException ("/ by zero"): the run's terminal status is
+# RunStatus::Threw; the corpus runner asserts the class name below and that
+# stdout is empty.
+
+.class Main
+
+.method static main ()V
+.regs 3
+.locals 0
+iconst r0 5
+iconst r1 0
+idiv r2 r0 r1
+return
+.end

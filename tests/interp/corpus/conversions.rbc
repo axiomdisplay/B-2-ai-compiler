@@ -1,0 +1,43 @@
+# Narrowing and clamping conversions (JLS 5.1.3):
+#   (byte) 300             -> 44
+#   (char) -1              -> 65535
+#   (short) 65535          -> -1
+#   (int) 1e10f            -> 2147483647  (saturated)
+#   (int) -1e10f           -> -2147483648 (saturated)
+# fconst bit patterns: 1e10f = 0x501502F9 = 1343554297,
+# -1e10f = 0xD01502F9 = -803929351 (signed decimal spelling).
+
+.class Main
+
+.method static main ()V
+.regs 5
+.locals 0
+.const c0 = field java/lang/System out Ljava/io/PrintStream;
+.const c1 = method java/io/PrintStream println (I)V
+iconst r0 300
+i2b r1 r0
+getstatic r2 c0
+imove r3 r1
+invokevirtual r4 r2 r2 c1
+iconst r0 -1
+i2c r1 r0
+getstatic r2 c0
+imove r3 r1
+invokevirtual r4 r2 r2 c1
+iconst r0 65535
+i2s r1 r0
+getstatic r2 c0
+imove r3 r1
+invokevirtual r4 r2 r2 c1
+fconst r0 1343554297
+f2i r1 r0
+getstatic r2 c0
+imove r3 r1
+invokevirtual r4 r2 r2 c1
+fconst r0 -803929351
+f2i r1 r0
+getstatic r2 c0
+imove r3 r1
+invokevirtual r4 r2 r2 c1
+return
+.end

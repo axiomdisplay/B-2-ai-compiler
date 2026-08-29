@@ -1,0 +1,51 @@
+# Hand-written quickened stream (the T0 quickened-opcode pins, Interp.h):
+#
+#   putfield_quick/getfield_quick: imm = byte offset = slot * sizeof(Value)
+#     (16). In the TEXT grammar a quick field op's imm is spelled as a cN
+#     reference whose resolved POOL INDEX equals the offset, so referencing
+#     c0 (the first pool entry, here also the `new` target class const)
+#     yields offset 0 = slot 0. The slot grows lazily on the first store.
+#
+#   invokestatic_quick: imm = MethodId, the index into the Program's method
+#     table. Methods in file order: main = 0, bump = 1 -> imm 1 below.
+#
+# main stores 20 into slot 0, then calls bump(obj, 22) which quick-loads
+# slot 0 and returns 20 + 22 = 42. The iconst r3 0 ahead of the quick call
+# pre-types the destination register: hand-written quickened streams verify
+# with "the same type rules" (rbc_spec.md SS6.2) and quickened call ops
+# carry no descriptor, so the dst type must already be established.
+
+.class Main
+
+.method static main ()V
+.regs 6
+.locals 1
+.const c0 = class "Main"
+.const c1 = field java/lang/System out Ljava/io/PrintStream;
+.const c2 = method java/io/PrintStream println (I)V
+new r0 c0
+astore r0 l0
+iconst r1 20
+aload r2 l0
+putfield_quick r0 r2 r1 c0
+aload r1 l0
+iconst r2 22
+iconst r3 0
+invokestatic_quick r3 r1 r2 1
+getstatic r4 c1
+imove r5 r3
+invokevirtual r4 r4 r2 c2
+return
+.end
+
+.method static bump (Ljava/lang/Object;I)I
+.regs 3
+.locals 2
+.const c0 = class "Main"
+iconst r0 0
+aload r1 l0
+getfield_quick r0 r1 c0
+iload r2 l1
+iadd r2 r0 r2
+ireturn r2
+.end
