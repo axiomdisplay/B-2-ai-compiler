@@ -8,6 +8,11 @@
 # Shared, non-team paths (no team may write without an approved message or
 # integrator approval):
 #   docs/laws.md            — law amendments follow Rule 145 / integrator approval
+#   docs/deopt_backend.md   — cross-team deopt/backend contract (Interpreter,
+#                             Baseline No-IR, IR, Codegen, AOT)
+#   docs/stencils.md        — shared stencil format contract; changes require an
+#                             RFC per Stencil Rule 10 / Amendment C
+#   docs/cpp26_standards.md — repo-wide C++26 standards and testing contract
 #   docs/teams/*            — team organization and charters
 #   messages/*              — message space (message files only, per messaging.md)
 #   .github/, CI config     — integrator-owned

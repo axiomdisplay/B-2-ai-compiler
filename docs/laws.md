@@ -2457,6 +2457,9 @@ Enforcement: docs lint, PR checklist.
 -   Java Language Specification for the supported Java version.
 -   Java Virtual Machine Specification for the supported class-file and bytecode version.
 -   Approved Java compatibility oracle / compatibility kit behavior.
+-   `docs/deopt_backend.md` — deopt system and backend design: T0 canonical state, FrameState, deopt metadata, MIR pipeline, W^X code publication.
+-   `docs/stencils.md` — precompiled stencil system: stencil format, categories, patching model, and Stencil Rules 1-10 (Amendment C).
+-   `docs/cpp26_standards.md` — B-2 C++26 code standards (CS-1 through CS-13) and the Java/C++ two-domain testing contract.
 -   `docs/ir_spec.md` — IR node specifications.
 -   `docs/effect_system.md` — effect model and effect-chain rules.
 -   `docs/abi.md` — calling conventions and native linkage.
@@ -2512,6 +2515,7 @@ Current amendments:
 
 - **Amendment A — No-IR Baseline Tier**
 - **Amendment B — Tier Model Redesign**
+- **Amendment C — Precompiled Stencil Subsystem**
 
 ---
 
@@ -2624,6 +2628,62 @@ The full optimization pass suite — including the named first-class passes SWLP
 4. **SWLP becomes a first-class pass** — not just loop vectorization.
 5. **Partial Escape Analysis becomes a named required pass** — not just full escape analysis.
 6. **NaN boxing becomes a cross-team representation lowering feature** — not just a normal optimization pass.
+
+---
+
+## Amendment C — Precompiled Stencil Subsystem
+
+**Status:** Accepted 2026-08-30
+**Amends:** Amendment A (No-IR Baseline Tier) and Amendment B (Tier Model Redesign), where they describe the T1 implementation strategy and runtime code generation.
+**Normative spec:** `docs/stencils.md` (§14 restates these rules).
+
+T1 is implemented as a **stencil compositor**: it selects precompiled,
+relocatable machine-code stencils for an RBC method, copies them into a
+writable staging buffer, patches the declared holes, and publishes the code to
+executable memory atomically under W^X. T2/T3 use precompiled stencils for
+stubs and runtime support: deopt stubs, uncommon-trap stubs, IC stubs,
+barrier stubs, safepoint-poll stubs, materialization helpers, and vector
+scalar-fallback fragments. Stencil generation happens at build time via the
+stencil toolchain (`tools/stencilgen/`). The runtime never generates stencil
+bodies.
+
+**T1 frame model:** T1 stencil frames are T0-compatible — the T0 register
+file lives in the frame — so T1 deopt is a pc-map lookup plus a register flush
+into the T0 interpreter, without IR state reconstruction. This does not weaken
+any deopt law in Part VIII.
+
+**Stencil Rules (binding on every team that emits, patches, or consumes
+stencils):**
+
+1. **Stencils are immutable.** The runtime must not generate new stencil
+   bodies. It may only copy existing stencils, patch described holes, and
+   compose them into code buffers. New stencil bodies are built by the
+   toolchain, never by the runtime.
+2. **Every stencil must have metadata:** patch table, clobber info, stack map
+   info, safepoint info, deopt info where applicable, exception behavior,
+   target feature requirements, and effect tags. No stencil may exist
+   without them.
+3. **Only described holes may be patched.** Arbitrary instruction mutation is
+   forbidden.
+4. **Stencils must be versioned.** Artifacts carry the stencil format
+   version, target arch, target feature hash, ABI hash, compiler hash, and
+   runtime config hash. A stencil that fails validation is rejected.
+5. **Stencil instantiation must be W^X safe.** Copying and patching happen in
+   writable staging memory; publication to executable memory preserves W^X.
+6. **Stencil deopt metadata is mandatory.** Any stencil that can trap, call,
+   safepoint, or deopt must carry enough metadata to reconstruct T0 state.
+7. **Stencils must not hold untracked GC references.** Any GC reference live
+   across a call, safepoint, runtime helper, deopt stub, or allocation must be
+   tracked in stack maps or handles.
+8. **Stencil fallback is mandatory.** If no valid stencil exists for an RBC
+   sequence, T1 falls back to T0. No silent miscompile.
+9. **Stencil cache pressure must be managed.** The runtime tracks stencil
+   code size, patch table size, metadata size, IC stub count, and retired
+   stencil instances; under pressure it throttles T1 compilation or evicts
+   cold code.
+10. **Stencil changes require a cross-team message.** Any stencil format
+    change requires an RFC message to affected teams (Baseline No-IR,
+    Codegen, Interpreter, IR, Passes, RegAlloc, AOT, GC/Runtime).
 
 ---
 

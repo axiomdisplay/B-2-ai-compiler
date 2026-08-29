@@ -57,7 +57,10 @@ Parse a Java file with the frontend driver:
 
 | Document | Purpose |
 |---|---|
-| `docs/laws.md` | The law system: 150 rules, Amendments A/B, Special Pass Laws (SWLP, PEA, NaN boxing) |
+| `docs/laws.md` | The law system: 150 rules, Amendments A/B/C, Special Pass Laws (SWLP, PEA, NaN boxing) |
+| `docs/deopt_backend.md` | Deopt system and backend design: T0 canonical state, FrameState, deopt metadata, MIR pipeline, W^X publication |
+| `docs/stencils.md` | Precompiled stencil system: T1 copy-and-patch composition, stencil format and categories, Stencil Rules 1-10 (Amendment C) |
+| `docs/cpp26_standards.md` | C++26 code standards (CS-1..CS-13) and the Java/C++ two-domain testing contract |
 | `docs/teams/README.md` | Team organization: eight teams of two AI roles (implementer + reviewer) |
 | `docs/teams/messaging.md` | Inter-team message system |
 | `docs/teams/ownership.yaml` | Machine-readable path ownership map |
