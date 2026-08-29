@@ -62,6 +62,10 @@ teams:
       - compiler/pipeline/
       - tests/passes/
       - docs/pass_contracts.md
+      # Special pass designs (CM-PEA, effect reordering, adaptive value
+      # representation): passes-team owned; NaN boxing representation
+      # contracts remain cross-team per the NaN Boxing Rule ownership clause.
+      - docs/special_passes.md
 
   regalloc:
     write:

@@ -77,6 +77,7 @@ Execute an RBC text program in Tier 0 with the interpreter driver:
 | Document | Purpose |
 |---|---|
 | `docs/laws.md` | The law system: 150 rules, Amendments A/B/C, Special Pass Laws (SWLP, PEA, NaN boxing) |
+| `docs/special_passes.md` | Special pass designs (SMT-free): CM-PEA escape lattice + summary tables, speculative effect reordering with compensation, adaptive value representation |
 | `docs/deopt_backend.md` | Deopt system and backend design: T0 canonical state, FrameState, deopt metadata, MIR pipeline, W^X publication |
 | `docs/stencils.md` | Precompiled stencil system: T1 copy-and-patch composition, stencil format and categories, Stencil Rules 1-10 (Amendment C) |
 | `docs/cpp26_standards.md` | C++26 code standards (CS-1..CS-13) and the Java/C++ two-domain testing contract |

@@ -25,7 +25,7 @@ compiler/passes/swlp/  compiler/passes/pea/  compiler/passes/nanbox_lowering/  c
 compiler/passes/escape/  compiler/passes/loop/  compiler/passes/scalar/  compiler/passes/memory/  compiler/passes/inline/
 ```
 
-Must deliver: the SWLP pass, the PEA pass, the NaN boxing lowering pass, and the full standard pass suite (see appendix); plus pass contracts, pass budgets, pass telemetry, kill switches, golden tests, and deterministic replay. Not owned: core IR data structures (request via RFC to the IR team), machine lowering, register allocation, codegen, the interpreter, the baseline JIT, the AOT driver.
+Must deliver: the SWLP pass, the PEA pass, the NaN boxing lowering pass, and the full standard pass suite (see appendix); plus pass contracts, pass budgets, pass telemetry, kill switches, golden tests, and deterministic replay. The engineering designs for the three special passes are fixed in `docs/special_passes.md` (SMT-free: CM-PEA height-6 escape lattice + inline summary tables; speculative effect reordering via the finite effect-kind lookup table and construction rules; adaptive value representation via profile-guided threshold classification) — implementations must follow those designs and their complexity budgets. Not owned: core IR data structures (request via RFC to the IR team), machine lowering, register allocation, codegen, the interpreter, the baseline JIT, the AOT driver.
 
 ---
 
@@ -36,6 +36,7 @@ compiler/passes/
 compiler/pipeline/
 tests/passes/
 docs/pass_contracts.md
+docs/special_passes.md
 ```
 
 ---
