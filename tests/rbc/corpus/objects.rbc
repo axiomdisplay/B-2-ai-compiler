@@ -1,0 +1,80 @@
+# Objects corpus: new/invokevirtual/getfield/putfield/checkcast/instanceof/
+# monitorenter.
+# Positive file: must parse cleanly and every method must pass verify().
+#
+# Call convention: dst = result, a = arg base, b = arg count (spelled rN in
+# the text form because the count lives in Ins::b), receiver = arg a[0].
+
+.class corpus/Objects
+
+# Object make() { return new corpus/Widget(); }
+# invokespecial takes the fresh instance as its single (receiver) argument.
+.method static make ()Ljava/lang/Object;
+.regs 2
+.locals 1
+.const c0 = class "corpus/Widget"
+.const c1 = method corpus/Widget <init> ()V
+new r0 c0
+invokespecial r0 r0 r1 c1
+astore r0 l0
+aload r1 l0
+areturn r1
+.end
+
+# int get(Object o) { return ((corpus/Widget) o).value; }
+# checkcast consumes a Class constant; getfield a FieldRef constant.
+.method static getValue (Ljava/lang/Object;)I
+.regs 2
+.locals 1
+.const c0 = class "corpus/Widget"
+.const c1 = field corpus/Widget value I
+aload r0 l0
+checkcast r1 r0 c0
+getfield r1 r1 c1
+ireturn r1
+.end
+
+# void put(Object o, int v) { ((corpus/Widget) o).value = v; }
+# putfield's dst is the unused canonical r0; a = object, b = value.
+.method static putValue (Ljava/lang/Object;I)V
+.regs 3
+.locals 2
+.const c0 = class "corpus/Widget"
+.const c1 = field corpus/Widget value I
+aload r0 l0
+checkcast r1 r0 c0
+iload r2 l1
+putfield r0 r1 r2 c1
+return
+.end
+
+# boolean isString(Object o)
+.method static isString (Ljava/lang/Object;)I
+.regs 2
+.locals 1
+.const c0 = class "java/lang/String"
+aload r0 l0
+instanceof r1 r0 c0
+ireturn r1
+.end
+
+# String describe(Object o) { return o.toString(); }
+# Receiver-only virtual call: argCount 1 is spelled r1 in the text form.
+.method static describe (Ljava/lang/Object;)Ljava/lang/String;
+.regs 2
+.locals 1
+.const c0 = method java/lang/Object toString ()Ljava/lang/String;
+aload r0 l0
+invokevirtual r1 r0 r1 c0
+areturn r1
+.end
+
+# synchronized-block equivalent on a monitor local.
+.method static sync (Ljava/lang/Object;)V
+.regs 1
+.locals 1
+aload r0 l0
+monitorenter r0
+monitorexit r0
+return
+.end

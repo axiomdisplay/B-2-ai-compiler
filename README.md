@@ -53,6 +53,15 @@ Parse a Java file with the frontend driver:
 
 `b2parse` prints diagnostics to stderr and exits non-zero when any error-severity diagnostic was issued.
 
+Verify and dump an RBC text file with the middle-end driver:
+
+```bash
+./build/compiler/rbc/b2rbc --verify-only tests/rbc/corpus/arithmetic.rbc   # parse + verify
+./build/compiler/rbc/b2rbc tests/rbc/corpus/controlflow.rbc               # also print it back
+```
+
+`b2rbc` prints parse errors as `file:offset:` and verification errors as `file [method descriptor]: pc N: error: ...`, and exits non-zero on any error.
+
 ## Documentation
 
 | Document | Purpose |
@@ -61,6 +70,7 @@ Parse a Java file with the frontend driver:
 | `docs/deopt_backend.md` | Deopt system and backend design: T0 canonical state, FrameState, deopt metadata, MIR pipeline, W^X publication |
 | `docs/stencils.md` | Precompiled stencil system: T1 copy-and-patch composition, stencil format and categories, Stencil Rules 1-10 (Amendment C) |
 | `docs/cpp26_standards.md` | C++26 code standards (CS-1..CS-13) and the Java/C++ two-domain testing contract |
+| `docs/rbc_spec.md` | Register Bytecode (RBC) specification: frame model, 150-opcode set, type system, verification rules, quickening, text format |
 | `docs/teams/README.md` | Team organization: eight teams of two AI roles (implementer + reviewer) |
 | `docs/teams/messaging.md` | Inter-team message system |
 | `docs/teams/ownership.yaml` | Machine-readable path ownership map |

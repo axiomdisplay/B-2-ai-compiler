@@ -1,0 +1,13 @@
+# Negative corpus: branch to a label bound past the end of the code.
+# A past-end label is legal ONLY as a .catch 'to' target; using it as a
+# branch target must fail at parse time; the .errors twin pins a substring of
+# the reported error.
+
+.class corpus/BadBranch
+
+.method static jumpAway ()V
+.regs 0
+goto tail
+return
+tail:
+.end

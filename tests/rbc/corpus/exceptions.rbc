@@ -1,0 +1,62 @@
+# Exceptions corpus: catch-all + typed catch, athrow, handler reads locals.
+# Positive file: must parse cleanly and every method must pass verify().
+#
+# Handler-entry registers are all Bottom, so handler bodies first reload from
+# locals (which must hold one stable type across each protected range).
+
+.class corpus/Exceptions
+
+# int guarded(int n) { try { return 100 / n; } catch (...) { return n; } }
+# l1 is initialized before the protected range; the catch 'to' label binds
+# past the end (legal only as a .catch 'to' target).
+.method static guarded (I)I
+.regs 2
+.locals 2
+iconst r1 100
+istore r1 l1
+L2:
+iload r0 l0
+idiv r1 r1 r0
+ireturn r1
+L5:
+iload r0 l0
+ireturn r0
+Lend:
+.catch all from L2 to Lend handler L5
+.end
+
+# Object pass(Object o) { try { throw o; } catch (...) { return o; } }
+# The handler reads local l0 (the parameter) at entry.
+.method static passThrough (Ljava/lang/Object;)Ljava/lang/Object;
+.regs 1
+.locals 1
+L0:
+aload r0 l0
+athrow r0
+L2:
+aload r0 l0
+areturn r0
+.catch all from L0 to L2 handler L2
+.end
+
+# Typed catch: the table entry references a Class constant.
+.method static catchTyped (Ljava/lang/Exception;)Ljava/lang/String;
+.regs 2
+.locals 1
+.const c0 = class "java/lang/Exception"
+.const c1 = string "fallback"
+L0:
+aload r0 l0
+athrow r0
+L2:
+ldc r1 c1
+areturn r1
+.catch c0 from L0 to L2 handler L2
+.end
+
+.method static thrower (Ljava/lang/Object;)Ljava/lang/Object;
+.regs 1
+.locals 1
+aload r0 l0
+athrow r0
+.end

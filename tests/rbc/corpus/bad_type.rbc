@@ -1,0 +1,13 @@
+# Negative corpus: iadd consumes a reference operand.
+# The verifier must reject the method; the .errors twin pins a substring of
+# the FIRST diagnostic.
+
+.class corpus/BadType
+
+.method static broken (Ljava/lang/Object;)I
+.regs 2
+.locals 1
+aload r0 l0
+iadd r1 r0 r0
+ireturn r1
+.end

@@ -49,6 +49,12 @@ teams:
       - tests/ir/
       - docs/ir_spec.md
       - docs/effect_system.md
+      # RBC core (middle-end v0): shared contract consumed by all tiers;
+      # opcode/format changes require a cross-team message per messaging.md.
+      - compiler/rbc/
+      - include/b2/rbc/
+      - tests/rbc/
+      - docs/rbc_spec.md
 
   passes:
     write:

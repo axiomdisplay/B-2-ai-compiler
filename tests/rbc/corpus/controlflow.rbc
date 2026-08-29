@@ -1,0 +1,63 @@
+# Control-flow corpus: loop with backward goto, if chain, dense tableswitch.
+# Positive file: must parse cleanly and every method must pass verify().
+
+.class corpus/ControlFlow
+
+# int sum(int n) { int i = 0, s = 0; while (i < n) { s += i; i++; } return s; }
+# L3 is the loop head (backward goto target); the poll marks the backedge.
+.method static sum (I)I
+.regs 3
+.locals 1
+iload r0 l0
+iconst r1 0
+iconst r2 0
+L3:
+safepoint_poll
+if_icmpge r2 r0 L8
+iadd r1 r1 r2
+iinc r2 1
+goto L3
+L8:
+ireturn r1
+.end
+
+# int grade(int score): if chain over two thresholds.
+.method static grade (I)I
+.regs 2
+.locals 1
+iload r0 l0
+iconst r1 90
+if_icmplt r0 r1 L5
+iconst r1 4
+ireturn r1
+L5:
+iconst r1 60
+if_icmplt r0 r1 L9
+iconst r1 3
+ireturn r1
+L9:
+iconst r1 0
+ireturn r1
+.end
+
+# Dense matches {0,1,2} canonicalize to the table layout
+# [low, high, default, targets...]; tableswitch references it.
+.method static pick (I)I
+.regs 2
+.locals 1
+.const c0 = switch { 0 : L4 1 : L6 2 : L8 default : L2 }
+iload r1 l0
+tableswitch r1 c0
+L2:
+iconst r1 -1
+ireturn r1
+L4:
+iconst r1 100
+ireturn r1
+L6:
+iconst r1 200
+ireturn r1
+L8:
+iconst r1 300
+ireturn r1
+.end

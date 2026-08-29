@@ -1,0 +1,81 @@
+# Arithmetic corpus: int/long/float/double mixes and conversions.
+# Positive file: must parse cleanly and every method must pass verify().
+
+.class corpus/Arithmetic
+
+.method static add (II)I
+.regs 3
+.locals 2
+iload r0 l0
+iload r1 l1
+iadd r2 r0 r1
+ireturn r2
+.end
+
+.method static wide (JJ)J
+.regs 4
+.locals 2
+lload r0 l0
+lload r1 l1
+ladd r2 r0 r1
+lmul r3 r2 r0
+lreturn r3
+.end
+
+.method static floats (FF)F
+.regs 4
+.locals 2
+fload r0 l0
+fload r1 l1
+fadd r2 r0 r1
+fmul r3 r2 r1
+freturn r3
+.end
+
+.method static doubles (DD)D
+.regs 4
+.locals 2
+dload r0 l0
+dload r1 l1
+dadd r2 r0 r1
+dsub r3 r2 r1
+dreturn r3
+.end
+
+# int -> long -> double conversion chain.
+.method static convolute (I)D
+.regs 3
+.locals 1
+iload r0 l0
+i2l r1 r0
+l2d r2 r1
+dreturn r2
+.end
+
+# double compare produces an Int result.
+.method static compare (DD)I
+.regs 3
+.locals 2
+dload r0 l0
+dload r1 l1
+dcmpg r2 r0 r1
+ireturn r2
+.end
+
+.method static negate (I)I
+.regs 2
+.locals 1
+iload r0 l0
+ineg r1 r0
+ireturn r1
+.end
+
+# iinc is the read-modify-write arithmetic op (dst is both source and dest).
+.method static bump (I)I
+.regs 2
+.locals 1
+iload r0 l0
+iinc r0 1
+iadd r1 r0 r0
+ireturn r1
+.end

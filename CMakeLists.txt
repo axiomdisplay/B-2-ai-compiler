@@ -22,7 +22,9 @@ option(B2_BUILD_TESTS "Build the test suite" ON)
 enable_testing()
 
 add_subdirectory(compiler/frontend)
+add_subdirectory(compiler/rbc)
 
 if(B2_BUILD_TESTS)
   add_subdirectory(tests/frontend)
+  add_subdirectory(tests/rbc)
 endif()

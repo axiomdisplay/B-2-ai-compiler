@@ -11,7 +11,7 @@ Team size: 2
 
 Roles:
 
-- `IR-IMPL` — Implementer. Produces the sea-of-nodes IR core, node kinds, effect model, metadata attachments, verifier core, serialization, and IR documentation inside the team's owned write paths.
+- `IR-IMPL` — Implementer. Produces the sea-of-nodes IR core, node kinds, effect model, metadata attachments, verifier core, serialization, and IR documentation inside the team's owned write paths. Also owns the RBC (Register Bytecode) core: opcode set, encoding, builder, verifier, and text format (docs/rbc_spec.md), the shared middle-end contract consumed by all tiers.
 - `IR-REV` — Reviewer. Checks every change for representation bugs, law compliance, boundary violations, missing tests, and missing node specifications. Does not rewrite code unless explicitly reassigned.
 
 ---
@@ -22,6 +22,7 @@ The IR Team owns the core sea-of-nodes compiler intermediate representation used
 
 In scope:
 
+- The RBC (Register Bytecode) core per `docs/rbc_spec.md`: the 150-opcode set, fixed 12-byte `Ins` encoding, constant pool, `RbcBuilder`, the structural + type verifier, and the text format. RBC is the convergence point of both entry paths (frontend lowering; loader/verifier/quickener) and the input of every tier; opcode and format changes require a cross-team message per `docs/teams/messaging.md`.
 - Sea-of-nodes graph representation and storage, arena-allocated per Rule 7.
 - Index-based `NodeId` edges (`uint32_t`) and use-def / def-use chain storage.
 - The `NodeKind` taxonomy: pure computation, control, memory, exception, guard, conversion, call, vector/SIMD, and tagged-value nodes.
