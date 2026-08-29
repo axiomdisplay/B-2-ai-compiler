@@ -1,0 +1,62 @@
+# B-2 Path Ownership Map
+#
+# Machine-readable ownership for the seven B-2 AI teams.
+# CI must fail any PR that touches paths outside the submitting team's write list.
+# Team doc reference: docs/teams/README.md
+# Message system:     docs/teams/messaging.md
+#
+# Shared, non-team paths (no team may write without an approved message or
+# integrator approval):
+#   docs/laws.md            — law amendments follow Rule 145 / integrator approval
+#   docs/teams/*            — team organization and charters
+#   messages/*              — message space (message files only, per messaging.md)
+#   .github/, CI config     — integrator-owned
+#
+# The T1 baseline (baseline_noir) intentionally owns no IR paths (Amendment A).
+# The AOT team drives the shared T2 pipeline; it must not fork it (Amendment B).
+
+teams:
+  interpreter:
+    write:
+      - compiler/interp/
+      - tests/interp/
+      - docs/interp_contract.md
+
+  baseline_noir:
+    write:
+      - compiler/baseline/
+      - tests/baseline/
+      - docs/baseline_contract.md
+
+  ir:
+    write:
+      - compiler/ir/core/
+      - include/b2/ir/
+      - tests/ir/
+      - docs/ir_spec.md
+      - docs/effect_system.md
+
+  passes:
+    write:
+      - compiler/passes/
+      - compiler/pipeline/
+      - tests/passes/
+      - docs/pass_contracts.md
+
+  regalloc:
+    write:
+      - compiler/regalloc/
+      - tests/regalloc/
+      - docs/regalloc_contract.md
+
+  codegen:
+    write:
+      - compiler/codegen/
+      - tests/codegen/
+      - docs/codegen_contract.md
+
+  aot:
+    write:
+      - compiler/aot/
+      - tests/aot/
+      - docs/aot_contract.md
