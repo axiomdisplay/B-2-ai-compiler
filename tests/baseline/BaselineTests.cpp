@@ -608,12 +608,15 @@ B2_TEST(baseline_set_candidates_order) {
     CHECK(cands[0].pattern_len == 1);
   }
   {
-    // An un-quickened virtual call: its only candidate is its own
-    // NeedsRuntimeFeature stencil (the availability map made honest).
+    // Set v2: the un-quickened virtual call is Available (the T1 helper
+    // seam); invokedynamic remains the honest NeedsRuntimeFeature case.
     const auto cands = set.candidates(rbc::Op::Invokevirtual);
     CHECK(cands.size() == 1);
     CHECK(cands[0].pattern_len == 1);
-    CHECK(cands[0].availability == StencilAvailability::NeedsRuntimeFeature);
+    CHECK(cands[0].availability == StencilAvailability::Available);
+    const auto indy = set.candidates(rbc::Op::Invokedynamic);
+    CHECK(indy.size() == 1);
+    CHECK(indy[0].availability == StencilAvailability::NeedsRuntimeFeature);
   }
 }
 
@@ -849,15 +852,15 @@ B2_TEST(baseline_availability_needs_runtime_feature) {
   // stubs are themselves NeedsRuntimeFeature. StencilSet.h: un-quickened
   // invokes need real IC/ABI patching (SS3.3); guard_class needs the
   // KlassId hole resolved against real class ids.
+  // Set version 2 (MSG-20260830-004): the un-quickened invoke* and ldc
+  // flipped Available (the T1 runtime-helper seam landed); the v1 archive
+  // gap made multianewarray the newest NeedsRuntimeFeature entry.
   const Pin pins[] = {
       {"invokedynamic", "SS6 item 4: BootstrapMethodError in v0"},
-      {"ldc", "SS6 item 4: MethodType/MethodHandle ldc raise InternalError"},
-      {"invokevirtual", "no IC patching in v0 (SS3.3)"},
-      {"invokespecial", "no call ABI in v0 (SS3.3)"},
-      {"invokestatic", "no call ABI in v0 (SS3.3)"},
-      {"invokeinterface", "no IC patching in v0 (SS3.3)"},
       {"guard_class", "KlassId hole pending real class-id patching"},
       {"deopt_trap", "SS6 item 2: unconditionally enters the deopt runtime"},
+      {"multianewarray",
+       "codegen_contract SS12: no archive body in the v1 instantiation"},
   };
   for (const Pin& pin : pins) {
     const StencilId id = set.find(pin.name);
@@ -894,6 +897,22 @@ B2_TEST(baseline_availability_quickened_available) {
 
 B2_TEST(baseline_availability_plain_available) {
   const StencilSet& set = theSet();
+  // Set version 2 (MSG-20260830-004): the un-quickened invoke* and ldc are
+  // Available now that the T1 runtime-helper seam executes them.
+  const char* flipped[] = {
+      "ldc",         "invokevirtual", "invokespecial",
+      "invokestatic", "invokeinterface",
+  };
+  for (const char* name : flipped) {
+    const StencilId id = set.find(name);
+    CHECK_MSG(id.valid(), std::string(name) + " stencil missing");
+    if (id.valid()) {
+      CHECK_MSG(set.desc(id).availability == StencilAvailability::Available,
+                std::string(name) +
+                    " must be Available (the T1 helper seam, set v2)");
+    }
+  }
+
   // A representative sweep of the ops T1 plans today: arithmetic, control,
   // field/static-field, allocation, monitors, guards, polls, returns.
   const char* names[] = {
@@ -916,11 +935,13 @@ B2_TEST(baseline_availability_plain_available) {
       "if_icmplt",    "if_icmpge",      "if_icmpgt",   "if_icmple",
       "if_acmpeq",    "if_acmpne",      "tableswitch", "lookupswitch",
       "getfield",     "putfield",       "getstatic",   "putstatic",
+      "ldc",          "invokevirtual",  "invokespecial", "invokestatic",
+      "invokeinterface",
       "newarray",     "anewarray",      "arraylength", "iaload",
       "laload",       "faload",         "daload",      "aaload",
       "baload",       "caload",         "saload",      "iastore",
       "lastore",      "fastore",        "dastore",     "aastore",
-      "bastore",      "castore",        "sastore",     "multianewarray",
+      "bastore",      "castore",        "sastore",
       "new",          "checkcast",      "instanceof",  "monitorenter",
       "monitorexit",  "return",         "ireturn",     "lreturn",
       "freturn",      "dreturn",        "areturn",     "athrow",
@@ -1317,13 +1338,25 @@ B2_TEST(baseline_refuse_unverifiable) {
 }
 
 B2_TEST(baseline_refuse_no_stencil) {
-  const Program prog = parseOk(kVirtual);
+  // Set v2 flipped invoke* Available (MSG-20260830-004), so the honest
+  // NoStencilForOp fixture is now invokedynamic (still verifier-only).
+  constexpr const char* kIndy =
+      ".class Main\n"
+      ".method static main ()V\n"
+      ".regs 3\n"
+      ".locals 0\n"
+      ".const c0 = indy run ()V\n"
+      "iconst r0 1\n"
+      "invokedynamic r1 r0 r0 c0\n"
+      "return\n"
+      ".end\n";
+  const Program prog = parseOk(kIndy);
   const PlanResult r = compilePlan(prog, 0, theSet(), CompileOptions{});
   CHECK(!r.ok);
   CHECK(r.reason == RefuseReason::NoStencilForOp);
   CHECK(!r.detail.empty());
-  CHECK(contains(r.detail, "invokevirtual"));
-  CHECK(contains(r.detail, "pc 2"));
+  CHECK(contains(r.detail, "invokedynamic"));
+  CHECK(contains(r.detail, "pc 1"));
 }
 
 B2_TEST(baseline_refuse_missing_backedge_poll) {
@@ -1765,7 +1798,7 @@ B2_TEST(baseline_dump_golden) {
   const std::string want =
       "plan method=f descriptor=()I static=1 index=0\n"
       "frame regs=1 locals=0\n"
-      "set magic=0x32737463 version=1 target_arch=0 abi_hash=0x0\n"
+      "set magic=0x32737463 version=2 target_arch=0 abi_hash=0x0\n"
       "summary code_size=32 entry_native_offset=0 instances=2 fusions=0 "
       "patches=1 deopt_points=0 safepoints=0\n"
       "  inst 0 @0+16 iconst rbc[0,1) patches:1 exc:\n"
@@ -1798,7 +1831,7 @@ B2_TEST(baseline_dump_shape) {
   if (lines.size() >= 4) {
     CHECK(lines[0] == "plan method=pick descriptor=(I)I static=0 index=1");
     CHECK(lines[1] == "frame regs=2 locals=2");
-    CHECK(lines[2] == "set magic=0x32737463 version=1 target_arch=0 abi_hash=0x0");
+    CHECK(lines[2] == "set magic=0x32737463 version=2 target_arch=0 abi_hash=0x0");
     CHECK(lines[3].starts_with("summary code_size=48 entry_native_offset=0 "
                                "instances=3 fusions=0 patches=2 deopt_points=0 "
                                "safepoints=0"));

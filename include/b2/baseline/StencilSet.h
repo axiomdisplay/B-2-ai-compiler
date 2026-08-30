@@ -91,8 +91,13 @@ struct StencilSet {
 // Deterministic: two calls build byte-identical tables (Rule 124).
 [[nodiscard]] StencilSet builtinStencilSetV0();
 
-// Current set version constants (Stencil Rule 4).
+// Current set version constants (Stencil Rule 4). Version 2 flips the
+// un-quickened invoke* + ldc to Available (MSG-20260830-004: the T1
+// runtime-helper seam) and marks multianewarray NeedsRuntimeFeature (v1
+// instantiation gap). Version 1 plans must not instantiate against it.
 inline constexpr std::uint32_t kStencilSetMagic = 0x32737463u; // "2stc"
-inline constexpr std::uint32_t kStencilSetVersionV0 = 1;
+inline constexpr std::uint32_t kStencilSetVersionV0 = 2;
+// Historical: the pre-flip manifest (frozen for golden replay of old plans).
+inline constexpr std::uint32_t kStencilSetVersionV1 = 1;
 
 } // namespace b2::baseline

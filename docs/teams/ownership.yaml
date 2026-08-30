@@ -80,6 +80,7 @@ teams:
   codegen:
     write:
       - compiler/codegen/
+      - tools/stencilgen/
       - tests/codegen/
       - docs/codegen_contract.md
 

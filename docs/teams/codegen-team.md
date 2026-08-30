@@ -18,7 +18,9 @@ Roles:
 
 ## Mission
 
-The Codegen Team owns lowering and final machine code emission for the optimizing tiers. It serves T2, the optimizing JIT, and shares its lowering with the T3 AOT pipeline (Amendment B: AOT reuses the T2 pipeline offline, so lowering has a runtime-detected JIT mode and a build-time-validated AOT mode for target features — Rule 129). T1's template/copy-patch emission belongs to the baseline_noir team, NOT here: nothing in `compiler/codegen/` is wired into the no-IR baseline, and this team adds no baseline carve-outs (Amendment A).
+The Codegen Team owns lowering and final machine code emission. It serves T2, the optimizing JIT, and shares its lowering with the T3 AOT pipeline (Amendment B: AOT reuses the T2 pipeline offline, so lowering has a runtime-detected JIT mode and a build-time-validated AOT mode for target features — Rule 129).
+
+The stencil ARCHIVE division (stencils.md SS15, landed with MSG-20260830-004): the baseline_noir team owns stencil SELECTION — the manifest, the plan, the no-IR discipline (Amendment A: nothing in `compiler/baseline/` grows analysis or machine code); the codegen team owns the machine-code side — the build-time stencil archive (`tools/stencilgen`, Stencil Rule 1), the copy-and-patch instantiator, W^X publication, the code cache, and the runtime-helper seam (the v1 `b2jit` engine). The T1 execution engine is backend infrastructure in exactly stencils.md SS2's sense ("stencils are backend infrastructure"), and T2 reuses its activation record, helper ABI, and deopt path unchanged.
 
 In scope:
 
@@ -30,6 +32,7 @@ In scope:
 - Safepoint poll emission at every location Rule 88 requires.
 - Stack map assembly: consuming regalloc's contribution data and finalizing GC reference maps (Rules 86, 128).
 - Machine code serialization into the code cache with patch-safe code layout and W^X-compatible output design (Rules 97-99).
+- The T1 stencil instantiation stack (landed v1): the build-time archive generator, declared-hole-only patching (Stencil Rule 3), deopt thunk/entry-stub emission as archive template copies (Stencil Rule 1), the runtime-helper ABI, and the Tier-1 code cache — `docs/codegen_contract.md`.
 - Code metadata emission: dependencies, target features, publication data (Rules 101, 129, 98).
 
 Codegen must support what the Part XVIII first-class passes require: SIMD/vector instruction emission for SWLP — preserving exact Java numeric semantics, no fast-math, feature-gated per Rule 129 — and tagged-value move/conversion primitives for the NaN boxing lowering if that cross-team contract is ever enabled (disabled by default; global kill switch; approval from all affected teams required per Part XVIII).

@@ -195,18 +195,19 @@ B2_TEST(baseline_corpus) {
     }
   }
 
-  // Sanity floors: the corpus is known to hold 14 programs with 19 methods,
-  // 5 of which plan (fields/quickened bump, statics_clinit <clinit>,
-  // exception_nest leaf, uncaught main) and 14 of which refuse. Floors (not
-  // exact pins) so corpus additions do not break the sweep.
+  // Sanity floors (set v2, MSG-20260830-004): the un-quickened invoke*/ldc
+  // flip made most corpus methods plannable - only the no-poll loop pair
+  // (fib_loop/sum_loop: MissingBackedgePoll) and any indy/multianewarray
+  // holdouts refuse. Floors (not exact pins) so corpus additions do not
+  // break the sweep.
   CHECK_MSG(files.size() >= 14,
             "expected at least 14 corpus programs, found " +
                 std::to_string(files.size()));
-  CHECK_MSG(plannedOk >= 5,
-            "expected at least 5 plannable corpus methods, got " +
+  CHECK_MSG(plannedOk >= 15,
+            "expected at least 15 plannable corpus methods, got " +
                 std::to_string(plannedOk));
-  CHECK_MSG(refused >= 8,
-            "expected at least 8 refused corpus methods, got " +
+  CHECK_MSG(refused >= 2,
+            "expected at least 2 refused corpus methods, got " +
                 std::to_string(refused));
 
   // The known-positive: uncaught.rbc's main plans under the default entry.

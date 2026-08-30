@@ -17,23 +17,10 @@
 // version (docs/stencils.md SS4/SS5).
 //
 // AVAILABILITY (StencilSet.h): Available for everything T1 can plan today;
-// NeedsRuntimeFeature for the ops whose execution path the v0 runtime cannot
+// NeedsRuntimeFeature for the ops whose execution path the runtime cannot
 // back in compiled form. Every NeedsRuntimeFeature decision, cited:
 //   - invokedynamic ......... interp_contract SS6 item 4 (raises
 //                             BootstrapMethodError in v0; verifier-only op).
-//   - ldc ................... interp_contract SS6 item 4 (MethodType/MethodHandle
-//                             ldc raise InternalError; string ldc runs in T0,
-//                             but one op-level stencil cannot split constant
-//                             kinds, so the whole op waits for per-kind
-//                             stencils - a v1 manifest item).
-//   - invokevirtual / invokespecial / invokestatic / invokeinterface:
-//                             call stencils need real IC/ABI patching
-//                             (docs/stencils.md SS3.3; StencilSet.h pins
-//                             invokevirtual/invokeinterface "without IC
-//                             patching"). The quickened variants stay
-//                             Available: SS7 pins their imm encodings
-//                             (MethodId / IC site id = call pc) as
-//                             plan-computable.
 //   - guard_class ........... StencilSet.h: KlassId hole pending real
 //                             class-id patching.
 //   - deopt_trap ............ interp_contract SS6 item 2 (raises
@@ -41,6 +28,17 @@
 //                             (v0)"); the compiled form unconditionally enters
 //                             the deopt runtime, whose stubs are themselves
 //                             NeedsRuntimeFeature manifest entries.
+//   - multianewarray ........ v1 instantiation gap (codegen_contract SS12):
+//                             dims-from-registers allocation has no archive
+//                             body yet; methods containing it stay on T0.
+//
+// SET VERSION 2 (MSG-20260830-004, codegen RFC, baseline approved): the
+// T1 runtime-helper seam landed, so the un-quickened invoke* and ldc become
+// Available - calls resolve at instantiation (static/special: MethodId) or
+// in the call helper (virtual/interface: builtin probe + (name,desc));
+// ldc (String intern / Class materialize / MethodType-MethodHandle refusal)
+// runs entirely in the LdcConst helper, mirroring interp SS6 exactly.
+// The quickened variants were already Available (SS7 imm pins).
 //
 // LAW PINS (docs/laws.md):
 // - Rule 23: every size/threshold below is a named, documented constant.
@@ -244,18 +242,15 @@ struct FrameAccounting {
   switch (op) {
     case Op::Invokedynamic:
       return StencilAvailability::NeedsRuntimeFeature;
-    case Op::Ldc:
-      return StencilAvailability::NeedsRuntimeFeature;
-    case Op::Invokevirtual:
-    case Op::Invokespecial:
-    case Op::Invokestatic:
-    case Op::Invokeinterface:
-      return StencilAvailability::NeedsRuntimeFeature;
     case Op::GuardClass:
       return StencilAvailability::NeedsRuntimeFeature;
     case Op::DeoptTrap:
       return StencilAvailability::NeedsRuntimeFeature;
+    case Op::Multianewarray:
+      return StencilAvailability::NeedsRuntimeFeature;
     default:
+      // Includes invoke* (all forms) and ldc since set version 2: the T1
+      // runtime-helper seam executes them (MSG-20260830-004).
       return StencilAvailability::Available;
   }
 }
