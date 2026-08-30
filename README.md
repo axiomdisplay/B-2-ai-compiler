@@ -72,6 +72,16 @@ Execute an RBC text program in Tier 0 with the interpreter driver:
 
 `b2run` parses, verifies (the hard gate: the interpreter refuses unverified input), and executes in T0. Program output goes to stdout; an uncaught exception is reported to stderr in the Java launcher shape (`Exception in thread "main" <class>: <message>`) with exit status 1.
 
+Compile a Tier-1 stencil plan from verified RBC with the baseline driver:
+
+```bash
+./build/compiler/baseline/b2plan tests/interp/corpus/uncaught.rbc            # plan main()V, print the golden dump
+./build/compiler/baseline/b2plan fields.rbc --entry bump "(Ljava/lang/Object;)V"  # fused aload_getfield + pending runtime patches
+./build/compiler/baseline/b2plan prog.rbc --no-fusion --check-only           # opcode-stencil-only, audit without dumping
+```
+
+`b2plan` parses, verifies, and lowers RBC to a `StencilPlan` against the target-neutral v0 stencil manifest: stencil selection with superinstruction fusion, patch values (plan-computable vs runtime-pending), the native-to-RBC pc map, stack maps, deopt points, and translated exception edges. Refusals are the contract: methods containing ops without an Available stencil (un-quickened calls, `ldc`, `invokedynamic`) stay on T0 — exit 1 with `refused: <reason> <detail>`.
+
 ## Documentation
 
 | Document | Purpose |
