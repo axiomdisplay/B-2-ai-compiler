@@ -1,6 +1,12 @@
 // b2parse - B-2 frontend driver.
 //
-//   b2parse [--dump-tokens] [--dump-ast] FILE.java...
+//   b2parse [--dump-tokens] [--dump-ast] [--emit-rbc] FILE.java...
+//
+// --emit-rbc lowers the parsed compilation unit to Register Bytecode and
+// prints it in the deterministic text format (printRbcText); the output
+// feeds b2rbc (verify) and b2run (execute), closing source -> execution:
+//
+//   b2parse --emit-rbc Hello.java > Hello.rbc && b2run Hello.rbc
 //
 // Exit status: 0 = parsed cleanly, 1 = diagnostics emitted, 2 = I/O error.
 
@@ -15,13 +21,16 @@
 #include "b2/frontend/AstDumper.h"
 #include "b2/frontend/Diagnostics.h"
 #include "b2/frontend/Lexer.h"
+#include "b2/frontend/Lower.h"
 #include "b2/frontend/Parser.h"
 #include "b2/frontend/SourceManager.h"
 #include "b2/frontend/Token.h"
+#include "b2/rbc/RbcText.h"
 
 namespace {
 
-int runOne(const std::string& path, bool dumpTokens, bool dumpAst) {
+int runOne(const std::string& path, bool dumpTokens, bool dumpAst,
+           bool emitRbc) {
   std::ifstream in(path, std::ios::binary);
   if (!in) {
     std::println(stderr, "b2parse: cannot open '{}'", path);
@@ -69,11 +78,25 @@ int runOne(const std::string& path, bool dumpTokens, bool dumpAst) {
   if (!all.empty()) std::print(stderr, "{}", all);
   std::println(stderr, "{}: {} error(s), {} diagnostic(s) total", path, diags.errorCount(),
                diags.diagnostics().size());
+
+  // Lowering runs only on clean parses: lowering a partial AST would emit
+  // garbage RBC. Lowering diagnostics reuse the same engine.
+  if (emitRbc && !diags.hasErrors() && unit) {
+    b2::frontend::LoweredUnit lowered =
+        b2::frontend::lowerUnit(*unit, sm, diags);
+    if (!diags.hasErrors()) {
+      std::print("{}", b2::rbc::printRbcText(lowered.program));
+    } else {
+      const std::string ld = diags.formatAll();
+      if (!ld.empty()) std::print(stderr, "{}", ld);
+      std::println(stderr, "{}: lowering failed", path);
+    }
+  }
   return diags.hasErrors() ? 1 : 0;
 }
 
 void usage() {
-  std::println("usage: b2parse [--dump-tokens] [--dump-ast] FILE.java...");
+  std::println("usage: b2parse [--dump-tokens] [--dump-ast] [--emit-rbc] FILE.java...");
 }
 
 }  // namespace
@@ -81,6 +104,7 @@ void usage() {
 int main(int argc, char** argv) {
   bool dumpTokens = false;
   bool dumpAst = false;
+  bool emitRbc = false;
   std::vector<std::string> files;
   for (int i = 1; i < argc; ++i) {
     const std::string_view a = argv[i];
@@ -88,6 +112,8 @@ int main(int argc, char** argv) {
       dumpTokens = true;
     } else if (a == "--dump-ast") {
       dumpAst = true;
+    } else if (a == "--emit-rbc") {
+      emitRbc = true;
     } else if (a == "-h" || a == "--help") {
       usage();
       return 0;
@@ -101,7 +127,7 @@ int main(int argc, char** argv) {
   }
   int worst = 0;
   for (const auto& f : files) {
-    worst = std::max(worst, runOne(f, dumpTokens, dumpAst));
+    worst = std::max(worst, runOne(f, dumpTokens, dumpAst, emitRbc));
   }
   return worst;
 }

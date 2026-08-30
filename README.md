@@ -30,7 +30,7 @@ Register Bytecode (RBC)
                          offline T2-style pipeline
 ```
 
-- **Entry paths** — Java source (`.java`) enters via the Frontend (lexer / parser -> AST -> binding -> RBC generation); Java classfiles enter via the Loader / Verifier / Quickener. Both entry paths converge at Register Bytecode (RBC).
+- **Entry paths** — Java source (`.java`) enters via the Frontend (lexer / parser -> AST -> **AST-to-RBC lowering, landed v1**); Java classfiles enter via the Loader / Verifier / Quickener. Both entry paths converge at Register Bytecode (RBC).
 - **T0** — direct-threaded register interpreter; the universal correctness fallback and deopt reconstruction target.
 - **T1** — no-IR baseline JIT (template / copy-and-patch); no IR graph, no optimization passes (Amendment A).
 - **T2** — optimizing JIT; first IR tier; sea-of-nodes; full pass suite including SWLP, PEA, and NaN boxing lowering.
@@ -44,14 +44,29 @@ cmake --build build -j
 ctest --test-dir build
 ```
 
-Parse a Java file with the frontend driver:
+Parse a Java file with the frontend driver, or lower it all the way to
+Register Bytecode:
 
 ```bash
 ./build/compiler/frontend/b2parse --dump-tokens SomeFile.java
 ./build/compiler/frontend/b2parse --dump-ast SomeFile.java
+./build/compiler/frontend/b2parse --emit-rbc SomeFile.java > SomeFile.rbc
 ```
 
 `b2parse` prints diagnostics to stderr and exits non-zero when any error-severity diagnostic was issued.
+
+**Source to execution is closed**: lower a Java file and run it on the T0
+interpreter:
+
+```bash
+./build/compiler/frontend/b2parse --emit-rbc Hello.java > Hello.rbc
+./build/compiler/interp/b2run Hello.rbc
+```
+
+Every method the v1 lowering emits passes the RBC verifier by construction;
+unsupported constructs (lambdas, string concatenation, enums, ...) are
+refused with diagnostics - never silently miscompiled
+(`docs/frontend_contract.md`).
 
 Verify and dump an RBC text file with the middle-end driver:
 
