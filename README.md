@@ -88,17 +88,19 @@ Compile a Tier-1 stencil plan from verified RBC with the baseline driver:
 |---|---|
 | `docs/laws.md` | The law system: 150 rules, Amendments A/B/C, Special Pass Laws (SWLP, PEA, NaN boxing) |
 | `docs/special_passes.md` | Special pass designs (SMT-free): CM-PEA escape lattice + summary tables, speculative effect reordering with compensation, adaptive value representation |
+| `docs/icdg.md` | ICDG — Inline Call/Dispatch Graph: the shared call/dispatch decision engine (dispatch states, unlock-value inline score model, invalidation, tier integration) |
+| `docs/gc.md` | GCR — Generational Concurrent Region-Based Collector: heap layout, barriers, collection phases, stack scanning, NUMA scaling, Java-visible testing |
 | `docs/deopt_backend.md` | Deopt system and backend design: T0 canonical state, FrameState, deopt metadata, MIR pipeline, W^X publication |
 | `docs/stencils.md` | Precompiled stencil system: T1 copy-and-patch composition, stencil format and categories, Stencil Rules 1-10 (Amendment C) |
 | `docs/cpp26_standards.md` | C++26 code standards (CS-1..CS-13) and the Java/C++ two-domain testing contract |
 | `docs/rbc_spec.md` | Register Bytecode (RBC) specification: frame model, 150-opcode set, type system, verification rules, quickening, text format |
 | `docs/interp_contract.md` | Tier-0 interpreter state contract (v1): the T0 frame, value model, deopt entry (`resume`), quickened-opcode pins, state-dump fixture format |
-| `docs/teams/README.md` | Team organization: eight teams of two AI roles (implementer + reviewer) |
+| `docs/teams/README.md` | Team organization: nine teams of two AI roles (implementer + reviewer), including the GC Team |
 | `docs/teams/messaging.md` | Inter-team message system |
 | `docs/teams/ownership.yaml` | Machine-readable path ownership map |
 | `docs/teams/frontend-team.md` | Frontend Team charter: the source path (Java source -> AST) |
 | `docs/frontend_contract.md` | Frontend v0 interface contract: inputs, outputs, guarantees, future obligations |
-| `docs/teams/*-team.md` | Team charters (frontend, interpreter, baseline-noir, ir, passes, regalloc, codegen, aot) |
+| `docs/teams/*-team.md` | Team charters (frontend, interpreter, baseline-noir, ir, passes, regalloc, codegen, aot, gc) |
 | `docs/templates/` | Message and review templates |
 
 ## Laws First

@@ -25,7 +25,7 @@ compiler/passes/swlp/  compiler/passes/pea/  compiler/passes/nanbox_lowering/  c
 compiler/passes/escape/  compiler/passes/loop/  compiler/passes/scalar/  compiler/passes/memory/  compiler/passes/inline/
 ```
 
-Must deliver: the SWLP pass, the PEA pass, the NaN boxing lowering pass, and the full standard pass suite (see appendix); plus pass contracts, pass budgets, pass telemetry, kill switches, golden tests, and deterministic replay. The engineering designs for the three special passes are fixed in `docs/special_passes.md` (SMT-free: CM-PEA height-6 escape lattice + inline summary tables; speculative effect reordering via the finite effect-kind lookup table and construction rules; adaptive value representation via profile-guided threshold classification) — implementations must follow those designs and their complexity budgets. Not owned: core IR data structures (request via RFC to the IR team), machine lowering, register allocation, codegen, the interpreter, the baseline JIT, the AOT driver.
+Must deliver: the SWLP pass, the PEA pass, the NaN boxing lowering pass, and the full standard pass suite (see appendix); plus pass contracts, pass budgets, pass telemetry, kill switches, golden tests, and deterministic replay. The engineering designs for the three special passes are fixed in `docs/special_passes.md` (SMT-free: CM-PEA height-6 escape lattice + inline summary tables; speculative effect reordering via the finite effect-kind lookup table and construction rules; adaptive value representation via profile-guided threshold classification) — implementations must follow those designs and their complexity budgets. The team is additionally the **primary owner of the ICDG contract** (`docs/icdg.md`, Inline Call/Dispatch Graph): the central call/dispatch decision engine that decides patch / devirtualize / guard-inline / inline / outline / trap / keep-indirect per call site from dispatch stability + downstream unlock value + cost/budget + deopt safety + invalidation risk. ICDG changes require RFC messages and approval from all consuming teams (baseline_noir, codegen, aot, ir). Not owned: core IR data structures (request via RFC to the IR team), machine lowering, register allocation, codegen, the interpreter, the baseline JIT, the AOT driver, the GC (GC Team, `docs/gc.md`).
 
 ---
 
@@ -37,6 +37,7 @@ compiler/pipeline/
 tests/passes/
 docs/pass_contracts.md
 docs/special_passes.md
+docs/icdg.md
 ```
 
 ---

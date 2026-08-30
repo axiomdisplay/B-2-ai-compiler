@@ -1,6 +1,6 @@
 # B-2 Path Ownership Map
 #
-# Machine-readable ownership for the eight B-2 AI teams.
+# Machine-readable ownership for the nine B-2 AI teams.
 # CI must fail any PR that touches paths outside the submitting team's write list.
 # Team doc reference: docs/teams/README.md
 # Message system:     docs/teams/messaging.md
@@ -66,6 +66,10 @@ teams:
       # representation): passes-team owned; NaN boxing representation
       # contracts remain cross-team per the NaN Boxing Rule ownership clause.
       - docs/special_passes.md
+      # ICDG (Inline Call/Dispatch Graph): passes-team is primary owner of the
+      # shared call/dispatch decision contract; consumers (baseline_noir,
+      # codegen, aot, ir) approve changes via RFC messages per docs/icdg.md.
+      - docs/icdg.md
 
   regalloc:
     write:
@@ -84,3 +88,11 @@ teams:
       - compiler/aot/
       - tests/aot/
       - docs/aot_contract.md
+
+  gc:
+    write:
+      - compiler/gc/
+      - include/b2/gc/
+      - tests/gc/
+      - docs/gc.md
+      - docs/teams/gc-team.md

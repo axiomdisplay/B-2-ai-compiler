@@ -1,6 +1,8 @@
 # B-2 Team Organization
 
 This document defines how the B-2 compiler is split into isolated AI teams.
+There are nine teams: the eight compilation teams plus the GC Team
+(`docs/teams/gc-team.md`, design `docs/gc.md`).
 
 The normative rules are in:
 
@@ -93,7 +95,17 @@ Java classfiles enter the same pipeline at the Register Bytecode (RBC) level via
 - Middle end (v0) complete: RBC specification, 150-opcode core, builder, structural/type verifier, deterministic text format, the `b2rbc` driver, and `tests/rbc/` (79 tests + corpus, all green). See `docs/rbc_spec.md`.
 - Backend kickoff (T0 interpreter v0) complete: direct-threaded register interpreter executing all 150 RBC opcodes, the v0 reference runtime (object model, monitors, exceptions with JVM messages, builtin println with JDK-exact float formatting, string interning, lazy class init), inline caches, safepoint polls, saturating profile counters, the deopt entry point (`resume`), the `b2run` driver, and `tests/interp/` (125 tests + 14-program runnable corpus, all green). The published T0 state contract is `docs/interp_contract.md` (v1.0.0) — normative for every compiled tier's deopt path.
 - T1 baseline (plan stage v0) complete: frozen `include/b2/baseline/` contract (stencil identity/categories/patch holes, `StencilPlan` records + 7 invariants, the v0 stencil-set manifest, the `compilePlan` API with budget/refusal semantics), the plan builder (linear no-IR scan with greedy superinstruction fusion, patch-value computation split plan-computable vs runtime-pending, pc map, stack maps, deopt points, translated exception edges, `verifyPlan` auditor), the deterministic golden dump, the `b2plan` driver, and `tests/baseline/` (50 tests, all green; corpus sweep: 5 methods plan, the rest refuse `no-stencil-for-op` per the documented v0 availability map). Instantiation (copy/patch/link, W^X publish) lands with the codegen team's stencil archive.
-- Next: frontend semantic binding and AST -> RBC lowering; T1 stencil instantiation + code cache (codegen team stencil archive); T2 IR construction kickoff (CM-PEA designs per `docs/special_passes.md`).
+- Next: frontend semantic binding and AST -> RBC lowering; T1 stencil instantiation + code cache (codegen team stencil archive); T2 IR construction kickoff (CM-PEA designs per `docs/special_passes.md`; ICDG per `docs/icdg.md` — the T0 interpreter's profile counters are its Phase 1 dispatch profiler); GCR Phase 1 (region allocator, TLAB, young scavenge) per `docs/gc.md`.
+
+---
+
+## Shared Cross-Team Contracts
+
+Two design contracts are shared across teams and require RFC + consumer
+approval to change:
+
+- `docs/icdg.md` — ICDG (Inline Call/Dispatch Graph), primary owner: passes; consumers: baseline_noir, codegen, aot, ir.
+- `docs/gc.md` — GCR (GC design), primary owner: gc; consumers: ir, passes, baseline_noir, codegen, interpreter, aot.
 
 ---
 
@@ -133,8 +145,9 @@ The reviewer does **not** rewrite the implementation unless explicitly reassigne
 | RegAlloc Team | `REGALLOC-IMPL` | `REGALLOC-REV` | T2/T3 | Liveness, register allocation, spills, GC reference tracking |
 | Codegen Team | `CODEGEN-IMPL` | `CODEGEN-REV` | T2/T3 | Lowering, machine code emission, safepoints, deopt stubs, ABI output |
 | AOT Team | `AOT-IMPL` | `AOT-REV` | T3 | AOT driver, manifests, artifact validation |
+| GC Team | `GC-IMPL` | `GC-REV` | runtime | GCR collector: regions, TLABs, barriers, concurrent mark-evacuate, stack-scanning contracts, stress hooks |
 
-Eight teams of two.
+Nine teams of two.
 
 If fewer teams are desired initially, AOT can be merged into Passes/Codegen — but for a real compiler experiment, a separate AOT team is preferred.
 
