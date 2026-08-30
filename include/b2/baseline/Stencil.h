@@ -181,12 +181,15 @@ enum class StencilAvailability : std::uint8_t {
 // the fusion is legal only when the window really is producer/consumer):
 //   useAsA/useAsB = index of an earlier step whose dst register feeds this
 //                   instruction's a/b operand (0xFFFF = unconstrained)
-//   thenDstOf     = reserved for chained dst constraints (0xFFFF = none)
+//   thenDstOf     = index of an earlier step whose dst register must EQUAL
+//                   this step's dst (0xFFFF = none). Chained-dst constraint:
+//                   accumulator idioms (iload_iinc_istore) need the load's,
+//                   the bump's, and the store's registers to be one register.
 struct PatternStep {
   rbc::Op op = rbc::Op::Nop;
   std::uint16_t useAsA = 0xFFFF; // earlier step index feeding operand a
   std::uint16_t useAsB = 0xFFFF; // earlier step index feeding operand b
-  std::uint16_t thenDstOf = 0xFFFF; // reserved (0xFFFF = none)
+  std::uint16_t thenDstOf = 0xFFFF; // earlier step index sharing this dst
 };
 
 // Metadata for one stencil (Stencil Rule 2). Everything the plan builder and
@@ -205,6 +208,17 @@ struct StencilDesc {
 
   StencilFlag flags = StencilFlag::None;
   StencilAvailability availability = StencilAvailability::Available;
+
+  // Fusion register-materialization mask (set version 3; the fusion-soundness
+  // fix). Bit k set = the compiled body does NOT write step k's dst register
+  // slot (the value exists only inside the body - e.g. the two iload results
+  // of iload_iload_iadd live in machine registers and never reach r-slots).
+  // The plan builder REFUSES the fusion unless every skipped dst register is
+  // dead at the window end (a post-window liveness check): a skipped register
+  // that is read later would observe a stale slot value and diverge from T0.
+  // Opcode stencils (pattern_len == 1) always materialize their dst; the
+  // default 0 keeps custom sets conservative. Bits above pattern_len unused.
+  std::uint8_t dst_skip_mask = 0;
 
   // Declared holes, in code order (Stencil Rule 3). The k-th hole of an
   // instance is filled from the k-th PatchValue of that instance.

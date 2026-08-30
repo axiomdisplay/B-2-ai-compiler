@@ -36,12 +36,18 @@
 //        fr.pc to a branch/switch target, (c) returns, or (d) traps.
 //     5. Every opcode that can trap funnels into THE EXCEPTION ALGORITHM.
 //
-// Dispatch threading (charter: direct-threaded, minimal overhead): v0 ships
-// the portable token-threaded core - fetch op, indirect jump through the
-// compiler's dense switch jump table, handler, next fetch. Computed-goto
-// (labels-as-values) is the named v1 upgrade: one TU compiled with
-// gnu++26 + a shared opcode-body table, selected at build time; semantics
-// are identical by construction (same handler bodies, different dispatch).
+// Dispatch threading (charter: direct-threaded, minimal overhead): TWO
+// forms over ONE set of handler bodies (interp_contract.md SS4, v1.1.0).
+// The portable token-threaded core - fetch op, indirect jump through the
+// compiler's dense switch jump table, handler, next fetch - is ALWAYS
+// buildable and is the exhaustiveness proof (no default clause; -Wswitch).
+// The computed-goto core (labels-as-values; the v1 milestone, LANDED) is
+// selected at build time with B2_INTERP_COMPUTED_GOTO (default ON for
+// GNU/Clang; the TU compiles as gnu++26): a designated-initializer label
+// table plus per-handler-tail dispatch, so the branch predictor learns
+// per-opcode transitions. Semantics are identical by construction; the
+// portable test binary runs the identical corpus against the identical
+// goldens as the differential proof (Law 36).
 //
 // Hot-path discipline (Rules 6/7/8/9/16/118): the dispatch switch and its
 // fast paths contain no allocation, no C++ exceptions, no RTTI, no locks,

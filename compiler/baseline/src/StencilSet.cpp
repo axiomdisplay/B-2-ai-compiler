@@ -406,59 +406,183 @@ struct StepSpec {
   Op op;
   std::uint16_t useAsA; // earlier step whose dst feeds this step's a operand
   std::uint16_t useAsB; // ... feeds this step's b operand
+  std::uint16_t thenDstOf; // earlier step whose dst must EQUAL this step's dst
 };
 
 struct SuperSpec {
   const char* name;
-  StepSpec steps[3];
+  StepSpec steps[4];
   std::uint8_t stepCount;
+  // Bits of steps whose dst register the compiled body does NOT write back to
+  // the frame (the value stays in machine registers). The plan builder's
+  // post-window liveness guard refuses the fusion when such a register is
+  // still live after the window - the fusion-soundness fix (set version 3).
+  std::uint8_t skipMask;
 };
 
 constexpr std::uint16_t kNoLink = 0xFFFF; // PatternStep sentinel
 
-// The seven v0 superinstructions from the StencilSet.h spec, in spec order.
+// The superinstructions of the builtin manifest, in spec order. Set v2
+// entries first (the original seven), then the set v3 extension.
 // Producer-consumer links are LOCAL window checks (Amendment A): the fusion
 // is only legal when the window really is producer/consumer.
 constexpr SuperSpec kSuperSpecs[] = {
     {"iload_iload_iadd",
-     {{Op::Iload, kNoLink, kNoLink},
-      {Op::Iload, kNoLink, kNoLink},
-      {Op::Iadd, 0, 1}},
-     3},
+     {{Op::Iload, kNoLink, kNoLink, kNoLink},
+      {Op::Iload, kNoLink, kNoLink, kNoLink},
+      {Op::Iadd, 0, 1, kNoLink},
+      {Op::Nop, kNoLink, kNoLink, kNoLink}},
+     3, 0x03},
     {"iload_iload_isub",
-     {{Op::Iload, kNoLink, kNoLink},
-      {Op::Iload, kNoLink, kNoLink},
-      {Op::Isub, 0, 1}},
-     3},
+     {{Op::Iload, kNoLink, kNoLink, kNoLink},
+      {Op::Iload, kNoLink, kNoLink, kNoLink},
+      {Op::Isub, 0, 1, kNoLink},
+      {Op::Nop, kNoLink, kNoLink, kNoLink}},
+     3, 0x03},
     {"iload_iload_imul",
-     {{Op::Iload, kNoLink, kNoLink},
-      {Op::Iload, kNoLink, kNoLink},
-      {Op::Imul, 0, 1}},
-     3},
+     {{Op::Iload, kNoLink, kNoLink, kNoLink},
+      {Op::Iload, kNoLink, kNoLink, kNoLink},
+      {Op::Imul, 0, 1, kNoLink},
+      {Op::Nop, kNoLink, kNoLink, kNoLink}},
+     3, 0x03},
     {"aload_getfield",
-     {{Op::Aload, kNoLink, kNoLink},
-      {Op::Getfield, 0, kNoLink},
-      {Op::Nop, kNoLink, kNoLink}},
-     2},
+     {{Op::Aload, kNoLink, kNoLink, kNoLink},
+      {Op::Getfield, 0, kNoLink, kNoLink},
+      {Op::Nop, kNoLink, kNoLink, kNoLink},
+      {Op::Nop, kNoLink, kNoLink, kNoLink}},
+     2, 0x01},
     {"aload_arraylength_if",
-     {{Op::Aload, kNoLink, kNoLink},
-      {Op::Arraylength, 0, kNoLink},
-      {Op::IfIcmpgt, 1, kNoLink}},
-     3},
+     {{Op::Aload, kNoLink, kNoLink, kNoLink},
+      {Op::Arraylength, 0, kNoLink, kNoLink},
+      {Op::IfIcmpgt, 1, kNoLink, kNoLink},
+      {Op::Nop, kNoLink, kNoLink, kNoLink}},
+     3, 0x01},
     {"iinc_goto",
-     {{Op::Iinc, kNoLink, kNoLink},
-      {Op::Goto, kNoLink, kNoLink},
-      {Op::Nop, kNoLink, kNoLink}},
-     2},
+     {{Op::Iinc, kNoLink, kNoLink, kNoLink},
+      {Op::Goto, kNoLink, kNoLink, kNoLink},
+      {Op::Nop, kNoLink, kNoLink, kNoLink},
+      {Op::Nop, kNoLink, kNoLink, kNoLink}},
+     2, 0x00},
     {"aload_getfield_ireturn",
-     {{Op::Aload, kNoLink, kNoLink},
-      {Op::Getfield, 0, kNoLink},
-      {Op::Ireturn, 1, kNoLink}},
-     3},
+     {{Op::Aload, kNoLink, kNoLink, kNoLink},
+      {Op::Getfield, 0, kNoLink, kNoLink},
+      {Op::Ireturn, 1, kNoLink, kNoLink},
+      {Op::Nop, kNoLink, kNoLink, kNoLink}},
+     3, 0x03},
+    // --- set v3: the loop-idiom extension (MSG-20260830-005) ----------------
+    {"iload_iload_iadd_istore",
+     {{Op::Iload, kNoLink, kNoLink, kNoLink},
+      {Op::Iload, kNoLink, kNoLink, kNoLink},
+      {Op::Iadd, 0, 1, kNoLink},
+      {Op::Istore, 2, kNoLink, kNoLink}},
+     4, 0x07},
+    {"iload_iload_isub_istore",
+     {{Op::Iload, kNoLink, kNoLink, kNoLink},
+      {Op::Iload, kNoLink, kNoLink, kNoLink},
+      {Op::Isub, 0, 1, kNoLink},
+      {Op::Istore, 2, kNoLink, kNoLink}},
+     4, 0x07},
+    {"iload_iload_imul_istore",
+     {{Op::Iload, kNoLink, kNoLink, kNoLink},
+      {Op::Iload, kNoLink, kNoLink, kNoLink},
+      {Op::Imul, 0, 1, kNoLink},
+      {Op::Istore, 2, kNoLink, kNoLink}},
+     4, 0x07},
+    {"iload_iinc_istore",
+     {{Op::Iload, kNoLink, kNoLink, kNoLink},
+      {Op::Iinc, kNoLink, kNoLink, 0},
+      {Op::Istore, 1, kNoLink, kNoLink},
+      {Op::Nop, kNoLink, kNoLink, kNoLink}},
+     3, 0x03},
+    {"iload_istore",
+     {{Op::Iload, kNoLink, kNoLink, kNoLink},
+      {Op::Istore, 0, kNoLink, kNoLink},
+      {Op::Nop, kNoLink, kNoLink, kNoLink},
+      {Op::Nop, kNoLink, kNoLink, kNoLink}},
+     2, 0x01},
+    {"iload_ireturn",
+     {{Op::Iload, kNoLink, kNoLink, kNoLink},
+      {Op::Ireturn, 0, kNoLink, kNoLink},
+      {Op::Nop, kNoLink, kNoLink, kNoLink},
+      {Op::Nop, kNoLink, kNoLink, kNoLink}},
+     2, 0x01},
+    {"iload_ifeq",
+     {{Op::Iload, kNoLink, kNoLink, kNoLink},
+      {Op::Ifeq, 0, kNoLink, kNoLink},
+      {Op::Nop, kNoLink, kNoLink, kNoLink},
+      {Op::Nop, kNoLink, kNoLink, kNoLink}},
+     2, 0x01},
+    {"iload_ifne",
+     {{Op::Iload, kNoLink, kNoLink, kNoLink},
+      {Op::Ifne, 0, kNoLink, kNoLink},
+      {Op::Nop, kNoLink, kNoLink, kNoLink},
+      {Op::Nop, kNoLink, kNoLink, kNoLink}},
+     2, 0x01},
+    {"iload_iflt",
+     {{Op::Iload, kNoLink, kNoLink, kNoLink},
+      {Op::Iflt, 0, kNoLink, kNoLink},
+      {Op::Nop, kNoLink, kNoLink, kNoLink},
+      {Op::Nop, kNoLink, kNoLink, kNoLink}},
+     2, 0x01},
+    {"iload_ifge",
+     {{Op::Iload, kNoLink, kNoLink, kNoLink},
+      {Op::Ifge, 0, kNoLink, kNoLink},
+      {Op::Nop, kNoLink, kNoLink, kNoLink},
+      {Op::Nop, kNoLink, kNoLink, kNoLink}},
+     2, 0x01},
+    {"iload_ifgt",
+     {{Op::Iload, kNoLink, kNoLink, kNoLink},
+      {Op::Ifgt, 0, kNoLink, kNoLink},
+      {Op::Nop, kNoLink, kNoLink, kNoLink},
+      {Op::Nop, kNoLink, kNoLink, kNoLink}},
+     2, 0x01},
+    {"iload_ifle",
+     {{Op::Iload, kNoLink, kNoLink, kNoLink},
+      {Op::Ifle, 0, kNoLink, kNoLink},
+      {Op::Nop, kNoLink, kNoLink, kNoLink},
+      {Op::Nop, kNoLink, kNoLink, kNoLink}},
+     2, 0x01},
+    {"iload_iconst_if_icmpeq",
+     {{Op::Iload, kNoLink, kNoLink, kNoLink},
+      {Op::Iconst, kNoLink, kNoLink, kNoLink},
+      {Op::IfIcmpeq, 0, 1, kNoLink},
+      {Op::Nop, kNoLink, kNoLink, kNoLink}},
+     3, 0x03},
+    {"iload_iconst_if_icmpne",
+     {{Op::Iload, kNoLink, kNoLink, kNoLink},
+      {Op::Iconst, kNoLink, kNoLink, kNoLink},
+      {Op::IfIcmpne, 0, 1, kNoLink},
+      {Op::Nop, kNoLink, kNoLink, kNoLink}},
+     3, 0x03},
+    {"iload_iconst_if_icmplt",
+     {{Op::Iload, kNoLink, kNoLink, kNoLink},
+      {Op::Iconst, kNoLink, kNoLink, kNoLink},
+      {Op::IfIcmplt, 0, 1, kNoLink},
+      {Op::Nop, kNoLink, kNoLink, kNoLink}},
+     3, 0x03},
+    {"iload_iconst_if_icmpge",
+     {{Op::Iload, kNoLink, kNoLink, kNoLink},
+      {Op::Iconst, kNoLink, kNoLink, kNoLink},
+      {Op::IfIcmpge, 0, 1, kNoLink},
+      {Op::Nop, kNoLink, kNoLink, kNoLink}},
+     3, 0x03},
+    {"iload_iconst_if_icmpgt",
+     {{Op::Iload, kNoLink, kNoLink, kNoLink},
+      {Op::Iconst, kNoLink, kNoLink, kNoLink},
+      {Op::IfIcmpgt, 0, 1, kNoLink},
+      {Op::Nop, kNoLink, kNoLink, kNoLink}},
+     3, 0x03},
+    {"iload_iconst_if_icmple",
+     {{Op::Iload, kNoLink, kNoLink, kNoLink},
+      {Op::Iconst, kNoLink, kNoLink, kNoLink},
+      {Op::IfIcmple, 0, 1, kNoLink},
+      {Op::Nop, kNoLink, kNoLink, kNoLink}},
+     3, 0x03},
 };
 
-static_assert(sizeof(kSuperSpecs) / sizeof(kSuperSpecs[0]) == 7,
-              "the v0 manifest carries exactly the seven spec'd superinstructions");
+static_assert(sizeof(kSuperSpecs) / sizeof(kSuperSpecs[0]) == 25,
+              "the builtin manifest carries exactly the 25 spec'd "
+              "superinstructions (7 of set v2 + 18 of set v3)");
 
 [[nodiscard]] std::uint8_t saturatingAddU8(std::uint8_t a, std::uint8_t b) noexcept {
   const unsigned sum = static_cast<unsigned>(a) + static_cast<unsigned>(b);
@@ -473,6 +597,7 @@ static_assert(sizeof(kSuperSpecs) / sizeof(kSuperSpecs[0]) == 7,
   d.flags = StencilFlag::None;
   d.frame_reads = 0;
   d.frame_writes = 0;
+  d.dst_skip_mask = spec.skipMask;
   std::uint64_t sizeSum = 0;
   for (std::uint8_t k = 0; k < spec.stepCount; ++k) {
     // Each part is built by the SAME makeOpStencil pipeline, then combined:
@@ -482,7 +607,7 @@ static_assert(sizeof(kSuperSpecs) / sizeof(kSuperSpecs[0]) == 7,
     d.pattern[k].op = spec.steps[k].op;
     d.pattern[k].useAsA = spec.steps[k].useAsA;
     d.pattern[k].useAsB = spec.steps[k].useAsB;
-    d.pattern[k].thenDstOf = kNoLink; // reserved (Stencil.h)
+    d.pattern[k].thenDstOf = spec.steps[k].thenDstOf;
     d.flags = d.flags | part.flags;
     d.frame_reads = saturatingAddU8(d.frame_reads, part.frame_reads);
     d.frame_writes = saturatingAddU8(d.frame_writes, part.frame_writes);

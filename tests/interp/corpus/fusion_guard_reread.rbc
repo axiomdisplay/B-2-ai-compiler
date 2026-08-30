@@ -1,0 +1,29 @@
+# Fusion register guard regression (set v3, MSG-20260830-005): the second
+# iadd re-reads r0/r1 after the would-be iload_iload_iadd window, so T1 must
+# refuse the fusion and compute 5+7 = 12 exactly like T0. The set v2 planner
+# fused the window, skipped the register writes, and printed 107 (the stale
+# iconst r0 100 + the stale r1 7) - the Law-36 differential catch.
+# Positive corpus file: must parse, verify, and run under T0 with the exact
+# expected stdout (Java semantics oracle, Rule 67).
+
+.class Main
+
+.method static main ()V
+.regs 8
+.locals 2
+.const c0 = field java/lang/System out Ljava/io/PrintStream;
+.const c1 = method java/io/PrintStream println (I)V
+iconst r0 5
+istore r0 l0
+iconst r1 7
+istore r1 l1
+iconst r0 100
+iload r0 l0
+iload r1 l1
+iadd r2 r0 r1
+iadd r3 r0 r1
+getstatic r4 c0
+imove r5 r3
+invokevirtual r6 r4 r2 c1
+return
+.end

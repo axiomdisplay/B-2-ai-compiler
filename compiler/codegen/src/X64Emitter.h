@@ -517,6 +517,23 @@ public:
     u8(0x66); u8(0x0F); u8(0x6E);
     u8(0xC8 | (static_cast<std::uint8_t>(src) & 7));
   }
+  // movq xmm0, r64 (66 48 0F 6E /r): the payload half of building a whole
+  // 16-byte interp::Value in xmm0 (superinstruction whole-slot stores).
+  void movqXmm0FromGpr(Gpr src) {
+    u8(0x66); u8(0x48); u8(0x0F); u8(0x6E);
+    u8(0xC0 | (static_cast<std::uint8_t>(src) & 7));
+  }
+  // pslldq xmm0, imm8 (66 0F 73 /7 ib): shift the qword payload into the
+  // high half of xmm0, leaving the tag half free for pinsrd.
+  void pslldqXmm0(std::uint8_t bytes) {
+    u8(0x66); u8(0x0F); u8(0x73); u8(0xF8); u8(bytes);
+  }
+  // pinsrd xmm0, r32, 0 (66 0F 3A 22 /r ib, SSE4.1): write the type tag
+  // into the low dword of xmm0, completing the Value build.
+  void pinsrdXmm0FromGpr(Gpr src) {
+    u8(0x66); u8(0x0F); u8(0x3A); u8(0x22);
+    u8(0xC0 | (static_cast<std::uint8_t>(src) & 7)); u8(0x00);
+  }
   enum class SseOp : std::uint8_t { Add, Sub, Mul, Div };
   void sseFloat(Xmm dst, SseOp op, PatchSource src, std::uint8_t step = 0) {
     static constexpr std::uint8_t kOps[4] = {0x58, 0x5C, 0x59, 0x5E};

@@ -1,0 +1,35 @@
+# Fusion register guard regression (set v3, MSG-20260830-005): the
+# loop-carried case. The iload_iinc_istore window [8,11) would skip r3's
+# register write, but the iadd at the loop head re-reads r3 through the
+# backedge (goto -> head -> iadd) with no intervening redefinition - only
+# the backward liveness fixpoint catches this; a linear scan would misread
+# the pc-8 iload as a kill. T0 and T1 must both print 46 (1 + 9 + ... + 1).
+# Positive corpus file: must parse, verify, and run under T0 with the exact
+# expected stdout (Java semantics oracle, Rule 67).
+
+.class Main
+
+.method static main ()V
+.regs 6
+.locals 1
+.const c0 = field java/lang/System out Ljava/io/PrintStream;
+.const c1 = method java/io/PrintStream println (I)V
+iconst r2 0
+iconst r3 1
+iconst r0 10
+istore r0 l0
+Lhead:
+safepoint_poll
+iload r1 l0
+ifle r1 Ldone
+iadd r2 r2 r3
+iload r3 l0
+iinc r3 -1
+istore r3 l0
+goto Lhead
+Ldone:
+getstatic r4 c0
+imove r5 r2
+invokevirtual r4 r4 r2 c1
+return
+.end

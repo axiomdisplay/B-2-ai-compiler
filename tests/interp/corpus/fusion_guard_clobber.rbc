@@ -1,0 +1,26 @@
+# Fusion register guard regression (set v3, MSG-20260830-005): both loads
+# define r0, so the iadd's b operand must see the SECOND load (7). The set v2
+# in-window clobber was unchecked and a fused body computing from both
+# locals would print 10 (5+5) instead of 12 (5+7).
+# Positive corpus file: must parse, verify, and run under T0 with the exact
+# expected stdout (Java semantics oracle, Rule 67).
+
+.class Main
+
+.method static main ()V
+.regs 5
+.locals 2
+.const c0 = field java/lang/System out Ljava/io/PrintStream;
+.const c1 = method java/io/PrintStream println (I)V
+iconst r0 5
+istore r0 l0
+iconst r1 7
+istore r1 l1
+iload r0 l0
+iload r0 l1
+iadd r2 r0 r0
+getstatic r3 c0
+imove r4 r2
+invokevirtual r3 r3 r2 c1
+return
+.end

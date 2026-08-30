@@ -10,6 +10,7 @@
 //
 // Usage:
 //   b2jit program.rbc [--entry NAME DESC] [--stats] [--quiet] [--code NAME]
+//                     [--bench N] [--no-fusion]
 //
 //   --entry NAME DESC   entry method (default: main; descriptor inferred
 //                       like b2run: ()V if present, else the String[] form)
@@ -17,11 +18,17 @@
 //   --quiet             suppress the "[b2jit] ..." status lines
 //   --code NAME         dump the compiled code of every method whose name
 //                       contains NAME (the golden/inspection path)
+//   --bench N           run N additional times on the same engine and report
+//                       steady-state timing to stderr (first run compiles;
+//                       the rest reuse the code cache - measures execution)
+//   --no-fusion         plan with superinstructions off (the diagnostic
+//                       mode; the A/B side of the fusion-set measurements)
 //
 // Exit status: 0 = normal return, 1 = uncaught Java exception or failure.
 
 #include <csignal>
 #include <ucontext.h>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -95,7 +102,7 @@ int main(int argc, char** argv) {
   if (argc < 2) {
     std::fprintf(stderr,
                  "usage: b2jit program.rbc [--entry NAME DESC] [--stats] "
-                 "[--quiet] [--code NAME]\n");
+                 "[--quiet] [--code NAME] [--bench N] [--no-fusion]\n");
     return 1;
   }
 
@@ -104,6 +111,13 @@ int main(int argc, char** argv) {
   std::string entryDesc;
   bool stats = false, quiet = false;
   std::string codeFilter;
+  // --bench N (MSG-20260830-005): run the program N times on ONE engine and
+  // report steady-state timing (first run compiles; the rest reuse the code
+  // cache - the measurement is execution, not compilation). --no-fusion:
+  // plan with superinstructions off (the diagnostic mode; the A/B side of the
+  // superinstruction set extension measurement).
+  std::uint32_t benchRuns = 0;
+  bool noFusion = false;
 
   for (int i = 1; i < argc; ++i) {
     const std::string_view arg = argv[i];
@@ -116,6 +130,11 @@ int main(int argc, char** argv) {
       quiet = true;
     } else if (arg == "--code" && i + 1 < argc) {
       codeFilter = argv[++i];
+    } else if (arg == "--bench" && i + 1 < argc) {
+      benchRuns = static_cast<std::uint32_t>(
+          std::strtoul(argv[++i], nullptr, 10));
+    } else if (arg == "--no-fusion") {
+      noFusion = true;
     } else if (path.empty()) {
       path = arg;
     } else {
@@ -147,7 +166,11 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  b2::codegen::Tier1 jit(*parsed);
+  b2::codegen::Tier1Config cfg;
+  if (noFusion) {
+    cfg.plan_options.superinstructions = false;
+  }
+  b2::codegen::Tier1 jit(*parsed, cfg);
 
   if (entryDesc.empty()) {
     entryDesc = "()V";
@@ -163,7 +186,37 @@ int main(int argc, char** argv) {
     args.push_back(b2::interp::Value::refVal(arr));
   }
 
-  const b2::codegen::Tier1RunResult r = jit.run(entryName, entryDesc, args);
+  const b2::codegen::Tier1RunResult r = [&] {
+    if (benchRuns == 0) {
+      return jit.run(entryName, entryDesc, args);
+    }
+    // Warmup run: compiles + instantiates; also the behavioral reference.
+    const b2::codegen::Tier1RunResult first =
+        jit.run(entryName, entryDesc, args);
+    const auto t0 = std::chrono::steady_clock::now();
+    for (std::uint32_t i = 0; i < benchRuns; ++i) {
+      const b2::codegen::Tier1RunResult rr =
+          jit.run(entryName, entryDesc, args);
+      if (rr.status != first.status) {
+        std::fprintf(stderr,
+                     "[b2jit] bench run %u diverged (status %d != %d); "
+                     "refusing to report\n",
+                     i, static_cast<int>(rr.status),
+                     static_cast<int>(first.status));
+        std::exit(1);
+      }
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+    const double wallNs = static_cast<double>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+    std::fprintf(stderr,
+                 "[b2jit] bench fusion=%s runs=%u wall_ms=%.3f "
+                 "ns_per_run=%.1f t1_entries=%llu\n",
+                 noFusion ? "off" : "on", benchRuns, wallNs / 1.0e6,
+                 wallNs / static_cast<double>(benchRuns),
+                 static_cast<unsigned long long>(first.stats.t1_entries));
+    return first;
+  }();
 
   // Program-visible output first (Java ordering discipline, as b2run).
   std::fwrite(jit.interp().runtime().stdout().data(), 1,

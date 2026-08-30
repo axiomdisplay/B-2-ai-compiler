@@ -6,11 +6,13 @@
 // longest-match superinstruction fusion through a peephole window, (3) a
 // second linear pass assembling the pc map, stack maps, deopt points, and
 // exception edges, (4) the backedge-poll membership check, (5) a final
-// verifyPlan() self-audit. There is NO IR, NO dataflow, NO worklist, NO
-// fixpoint (Amendment A): every "analysis" below is a single linear pass
-// building a membership set, exactly like the poll set the contract names.
-// Effect order in the plan IS RBC order - nothing is reordered, eliminated,
-// or speculated.
+// verifyPlan() self-audit. There is NO IR and NO worklist scheduler
+// (Amendment A): every membership set below is a linear pass, and the one
+// fixpoint that exists (register liveness, set version 3) is a bounded
+// backward bitset pass over the ORIGINAL RBC pcs serving ONLY the fusion
+// guard - it creates no nodes, reorders nothing, and its result is a pure
+// function of (RBC, set, options) (Rule 124). Effect order in the plan IS
+// RBC order - nothing is reordered, eliminated, or speculated.
 //
 // The builder TRUSTS the verifier (structural bounds, cp kinds, branch
 // targets, handler ranges) and re-checks only what selection itself needs:
@@ -40,6 +42,17 @@
 //   a real instance boundary (instantiable branch/exception patching), and
 //   makes "handler range covers instance range" unambiguous for exc_covers.
 //   It is a bounded membership check over precomputed tables, not analysis.
+// - Fusion register guard (set version 3, MSG-20260830-005; the
+//   fusion-soundness fix): a fused body may leave intermediate step dst
+//   registers in machine registers (StencilDesc::dst_skip_mask). The window
+//   is only fused when every skipped register is DEAD at the window end
+//   (backward register liveness over the method's normal control edges),
+//   when no in-window step clobbers a linked producer's register between
+//   producer and consumer, and when no UNLINKED register read of a window
+//   step aliases a skipped in-window dst. Exception edges contribute NO
+//   liveness (registers die at handler entry, rbc_spec.md SS5.3) and deopt
+//   edges re-execute from the fusion start (where T0 rewrites the skipped
+//   registers itself), so both are excluded by construction.
 // - GuardCp deopt ids live in Ins::b (Sig::GuardCp pin in rbc/Opcode.h), so
 //   DeoptIdSource values read b for guard_class and imm elsewhere; DeoptId
 //   holes on call stencils carry the plan-allocated CallException id.
@@ -241,11 +254,289 @@ void markControlTargets(const rbc::Method& m, std::vector<char>& marked) {
   return blocked;
 }
 
-// --- superinstruction matching (the peephole window) -------------------------------
+// --- register effect classification + liveness (the fusion register guard) --------
+//
+// WHICH registers an instruction READS (uses) and DEFINES (defs), derived from
+// rbc::Sig plus the operand pins the interpreter implements (Interp.cpp):
+// - iinc reads AND writes dst (dst = dst + imm, JLS 15.26.2 compound form);
+// - putstatic's dst is READ (P1: "Sig::RegCp, dst is READ as the value");
+// - putfield reads a (object) and b (value), defines nothing;
+// - the eight array stores read dst (value), a (array), b (index), define
+//   nothing (P3);
+// - calls read the arg range a..a+b-1 (receiver first for instance calls);
+//   the dst write on normal return is NOT a def here (conservative: treating
+//   it as live-through only refuses extra fusions, never unsound ones), and
+//   exception returns kill the whole register file (SS5.3) so they carry no
+//   liveness at all;
+// - multianewarray reads the b dimension registers a..a+b-1.
+[[nodiscard]] bool isArrayStoreOp(Op op) noexcept {
+  switch (op) {
+    case Op::Iastore: case Op::Lastore: case Op::Fastore:
+    case Op::Dastore: case Op::Aastore: case Op::Bastore:
+    case Op::Castore: case Op::Sastore:
+      return true;
+    default:
+      return false;
+  }
+}
 
+// Appends the read register numbers of `ins` to `out` (duplicates possible;
+// callers treat it as a set union).
+void appendRegReads(const rbc::Ins& ins, std::vector<std::uint16_t>& out) {
+  const Op op = ins.opcode();
+  const Sig sig = rbc::info(op).sig;
+  const auto push = [&out](std::uint16_t r) { out.push_back(r); };
+  switch (sig) {
+    case Sig::None:
+    case Sig::Branch:
+    case Sig::Trap:
+      break;
+    case Sig::Reg:          // monitorenter/exit, *return, athrow: read a
+    case Sig::RegBranch:    // if<cond>: read a
+    case Sig::RegCpBranch:  // switch: read a (selector)
+    case Sig::RegSlot:      // loads: no reg reads (reads a local)
+      if (sig != Sig::RegSlot) {
+        push(ins.a);
+      }
+      break;
+    case Sig::SlotReg:      // stores: read a
+    case Sig::RegReg:       // moves/neg/length/cast: read a
+    case Sig::RegRegImm:    // newarray: read a (length)
+    case Sig::RegRegCp:     // getfield/new/checkcast/instanceof: read a
+      push(ins.a);
+      break;
+    case Sig::RegImm:       // iinc reads dst; iconst/fconst/aconst_null read none
+      if (op == Op::Iinc) {
+        push(ins.dst);
+      }
+      break;
+    case Sig::RegCp:        // lconst/dconst/ldc write only; putstatic READS dst
+      if (op == Op::Putstatic) {
+        push(ins.dst);
+      }
+      break;
+    case Sig::RegRegReg:    // arith reads a,b; array stores read dst,a,b
+      if (isArrayStoreOp(op)) {
+        push(ins.dst);
+        push(ins.a);
+        push(ins.b);
+      } else {
+        push(ins.a);
+        push(ins.b);
+      }
+      break;
+    case Sig::RegRegRegCp:  // putfield: a=object, b=value; multianewarray: dims
+      if (op == Op::Multianewarray) {
+        for (std::uint32_t k = 0; k < ins.b && k < 0xFFFFu; ++k) {
+          push(static_cast<std::uint16_t>(ins.a + k));
+        }
+      } else { // putfield
+        push(ins.a);
+        push(ins.b);
+      }
+      break;
+    case Sig::RegRegBranch: // if_icmp*/if_acmp*: read a,b
+      push(ins.a);
+      push(ins.b);
+      break;
+    case Sig::Call:
+    case Sig::CallQuick:
+      for (std::uint32_t k = 0; k < ins.b && k < 0xFFFFu; ++k) {
+        push(static_cast<std::uint16_t>(ins.a + k));
+      }
+      break;
+    case Sig::Guard:
+    case Sig::GuardCp:
+      push(ins.a);
+      break;
+  }
+}
+
+// Does `ins` DEFINE its dst register? (False = dst is not written at all:
+// stores/branches/putfield/array stores, or write-only locals/cp pools.)
+[[nodiscard]] bool definesDst(const rbc::Ins& ins) noexcept {
+  const Op op = ins.opcode();
+  const Sig sig = rbc::info(op).sig;
+  switch (sig) {
+    case Sig::RegSlot:   // loads
+    case Sig::RegReg:    // moves/neg/length/cast
+    case Sig::RegRegReg: // arith (array stores filtered below)
+    case Sig::RegImm:    // iconst/fconst/aconst_null/iinc
+    case Sig::RegCp:     // lconst/dconst/ldc (putstatic filtered below)
+    case Sig::RegRegImm: // newarray
+    case Sig::RegRegCp:  // getfield/new/anewarray/checkcast/instanceof
+    case Sig::RegRegRegCp: // multianewarray (putfield filtered below)
+      return !isArrayStoreOp(op) && op != Op::Putstatic && op != Op::Putfield;
+    default:
+      return false;
+  }
+}
+
+// One liveness word per 64 registers; a method's register file is bounded by
+// the verifier and the plan budget, so words stays tiny in practice.
+struct LiveSet {
+  std::vector<std::uint64_t> words;
+
+  [[nodiscard]] bool test(std::uint16_t reg) const noexcept {
+    return (words[reg >> 6] >> (reg & 63u)) & 1ull;
+  }
+  void set(std::uint16_t reg) noexcept {
+    words[reg >> 6] |= 1ull << (reg & 63u);
+  }
+  void reset(std::uint16_t reg) noexcept {
+    words[reg >> 6] &= ~(1ull << (reg & 63u));
+  }
+};
+
+// liveBefore[p] = registers live at the boundary JUST BEFORE pc p (state a
+// T0 resumption at p would need). liveBefore[code.size()] is the past-the-end
+// boundary (empty: verified methods end in terminators, and the conservative
+// empty set only refuses fusions). Backward fixpoint over NORMAL control
+// edges only - exception edges kill the register file (SS5.3) and deopt edges
+// re-execute from the fusion start, so neither contributes liveness.
+struct LivenessInfo {
+  std::size_t words = 0;
+  std::vector<std::uint64_t> liveBefore; // (code.size() + 1) * words
+  std::vector<std::uint16_t> usesFlat;   // per-pc read lists, flattened
+  std::vector<std::uint32_t> usesOffset; // code.size() + 2 offsets into usesFlat
+
+  [[nodiscard]] LiveSet at(std::uint32_t pc) const noexcept {
+    LiveSet s;
+    s.words.assign(words, 0ull);
+    const std::size_t base = static_cast<std::size_t>(pc) * words;
+    for (std::size_t i = 0; i < words; ++i) {
+      s.words[i] = liveBefore[base + i];
+    }
+    return s;
+  }
+};
+
+[[nodiscard]] LivenessInfo computeLiveness(const rbc::Method& m) {
+  LivenessInfo li;
+  const std::size_t n = m.code.size();
+  li.words = (static_cast<std::size_t>(m.numRegs) + 63u) / 64u;
+  if (li.words == 0) {
+    li.words = 1; // numRegs == 0: one empty word keeps indexing uniform
+  }
+  li.liveBefore.assign((n + 1) * li.words, 0ull);
+  li.usesOffset.assign(n + 1, 0);
+
+  // Per-pc uses + normal successors, in one pass.
+  std::vector<std::vector<std::uint16_t>> succs(n);
+  std::vector<std::uint16_t> reads;
+  for (std::uint32_t p = 0; p < n; ++p) {
+    reads.clear();
+    appendRegReads(m.code[p], reads);
+    li.usesFlat.insert(li.usesFlat.end(), reads.begin(), reads.end());
+    li.usesOffset[p] = static_cast<std::uint32_t>(li.usesFlat.size());
+    const Sig sig = rbc::info(m.code[p].opcode()).sig;
+    const auto addSucc = [&](std::uint32_t t) {
+      if (t < n) {
+        succs[p].push_back(static_cast<std::uint16_t>(t));
+      }
+    };
+    switch (sig) {
+      case Sig::Branch: // goto
+        addSucc(m.code[p].imm);
+        break;
+      case Sig::RegBranch:
+      case Sig::RegRegBranch:
+        addSucc(m.code[p].imm);
+        addSucc(p + 1);
+        break;
+      case Sig::RegCpBranch: {
+        // Canonical switch payloads (Verifier.cpp/Interp.cpp A1 pin):
+        // tableswitch [low, high, default, t(low)..t(high)];
+        // lookupswitch [N, default, match,target pairs].
+        if (m.code[p].imm < m.cp.size() &&
+            m.cp[m.code[p].imm].kind == rbc::Const::Kind::SwitchTable) {
+          const std::vector<std::int32_t>& tbl = m.cp[m.code[p].imm].ints;
+          if (tbl.size() >= 3) {
+            if (m.code[p].opcode() == Op::Tableswitch) {
+              for (std::size_t k = 2; k < tbl.size(); ++k) {
+                addSucc(static_cast<std::uint32_t>(tbl[k]));
+              }
+            } else {
+              addSucc(static_cast<std::uint32_t>(tbl[1]));
+              for (std::size_t k = 3; k < tbl.size(); k += 2) {
+                addSucc(static_cast<std::uint32_t>(tbl[k]));
+              }
+            }
+          }
+        }
+        break;
+      }
+      case Sig::Reg: // returns + athrow terminate; monitorenter/exit fall
+        if (m.code[p].opcode() != Op::Monitorenter &&
+            m.code[p].opcode() != Op::Monitorexit) {
+          break; // no successors
+        }
+        addSucc(p + 1);
+        break;
+      case Sig::Trap: // deopt_trap transfers to T0; no normal successor
+        break;
+      default:
+        addSucc(p + 1);
+        break;
+    }
+  }
+  li.usesOffset[n] = static_cast<std::uint32_t>(li.usesFlat.size());
+
+  // Backward fixpoint: iterate to a stable liveBefore. The iteration order
+  // (reverse pc) makes straight-line code converge in one pass; loops need
+  // one extra pass per nesting level in the worst case. Bounded by the plan
+  // budget's method-size ceilings; deterministic result (Rule 124).
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (std::uint32_t p = static_cast<std::uint32_t>(n); p-- > 0;) {
+      LiveSet after;
+      after.words.assign(li.words, 0ull);
+      for (const std::uint16_t s : succs[p]) {
+        const std::size_t base = static_cast<std::size_t>(s) * li.words;
+        for (std::size_t w = 0; w < li.words; ++w) {
+          after.words[w] |= li.liveBefore[base + w];
+        }
+      }
+      // No fallthrough for terminators is already encoded in succs (empty).
+      if (definesDst(m.code[p])) {
+        after.reset(m.code[p].dst);
+      }
+      const std::uint32_t uBegin = (p == 0) ? 0 : li.usesOffset[p - 1];
+      const std::uint32_t uEnd = li.usesOffset[p];
+      for (std::uint32_t k = uBegin; k < uEnd; ++k) {
+        after.set(li.usesFlat[k]);
+      }
+      const std::size_t base = static_cast<std::size_t>(p) * li.words;
+      for (std::size_t w = 0; w < li.words; ++w) {
+        if (after.words[w] != li.liveBefore[base + w]) {
+          li.liveBefore[base + w] = after.words[w];
+          changed = true;
+        }
+      }
+    }
+  }
+  return li;
+}
+
+// --- superinstruction matching (the peephole window) -------------------------------
+//
+// Full legality rule set (set version 3; the fusion-soundness fix):
+//   L1 opcode sequence matches (existing);
+//   L2 declared a/b links hold AND no in-window step between producer and
+//      consumer rewrites the linked register (the double-write case: two
+//      producers of one register would make the body's local-based
+//      computation read the wrong generation);
+//   L3 thenDstOf chained-dst constraints hold (accumulator idioms);
+//   L4 no UNLINKED register read of a window step aliases a SKIPPED in-window
+//      dst (the body would read a stale slot instead of the pre-window value);
+//   L5 every SKIPPED dst register (StencilDesc::dst_skip_mask) is dead at the
+//      window end (backward liveness) - the main soundness guard;
+//   L6 no branch target / handler boundary strictly inside (existing guard).
 [[nodiscard]] bool matchSuper(const StencilDesc& cand, const rbc::Method& m,
                               std::uint32_t pc,
-                              const std::vector<char>& blockedInside) noexcept {
+                              const std::vector<char>& blockedInside,
+                              const LivenessInfo& live) noexcept {
   const std::uint32_t len = cand.pattern_len;
   if (len == 0 || len > StencilDesc::kMaxPattern) {
     return false;
@@ -260,25 +551,110 @@ void markControlTargets(const rbc::Method& m, std::vector<char>& marked) {
     // Producer-consumer links: an earlier step's dst must feed this step's
     // a/b operand. Links only point backwards (Stencil.h).
     const std::uint16_t linkA = cand.pattern[k].useAsA;
-    if (linkA != kNoStepLink) {
+    const bool linkedA = linkA != kNoStepLink;
+    if (linkedA) {
       if (linkA >= k) {
         return false;
       }
       if (m.code[pc + linkA].dst != m.code[pc + k].a) {
         return false;
       }
+      // L2: an intermediate step rewriting the linked register between
+      // producer and consumer changes the generation the consumer sees.
+      for (std::uint32_t mid = linkA + 1; mid < k; ++mid) {
+        if (m.code[pc + mid].dst == m.code[pc + k].a) {
+          return false;
+        }
+      }
     }
     const std::uint16_t linkB = cand.pattern[k].useAsB;
-    if (linkB != kNoStepLink) {
+    const bool linkedB = linkB != kNoStepLink;
+    if (linkedB) {
       if (linkB >= k) {
         return false;
       }
       if (m.code[pc + linkB].dst != m.code[pc + k].b) {
         return false;
       }
+      for (std::uint32_t mid = linkB + 1; mid < k; ++mid) {
+        if (m.code[pc + mid].dst == m.code[pc + k].b) {
+          return false;
+        }
+      }
+    }
+    // L3: chained-dst constraint (iload_iinc_istore and friends): this
+    // step's dst equals the linked step's dst, and nothing in between
+    // rewrites it (the body computes the accumulator from the producer).
+    const std::uint16_t dstLink = cand.pattern[k].thenDstOf;
+    const bool dstLinked = dstLink != kNoStepLink;
+    if (dstLinked) {
+      if (dstLink >= k) {
+        return false;
+      }
+      if (m.code[pc + dstLink].dst != m.code[pc + k].dst) {
+        return false;
+      }
+      for (std::uint32_t mid = dstLink + 1; mid < k; ++mid) {
+        if (m.code[pc + mid].dst == m.code[pc + k].dst) {
+          return false;
+        }
+      }
+    }
+    // L4: an unlinked register read of this step aliases a skipped earlier
+    // dst -> the body would read a stale slot. (Aliasing a MATERIALIZED dst
+    // is fine: the body wrote the correct value into the slot. The iinc
+    // accumulator read is covered by the thenDstOf chain, not a/b links.)
+    if (!linkedA || !linkedB) {
+      std::uint16_t reads[2] = {};
+      std::uint32_t readCount = 0;
+      // a/b operand reads by Sig (dst-read ops cannot appear in v0 windows:
+      // no fusion pattern contains putstatic/array stores/calls).
+      const Sig sig = rbc::info(m.code[pc + k].opcode()).sig;
+      if (sig == Sig::Reg || sig == Sig::RegBranch || sig == Sig::RegCpBranch ||
+          sig == Sig::SlotReg || sig == Sig::RegReg || sig == Sig::RegRegImm ||
+          sig == Sig::RegRegCp || sig == Sig::Guard || sig == Sig::GuardCp) {
+        reads[readCount++] = m.code[pc + k].a;
+      } else if (sig == Sig::RegRegReg || sig == Sig::RegRegBranch ||
+                 sig == Sig::RegRegRegCp) {
+        reads[readCount++] = m.code[pc + k].a;
+        reads[readCount++] = m.code[pc + k].b;
+      } else if (sig == Sig::RegImm && m.code[pc + k].opcode() == Op::Iinc) {
+        reads[readCount++] = m.code[pc + k].dst; // the accumulator read
+      }
+      for (std::uint32_t r = 0; r < readCount; ++r) {
+        const std::uint16_t reg = reads[r];
+        if (linkedA && reg == m.code[pc + k].a) {
+          continue; // supplied by the linked producer, not the slot
+        }
+        if (linkedB && reg == m.code[pc + k].b) {
+          continue;
+        }
+        if (dstLinked && reg == m.code[pc + k].dst) {
+          continue; // supplied through the thenDstOf accumulator chain
+        }
+        for (std::uint32_t j = 0; j < k; ++j) {
+          if (((cand.dst_skip_mask >> j) & 1u) != 0u &&
+              m.code[pc + j].dst == reg) {
+            return false;
+          }
+        }
+      }
     }
   }
-  // Fusion-safety guard (see the file header): no observable boundary may
+  // L5: every skipped dst must be dead at the window end. The window's own
+  // linked reads are satisfied inside the body; a skipped register live at
+  // pc+len would be read (before any redefinition) with a stale slot value.
+  if (cand.dst_skip_mask != 0) {
+    const LiveSet liveEnd = live.at(pc + len);
+    for (std::uint32_t k = 0; k < len; ++k) {
+      if (((cand.dst_skip_mask >> k) & 1u) != 0u) {
+        if (liveEnd.test(m.code[pc + k].dst)) {
+          return false;
+        }
+      }
+    }
+  }
+  // L6: fusion-safety guard (see the file header): no observable boundary may
   // fall strictly inside the window.
   for (std::uint32_t t = pc + 1; t < pc + len; ++t) {
     if (blockedInside[t] != 0) {
@@ -630,9 +1006,12 @@ PlanResult compilePlan(const rbc::Program& program, std::uint32_t method_index,
     return refused(RefuseReason::UnverifiableMethod, std::move(detail));
   }
 
-  // Membership sets, each built in ONE linear pass (Amendment A discipline).
+  // Membership sets, each built in ONE linear pass (Amendment A discipline),
+  // plus the backward register-liveness fixpoint the fusion register guard
+  // consumes (set version 3; bounded, RBC-level, no IR - see file header).
   const std::vector<char> poll = computePollSet(method);
   const std::vector<char> blocked = computeFusionBlocked(method);
+  const LivenessInfo live = computeLiveness(method);
 
   // exc_covers indices are u16 (Plan.h): a handler table beyond that space
   // cannot be represented; refuse loudly rather than truncate coverage.
@@ -663,7 +1042,7 @@ PlanResult compilePlan(const rbc::Program& program, std::uint32_t method_index,
         winner = &cand; // an opcode stencil always matches its own op
         break;
       }
-      if (matchSuper(cand, method, pc, blocked)) {
+      if (matchSuper(cand, method, pc, blocked, live)) {
         winner = &cand;
         break;
       }

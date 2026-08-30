@@ -1,0 +1,41 @@
+# T1 benchmark + differential corpus entry (MSG-20260830-005): fib_loop's
+# shape with the safepoint_poll AT the loop head (the backedge-poll
+# membership convention the plan builder requires by default), so the method
+# actually compiles on T1 - the loop body exercises iload_ifle,
+# iload_iload_iadd, iload_istore, and iload_iinc_istore.
+# Positive corpus file: must parse, verify, and run under T0 with the exact
+# expected stdout (Java semantics oracle, Rule 67).
+
+.class Main
+
+.method static main ()V
+.regs 6
+.locals 3
+.const c0 = field java/lang/System out Ljava/io/PrintStream;
+.const c1 = method java/io/PrintStream println (I)V
+iconst r0 0
+istore r0 l0
+iconst r0 1
+istore r0 l1
+iconst r0 15
+istore r0 l2
+Lloop:
+safepoint_poll
+iload r0 l2
+ifle r0 Ldone
+iload r0 l0
+iload r1 l1
+iadd r2 r0 r1
+iload r0 l1
+istore r0 l0
+istore r2 l1
+iload r3 l2
+iinc r3 -1
+istore r3 l2
+goto Lloop
+Ldone:
+getstatic r0 c0
+iload r1 l0
+invokevirtual r2 r0 r2 c1
+return
+.end

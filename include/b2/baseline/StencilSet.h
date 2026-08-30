@@ -64,15 +64,26 @@ struct StencilSet {
 //   constants, guard_class KlassId holes pending real class-id patching).
 //   The exact availability map mirrors interp_contract SS6/SS7 - the honest
 //   list of what actually runs.
-// - Superinstructions (Available), all local producer-consumer fusions:
+// - Superinstructions (Available), all local producer-consumer fusions.
+//   Set v2 (the original seven):
 //     iload_iload_iadd        (l0,l1 -> iadd)
 //     iload_iload_isub / imul (same shape, other arithmetic)
 //     aload_getfield          (receiver load + field read incl. null trap)
 //     aload_arraylength_if    (load + length + bounds-shaped compare)
 //     iinc_goto               (counter bump + backedge, the loop idiom)
 //     aload_getfield_ireturn  (getter idiom)
-//   Each declares the fused hole set (two slot offsets, one FieldOffset,
-//   one BranchRel32, ...) and the union of the parts' flags.
+//   Set v3 (MSG-20260830-005: the superinstruction set extension + the
+//   fusion-soundness fix; dst_skip_mask + post-window liveness guard):
+//     iload_iload_{iadd,isub,imul}_istore  (the docs/stencils.md SS11 canonical
+//                                           accumulator chain, full local form)
+//     iload_iinc_istore       (counter update idiom: load, bump, store-back)
+//     iload_istore            (local-to-local move)
+//     iload_ireturn           (return-a-local epilogue)
+//     iload_if{eq,ne,lt,ge,gt,le}         (loop-exit test on a local)
+//     iload_iconst_if_icmp{eq,ne,lt,ge,gt,le} (loop-exit test vs constant)
+//   Each declares the fused hole set (slot offsets, immediates, branch
+//   rel32s, ...) and the union of the parts' flags, plus dst_skip_mask
+//   (which intermediate registers the body leaves in machine registers).
 // - Call stencils (NeedsRuntimeFeature until IC patching lands):
 //   call_static, call_virtual_monomorphic, call_virtual_bimorphic,
 //   call_interface_megamorphic, call_invokedynamic.
@@ -91,13 +102,20 @@ struct StencilSet {
 // Deterministic: two calls build byte-identical tables (Rule 124).
 [[nodiscard]] StencilSet builtinStencilSetV0();
 
-// Current set version constants (Stencil Rule 4). Version 2 flips the
-// un-quickened invoke* + ldc to Available (MSG-20260830-004: the T1
-// runtime-helper seam) and marks multianewarray NeedsRuntimeFeature (v1
-// instantiation gap). Version 1 plans must not instantiate against it.
+// Current set version constants (Stencil Rule 4). Version 3 lands the
+// superinstruction set extension + the fusion-soundness fix (MSG-20260830-005:
+// dst_skip_mask on StencilDesc, post-window liveness/in-window-clobber checks
+// in the plan builder, and the 18 new loop-idiom superinstructions listed
+// above). Version 2 flipped the un-quickened invoke* + ldc to Available
+// (MSG-20260830-004: the T1 runtime-helper seam) and marked multianewarray
+// NeedsRuntimeFeature (v1 instantiation gap). Version 1 plans must not
+// instantiate against v2+; v2 plans must not instantiate against v3
+// (stencil ids and hole counts moved).
 inline constexpr std::uint32_t kStencilSetMagic = 0x32737463u; // "2stc"
-inline constexpr std::uint32_t kStencilSetVersionV0 = 2;
-// Historical: the pre-flip manifest (frozen for golden replay of old plans).
+inline constexpr std::uint32_t kStencilSetVersionV0 = 3;
+// Historical: the v2 pre-extension manifest (frozen for golden replay of old
+// plans), and the pre-flip v1 manifest.
+inline constexpr std::uint32_t kStencilSetVersionV2 = 2;
 inline constexpr std::uint32_t kStencilSetVersionV1 = 1;
 
 } // namespace b2::baseline

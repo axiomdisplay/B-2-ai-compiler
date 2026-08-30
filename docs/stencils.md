@@ -173,14 +173,21 @@ These are the baseline building blocks.
 
 Fused stencils for common RBC sequences.
 
+The builtin set v3 (MSG-20260830-005) carries 25: the seven v2 fusions
+(`iload_iload_{iadd,isub,imul}`, `aload_getfield`, `aload_arraylength_if`,
+`iinc_goto`, `aload_getfield_ireturn`) and the eighteen loop-idiom fusions
+(`iload_iload_{iadd,isub,imul}_istore`, `iload_iinc_istore`, `iload_istore`,
+`iload_ireturn`, `iload_if{eq,ne,lt,ge,gt,le}`,
+`iload_iconst_if_icmp{eq,ne,lt,ge,gt,le}`).
+
 Examples:
 
 ```text
-aload_getfield_nullcheck
 iload_iload_iadd_istore
-aload_invokevirtual_pop
-aload_arraylength_ifgt
-iinc_goto_backedge
+aload_getfield
+iload_iinc_istore
+aload_arraylength_if
+iinc_goto
 aload_getfield_ireturn
 ```
 
@@ -192,6 +199,38 @@ Superinstructions reduce:
 - metadata size
 
 They are very important for T1 performance.
+
+### 3.2.1 Fusion legality rules (normative; set version 3)
+
+A fused body may compute intermediate results in machine registers and skip
+writing them to the T0-layout frame slots — that skip is exactly where the
+speed comes from. The skip is only legal when nothing can observe the slot.
+The plan builder enforces ALL of:
+
+- **L1 pattern**: the window's opcode sequence matches the descriptor, and
+  the declared producer-consumer links (`useAsA`/`useAsB`) hold.
+- **L2 in-window clobber**: no step between a linked producer and its
+  consumer rewrites the linked register (otherwise the consumer must see the
+  later generation, and a body computing from the producer is wrong).
+- **L3 chained dst** (`thenDstOf`): accumulator idioms require the linked
+  steps to share one dst register, with no in-between rewrite.
+- **L4 unlinked-read alias**: no unlinked register read of a window step
+  aliases a SKIPPED in-window dst (the body would read a stale slot;
+  aliasing a materialized dst is fine — the body wrote the correct value).
+- **L5 post-window liveness**: every step whose dst is declared skipped
+  (`StencilDesc::dst_skip_mask`) must be DEAD at the window end, per a
+  bounded backward register-liveness fixpoint over the method's normal
+  control edges. Exception edges contribute no liveness (registers die at
+  handler entry, rbc_spec.md SS5.3) and deopt edges re-execute from the
+  fusion start (where T0 rewrites the skipped registers itself).
+- **L6 boundaries**: no branch target and no exception-handler boundary
+  falls strictly inside the window (the pre-existing guard).
+
+Rule for spec authors: `dst_skip_mask` must mirror what the body ACTUALLY
+writes (a wrong mask re-opens the soundness hole the set v3 fix closed), the
+body must satisfy every in-window read through a link or a correct slot
+value, and every skipped register must be dead at the window end. The
+differential corpus (b2run vs b2jit) is the final arbiter (Law 36).
 
 ## 3.3 Call stencils
 

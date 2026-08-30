@@ -276,6 +276,166 @@ constexpr const char* kFusionGuard =
     "return\n"
     ".end\n";
 
+// Fusion register guard, case 1 (post-window live): the second iadd re-reads
+// r0/r1 after the would-be window [5,8). This is the Law-36 differential
+// probe that exposed the set v2 unsoundness (T0 printed 12, v2 T1 printed
+// 107 - the stale iconst r0 100 and the stale r1 7).
+constexpr const char* kFusionReread =
+    ".class Main\n"
+    ".method static main ()V\n"
+    ".regs 8\n"
+    ".locals 2\n"
+    ".const c0 = field java/lang/System out Ljava/io/PrintStream;\n"
+    ".const c1 = method java/io/PrintStream println (I)V\n"
+    "iconst r0 5\n"
+    "istore r0 l0\n"
+    "iconst r1 7\n"
+    "istore r1 l1\n"
+    "iconst r0 100\n"
+    "iload r0 l0\n"
+    "iload r1 l1\n"
+    "iadd r2 r0 r1\n"
+    "iadd r3 r0 r1\n"
+    "getstatic r4 c0\n"
+    "imove r5 r3\n"
+    "invokevirtual r6 r4 r2 c1\n"
+    "return\n"
+    ".end\n";
+
+// Fusion register guard, case 2 (post-window dead): same window, but both
+// registers are redefined by the following iloads before the later iadd
+// reads them - the fusion fires.
+constexpr const char* kFusionDead =
+    ".class Main\n"
+    ".method static f ()I\n"
+    ".regs 4\n"
+    ".locals 2\n"
+    "iconst r0 5\n"
+    "istore r0 l0\n"
+    "iconst r1 7\n"
+    "istore r1 l1\n"
+    "iconst r0 100\n"
+    "iload r0 l0\n"
+    "iload r1 l1\n"
+    "iadd r2 r0 r1\n"
+    "iload r0 l0\n"
+    "iload r1 l1\n"
+    "iadd r3 r0 r1\n"
+    "ireturn r3\n"
+    ".end\n";
+
+// Fusion register guard, case 3 (in-window clobber): both loads define r0,
+// so the iadd's b operand must see the SECOND load. A body computing from
+// both locals would use the first: the fusion must be refused.
+constexpr const char* kFusionDoubleWrite =
+    ".class Main\n"
+    ".method static f ()I\n"
+    ".regs 3\n"
+    ".locals 2\n"
+    "iconst r0 5\n"
+    "istore r0 l0\n"
+    "iconst r1 7\n"
+    "istore r1 l1\n"
+    "iload r0 l0\n"
+    "iload r0 l1\n"
+    "iadd r2 r0 r0\n"
+    "ireturn r2\n"
+    ".end\n";
+
+// Fusion register guard, case 4 (loop-carried live): the register the
+// iload_iinc_istore window [8,11) would skip is re-read at the loop head
+// through the backedge - only the backward fixpoint catches this (a linear
+// scan would see the pc-8 iload as a kill).
+constexpr const char* kFusionLoopLive =
+    ".class Main\n"
+    ".method static f ()I\n"
+    ".regs 5\n"
+    ".locals 1\n"
+    "iconst r2 0\n"
+    "iconst r3 1\n"
+    "iconst r0 10\n"
+    "istore r0 l0\n"
+    "Lhead:\n"
+    "safepoint_poll\n"
+    "iload r1 l0\n"
+    "ifle r1 Ldone\n"
+    "iadd r2 r2 r3\n"
+    "iload r3 l0\n"
+    "iinc r3 -1\n"
+    "istore r3 l0\n"
+    "goto Lhead\n"
+    "Ldone:\n"
+    "ireturn r2\n"
+    ".end\n";
+
+// The sum-loop idiom program (sum_loop.rbc's shape, poll at the loop head
+// for the default backedge check): the set v3 fusions tile the whole body.
+constexpr const char* kSumLoop =
+    ".class Main\n"
+    ".method static main ()V\n"
+    ".regs 5\n"
+    ".locals 2\n"
+    ".const c0 = field java/lang/System out Ljava/io/PrintStream;\n"
+    ".const c1 = method java/io/PrintStream println (I)V\n"
+    "iconst r0 0\n"
+    "istore r0 l0\n"
+    "iconst r0 1\n"
+    "istore r0 l1\n"
+    "Lcond:\n"
+    "safepoint_poll\n"
+    "iload r0 l1\n"
+    "iconst r1 101\n"
+    "if_icmpge r0 r1 Ldone\n"
+    "iload r0 l0\n"
+    "iload r1 l1\n"
+    "iadd r2 r0 r1\n"
+    "istore r2 l0\n"
+    "iload r3 l1\n"
+    "iinc r3 1\n"
+    "istore r3 l1\n"
+    "goto Lcond\n"
+    "Ldone:\n"
+    "getstatic r0 c0\n"
+    "iload r1 l0\n"
+    "invokevirtual r2 r0 r2 c1\n"
+    "return\n"
+    ".end\n";
+
+// The fib-loop idiom program (fib_loop.rbc's shape, poll at the loop head).
+constexpr const char* kFibLoop =
+    ".class Main\n"
+    ".method static main ()V\n"
+    ".regs 6\n"
+    ".locals 3\n"
+    ".const c0 = field java/lang/System out Ljava/io/PrintStream;\n"
+    ".const c1 = method java/io/PrintStream println (I)V\n"
+    "iconst r0 0\n"
+    "istore r0 l0\n"
+    "iconst r0 1\n"
+    "istore r0 l1\n"
+    "iconst r0 15\n"
+    "istore r0 l2\n"
+    "Lloop:\n"
+    "safepoint_poll\n"
+    "iload r0 l2\n"
+    "ifle r0 Ldone\n"
+    "iload r0 l0\n"
+    "iload r1 l1\n"
+    "iadd r2 r0 r1\n"
+    "iload r0 l1\n"
+    "istore r0 l0\n"
+    "istore r2 l1\n"
+    "iload r3 l2\n"
+    "iinc r3 -1\n"
+    "istore r3 l2\n"
+    "goto Lloop\n"
+    "Ldone:\n"
+    "getstatic r0 c0\n"
+    "iload r1 l0\n"
+    "invokevirtual r2 r0 r2 c1\n"
+    "return\n"
+    ".end\n";
+
 // The loop idiom: iinc immediately before the backedge goto, with the
 // SafepointPoll at the loop head (where require_backedge_polls expects it;
 // sum_loop.rbc's shape with the poll immediately before the goto is the
@@ -493,9 +653,10 @@ B2_TEST(baseline_set_deterministic) {
 
 B2_TEST(baseline_set_shape_and_version) {
   const StencilSet& set = theSet();
-  // 1 null + one opcode stencil per Op + 7 superinstructions + 16 manifest-only.
+  // 1 null + one opcode stencil per Op + 25 superinstructions (7 of set v2 +
+  // 18 of set v3, MSG-20260830-005) + 16 manifest-only.
   CHECK(set.stencils.size() ==
-        1 + rbc::opCount() + 7 + 16);
+        1 + rbc::opCount() + 25 + 16);
   // Null stencil entry 0: invalid id, empty name, empty pattern.
   CHECK(!set.stencils[0].id.valid());
   CHECK(set.stencils[0].name.empty());
@@ -578,12 +739,21 @@ B2_TEST(baseline_set_candidates_order) {
   // Concrete shapes: the ops with superinstructions.
   {
     const auto cands = set.candidates(rbc::Op::Iload);
-    CHECK(cands.size() == 4); // iload_iload_{iadd,isub,imul} + iload
-    CHECK(cands[0].pattern_len == 3);
-    CHECK(cands[1].pattern_len == 3);
-    CHECK(cands[2].pattern_len == 3);
-    CHECK(cands[3].pattern_len == 1);
-    CHECK(cands[3].name == "iload");
+    // Set v3: 3 four-step accumulator chains, then 10 three-step (3 arith +
+    // iinc_istore + 6 iconst_if_icmp), then 8 two-step (istore, ireturn, 6
+    // if-tests), then the opcode stencil. Longest-first is a set invariant.
+    CHECK(cands.size() == 22);
+    CHECK(cands[0].pattern_len == 4);
+    CHECK(cands[1].pattern_len == 4);
+    CHECK(cands[2].pattern_len == 4);
+    CHECK(cands[3].pattern_len == 3);
+    CHECK(cands[12].pattern_len == 3);
+    CHECK(cands[13].pattern_len == 2);
+    CHECK(cands[20].pattern_len == 2);
+    CHECK(cands[21].pattern_len == 1);
+    CHECK(cands[21].name == "iload");
+    CHECK(cands[0].dst_skip_mask == 0x07); // full chain skips 3 regs
+    CHECK(cands[21].dst_skip_mask == 0x00); // opcode stencils skip none
   }
   {
     const auto cands = set.candidates(rbc::Op::Aload);
@@ -699,6 +869,25 @@ B2_TEST(baseline_set_superinstructions) {
       {"aload_arraylength_if", rbc::Op::Aload, 3 * 16 - 4},
       {"iinc_goto", rbc::Op::Iinc, 2 * 16 - 4},
       {"aload_getfield_ireturn", rbc::Op::Aload, 3 * 16 - 4},
+      // Set v3 extension (MSG-20260830-005).
+      {"iload_iload_iadd_istore", rbc::Op::Iload, 4 * 16 - 4},
+      {"iload_iload_isub_istore", rbc::Op::Iload, 4 * 16 - 4},
+      {"iload_iload_imul_istore", rbc::Op::Iload, 4 * 16 - 4},
+      {"iload_iinc_istore", rbc::Op::Iload, 3 * 16 - 4},
+      {"iload_istore", rbc::Op::Iload, 2 * 16 - 4},
+      {"iload_ireturn", rbc::Op::Iload, 2 * 16 - 4},
+      {"iload_ifeq", rbc::Op::Iload, 2 * 16 - 4},
+      {"iload_ifne", rbc::Op::Iload, 2 * 16 - 4},
+      {"iload_iflt", rbc::Op::Iload, 2 * 16 - 4},
+      {"iload_ifge", rbc::Op::Iload, 2 * 16 - 4},
+      {"iload_ifgt", rbc::Op::Iload, 2 * 16 - 4},
+      {"iload_ifle", rbc::Op::Iload, 2 * 16 - 4},
+      {"iload_iconst_if_icmpeq", rbc::Op::Iload, 3 * 16 - 4},
+      {"iload_iconst_if_icmpne", rbc::Op::Iload, 3 * 16 - 4},
+      {"iload_iconst_if_icmplt", rbc::Op::Iload, 3 * 16 - 4},
+      {"iload_iconst_if_icmpge", rbc::Op::Iload, 3 * 16 - 4},
+      {"iload_iconst_if_icmpgt", rbc::Op::Iload, 3 * 16 - 4},
+      {"iload_iconst_if_icmple", rbc::Op::Iload, 3 * 16 - 4},
   };
   int superCount = 0;
   for (const StencilDesc& d : set.stencils) {
@@ -706,7 +895,7 @@ B2_TEST(baseline_set_superinstructions) {
       ++superCount;
     }
   }
-  CHECK(superCount == 7);
+  CHECK(superCount == 25);
   for (const SuperPin& pin : pins) {
     const StencilId id = set.find(pin.name);
     CHECK_MSG(id.valid(), std::string(pin.name) + " missing from the manifest");
@@ -1009,8 +1198,9 @@ B2_TEST(baseline_plan_header_fields) {
   CHECK(plan.num_regs == 2);
   CHECK(plan.num_locals == 2); // this + the int param
   CHECK(plan.entry_native_offset == 0);
-  CHECK(plan.code_size == 3 * 16);
-  CHECK(plan.instances.size() == 3);
+  // Set v3: "pick" is aload + (iload_ireturn fused): 2 instances, 16 + 28.
+  CHECK(plan.code_size == 2 * 16 - 4 + 16);
+  CHECK(plan.instances.size() == 2);
   checkTiling(plan, prog.methods[1], "pick");
   // compilePlanFor resolves the same method by name+descriptor.
   const PlanResult byName =
@@ -1322,6 +1512,159 @@ B2_TEST(baseline_fusion_iinc_goto_backedge) {
   // The backedge check passed because the poll sits at the loop head (the
   // backward goto target pc 0 IS the safepoint_poll instruction).
   checkTiling(plan, prog.methods[0], "iinc_goto backedge");
+}
+
+// ===========================================================================
+// 5b. FUSION REGISTER GUARD (set v3 soundness fix, MSG-20260830-005)
+// ===========================================================================
+// The law these tests pin: a fused body may leave intermediate registers in
+// machine registers ONLY when nothing after the window can observe them, and
+// no in-window clobber/alias may change what a consumer sees. Each case
+// below is a shape where the OLD planner (set v2) miscompiled.
+
+// The Law-36 differential probe that exposed the bug: after the window, the
+// second iadd re-reads r0/r1, which the fused body never wrote. T0 prints
+// 12; the v2 T1 printed 107 (stale iconst r0 100 + stale r1 7).
+B2_TEST(baseline_fusion_guard_post_window_live) {
+  const Program prog = parseOk(kFusionReread);
+  const PlanResult r = compileOk(prog, 0, "reread");
+  if (!r.ok) {
+    return;
+  }
+  const StencilPlan& plan = r.plan;
+  // The iload_iload_iadd window [5,8) must NOT fuse: r0 and r1 are live at
+  // pc 8 (the iadd at pc 8 reads both before any redefinition).
+  CHECK(plan.fusion_count == 0);
+  CHECK(plan.instances.size() == prog.methods[0].code.size());
+  checkTiling(plan, prog.methods[0], "reread");
+}
+
+// Same window, but the post-window reader is preceded by redefinitions: the
+// loads' registers die at the window end, so the fusion fires.
+B2_TEST(baseline_fusion_guard_post_window_dead) {
+  const Program prog = parseOk(kFusionDead);
+  const PlanResult r = compileOk(prog, 0, "dead");
+  if (!r.ok) {
+    return;
+  }
+  const StencilPlan& plan = r.plan;
+  // BOTH windows fuse: [5,8) and [8,11) - in the second, the loads' registers
+  // die at pc 11 (ireturn reads only r3), so the same shape that was refused
+  // in kFusionReread is accepted here once the readers are preceded by the
+  // pc-8/pc-9 redefinitions.
+  CHECK(plan.fusion_count == 2);
+  const StencilInstance* fused = instanceAt(plan, 5);
+  CHECK(fused != nullptr);
+  if (fused != nullptr) {
+    CHECK(theSet().desc(fused->stencil).name == "iload_iload_iadd");
+    CHECK(fused->rbc_pc_start == 5);
+    CHECK(fused->rbc_pc_end == 8);
+  }
+  checkTiling(plan, prog.methods[0], "dead");
+}
+
+// In-window double write: BOTH loads define r0, so the iadd's "b" operand
+// sees the SECOND load's value; a body computing from both locals would
+// read the first. The clobber check refuses the fusion.
+B2_TEST(baseline_fusion_guard_in_window_clobber) {
+  const Program prog = parseOk(kFusionDoubleWrite);
+  const PlanResult r = compileOk(prog, 0, "double write");
+  if (!r.ok) {
+    return;
+  }
+  const StencilPlan& plan = r.plan;
+  CHECK(plan.fusion_count == 0);
+  for (const StencilInstance& inst : plan.instances) {
+    CHECK(inst.rbc_pc_end - inst.rbc_pc_start == 1);
+  }
+  checkTiling(plan, prog.methods[0], "double write");
+}
+
+// Loop-carried liveness: the fused counter update iload_iinc_istore skips
+// its register, and the loop head RE-READS it via a later iload+iadd before
+// any redefinition - the wrap-around path must keep the fusion off.
+B2_TEST(baseline_fusion_guard_loop_carried_live) {
+  const Program prog = parseOk(kFusionLoopLive);
+  const PlanResult r = compileOk(prog, 0, "loop live");
+  if (!r.ok) {
+    return;
+  }
+  const StencilPlan& plan = r.plan;
+  // The window [8,11) (iload r3 l0, iinc r3 -1, istore r3 l0) must not
+  // fuse: the iadd at pc 7 reads r3 through the backedge path
+  // (pc11 goto -> head -> pc7) with no intervening redefinition - only the
+  // backward fixpoint sees this; a linear scan would misread the pc-8
+  // iload as a kill. The iload_ifle at [5,7) does fuse (r1 dies at pc 7).
+  CHECK(plan.fusion_count == 1);
+  const StencilInstance* counter = instanceAt(plan, 8);
+  CHECK(counter != nullptr);
+  if (counter != nullptr) {
+    CHECK(counter->rbc_pc_end - counter->rbc_pc_start == 1);
+  }
+  checkTiling(plan, prog.methods[0], "loop live");
+}
+
+// The set v3 loop idioms: the whole sum_loop body collapses to three fused
+// instances per iteration (exit test, accumulator chain, counter update).
+B2_TEST(baseline_fusion_v3_loop_idioms) {
+  const Program prog = parseOk(kSumLoop);
+  const PlanResult r = compileOk(prog, 0, "sum loop idioms");
+  if (!r.ok) {
+    return;
+  }
+  const StencilPlan& plan = r.plan;
+  CHECK(plan.fusion_count == 3);
+  // [5,8): iload l1, iconst 101, if_icmpge Ldone.
+  const StencilInstance* exitTest = instanceAt(plan, 5);
+  CHECK(exitTest != nullptr);
+  if (exitTest != nullptr) {
+    CHECK(theSet().desc(exitTest->stencil).name == "iload_iconst_if_icmpge");
+    CHECK(exitTest->rbc_pc_end == 8);
+  }
+  // [8,12): iload l0, iload l1, iadd, istore l0.
+  const StencilInstance* accum = instanceAt(plan, 8);
+  CHECK(accum != nullptr);
+  if (accum != nullptr) {
+    CHECK(theSet().desc(accum->stencil).name == "iload_iload_iadd_istore");
+    CHECK(accum->rbc_pc_end == 12);
+  }
+  // [12,15): iload l1, iinc, istore l1.
+  const StencilInstance* counter = instanceAt(plan, 12);
+  CHECK(counter != nullptr);
+  if (counter != nullptr) {
+    CHECK(theSet().desc(counter->stencil).name == "iload_iinc_istore");
+    CHECK(counter->rbc_pc_end == 15);
+  }
+  checkTiling(plan, prog.methods[0], "sum loop idioms");
+}
+
+// The local-move and return-local epilogues (fib_loop's shapes).
+B2_TEST(baseline_fusion_v3_move_and_return) {
+  const Program prog = parseOk(kFibLoop);
+  const PlanResult r = compileOk(prog, 0, "fib loop idioms");
+  if (!r.ok) {
+    return;
+  }
+  const StencilPlan& plan = r.plan;
+  // fib_loop's loop body: iload_ifle (exit), iload_iload_iadd (fib step),
+  // iload_istore (local move), iload_iinc_istore (counter).
+  CHECK(plan.fusion_count == 4);
+  const StencilInstance* exitTest = instanceAt(plan, 7);
+  CHECK(exitTest != nullptr);
+  if (exitTest != nullptr) {
+    CHECK(theSet().desc(exitTest->stencil).name == "iload_ifle");
+  }
+  const StencilInstance* move = instanceAt(plan, 12);
+  CHECK(move != nullptr);
+  if (move != nullptr) {
+    CHECK(theSet().desc(move->stencil).name == "iload_istore");
+  }
+  const StencilInstance* counter = instanceAt(plan, 15);
+  CHECK(counter != nullptr);
+  if (counter != nullptr) {
+    CHECK(theSet().desc(counter->stencil).name == "iload_iinc_istore");
+  }
+  checkTiling(plan, prog.methods[0], "fib loop idioms");
 }
 
 // ===========================================================================
@@ -1798,7 +2141,7 @@ B2_TEST(baseline_dump_golden) {
   const std::string want =
       "plan method=f descriptor=()I static=1 index=0\n"
       "frame regs=1 locals=0\n"
-      "set magic=0x32737463 version=2 target_arch=0 abi_hash=0x0\n"
+      "set magic=0x32737463 version=3 target_arch=0 abi_hash=0x0\n"
       "summary code_size=32 entry_native_offset=0 instances=2 fusions=0 "
       "patches=1 deopt_points=0 safepoints=0\n"
       "  inst 0 @0+16 iconst rbc[0,1) patches:1 exc:\n"
@@ -1831,9 +2174,9 @@ B2_TEST(baseline_dump_shape) {
   if (lines.size() >= 4) {
     CHECK(lines[0] == "plan method=pick descriptor=(I)I static=0 index=1");
     CHECK(lines[1] == "frame regs=2 locals=2");
-    CHECK(lines[2] == "set magic=0x32737463 version=2 target_arch=0 abi_hash=0x0");
-    CHECK(lines[3].starts_with("summary code_size=48 entry_native_offset=0 "
-                               "instances=3 fusions=0 patches=2 deopt_points=0 "
+    CHECK(lines[2] == "set magic=0x32737463 version=3 target_arch=0 abi_hash=0x0");
+    CHECK(lines[3].starts_with("summary code_size=44 entry_native_offset=0 "
+                               "instances=2 fusions=1 patches=2 deopt_points=0 "
                                "safepoints=0"));
   }
 

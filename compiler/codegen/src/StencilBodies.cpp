@@ -817,12 +817,29 @@ void callBody(X64& x, HK targetKind, PS targetSrc) {
   return false;
 }
 
-// --- superinstruction bodies (the seven v0 fusions) ------------------------------------------
+// --- superinstruction bodies (the builtin fusions: set v2's seven + set v3's
+// eighteen loop-idiom extensions, MSG-20260830-005) --------------------------------
 //
 // Step indices matter: Stream/Plan holes record which pattern instruction
 // supplies the operand. The fused body only writes values that are live at
-// the fusion-START boundary or later (the intermediate producer registers
-// are dead: regs die at handler entry, unwound frames are discarded).
+// the fusion-START boundary or later; WHICH intermediate registers it may
+// skip is declared by StencilDesc::dst_skip_mask, and the plan builder's
+// fusion register guard (liveness + clobber + alias checks, PlanBuilder.cpp)
+// proves every skipped register dead before the window is ever selected.
+
+// Builds the complete 16-byte interp::Value{tag, payload} in xmm0 from the
+// 32-bit int result in `src` and stores it to the frame slot of `step` with
+// ONE Plan hole (the whole-slot store form; the plan supplies one FrameSlot
+// patch value per local access). Payload first in the register, then shift
+// up and pin the tag into the low dword.
+void storeIntValueWhole(X64& x, Gpr src, std::uint8_t step) {
+  x.movsxdReg(kA, src);   // T1 pin: int payloads stored sign-extended
+  x.movqXmm0FromGpr(kA);  // xmm0 = [payload | 0]
+  x.pslldqXmm0(8);        // xmm0 = [0 | payload]
+  x.movRegImm32(kB, kTagInt);
+  x.pinsrdXmm0FromGpr(kB); // xmm0 = [kTagInt | payload]
+  x.storeValue(X64::Xmm::X0, PS::FrameSlot, step, kDeltaTag, HT::Plan);
+}
 
 void emitSuperBody(const baseline::StencilDesc& d, X64& x) {
   const std::string_view name = d.name;
@@ -837,6 +854,87 @@ void emitSuperBody(const baseline::StencilDesc& d, X64& x) {
       x.aluSlot32(kA, alu, PS::FrameSlot, 1, kDeltaPayload, HT::Plan);
     }
     storeResult32(x, 2);
+    return;
+  }
+  if (name == "iload_iload_iadd_istore" || name == "iload_iload_isub_istore" ||
+      name == "iload_iload_imul_istore") {
+    // The docs/stencils.md SS11 canonical accumulator chain: two locals in,
+    // one local out. None of the three intermediate registers reaches the
+    // frame (dst_skip_mask 0x07; the plan proves them dead at the window
+    // end), so the whole chain is two loads, one ALU op, one whole-slot
+    // store.
+    x.loadSlot32(kA, PS::FrameSlot, 0, kDeltaPayload, HT::Plan);
+    if (name == "iload_iload_imul_istore") {
+      x.imulSlot32(kA, PS::FrameSlot, 1, HT::Plan);
+    } else {
+      const X64::Alu alu = name == "iload_iload_iadd_istore"
+                               ? X64::Alu::Add
+                               : X64::Alu::Sub;
+      x.aluSlot32(kA, alu, PS::FrameSlot, 1, kDeltaPayload, HT::Plan);
+    }
+    storeIntValueWhole(x, kA, 3);
+    return;
+  }
+  if (name == "iload_iinc_istore") {
+    // Counter idiom: l9 = l9 + imm through the accumulator register. The
+    // thenDstOf chain (iload.dst == iinc.dst == istore.a) is proven by the
+    // plan, so "eax = local payload + imm, store whole Value" reproduces
+    // the whole three-instruction chain.
+    x.loadSlot32(kA, PS::FrameSlot, 0, kDeltaPayload, HT::Plan);
+    x.addEaxImm32Hole(HK::Imm32, PS::InsImm, HT::Plan, 1);
+    storeIntValueWhole(x, kA, 2);
+    return;
+  }
+  if (name == "iload_istore") {
+    // Local-to-local move: one 16-byte Value move, no register round-trip.
+    x.loadValue(X64::Xmm::X0, PS::FrameSlot, 0, kDeltaTag, HT::Plan);
+    x.storeValue(X64::Xmm::X0, PS::FrameSlot, 1, kDeltaTag, HT::Plan);
+    return;
+  }
+  if (name == "iload_ireturn") {
+    // Return-a-local epilogue: the Value goes straight to the fixed return
+    // slot in the control block, then the embedded exit sequence returns.
+    x.loadValue(X64::Xmm::X0, PS::FrameSlot, 0, kDeltaTag, HT::Plan);
+    x.storeValueToAct(X64::Xmm::X0, kActOffRetValue);
+    x.xorRegReg32(kA, kA); // kExitNormal
+    x.popRbp();
+    x.ret();
+    return;
+  }
+  if (name == "iload_ifeq" || name == "iload_ifne" || name == "iload_iflt" ||
+      name == "iload_ifge" || name == "iload_ifgt" || name == "iload_ifle") {
+    // Loop-exit test on a local: compare the local's int payload against 0
+    // in memory and branch - the value never becomes a register Value.
+    std::uint8_t cc = kCcE;
+    if (name == "iload_ifne") { cc = kCcNe; }
+    if (name == "iload_iflt") { cc = kCcL; }
+    if (name == "iload_ifge") { cc = kCcGe; }
+    if (name == "iload_ifgt") { cc = kCcG; }
+    if (name == "iload_ifle") { cc = kCcLe; }
+    // cmp dword [rbp + <FrameSlot hole> + payload], 0  (83 /7 ib)
+    x.u8(0x83);
+    x.u8(0xBD); // modrm: mod=10, reg=/7 (cmp), rm=rbp+disp32
+    x.hole(HK::SlotOffset, PS::FrameSlot, HT::Plan, 4, 0, 0, kDeltaPayload);
+    x.u8(0x00);
+    x.jccHole(cc, PS::BranchTarget, HT::Plan, 1);
+    return;
+  }
+  if (name == "iload_iconst_if_icmpeq" || name == "iload_iconst_if_icmpne" ||
+      name == "iload_iconst_if_icmplt" || name == "iload_iconst_if_icmpge" ||
+      name == "iload_iconst_if_icmpgt" || name == "iload_iconst_if_icmple") {
+    // Loop-exit test against a constant: load the local's payload once,
+    // compare against the iconst immediate in place, branch.
+    std::uint8_t cc = kCcE;
+    if (name == "iload_iconst_if_icmpne") { cc = kCcNe; }
+    if (name == "iload_iconst_if_icmplt") { cc = kCcL; }
+    if (name == "iload_iconst_if_icmpge") { cc = kCcGe; }
+    if (name == "iload_iconst_if_icmpgt") { cc = kCcG; }
+    if (name == "iload_iconst_if_icmple") { cc = kCcLe; }
+    x.loadSlot32(kA, PS::FrameSlot, 0, kDeltaPayload, HT::Plan);
+    // cmp eax, imm32-hole (3D id: the special eax immediate form)
+    x.u8(0x3D);
+    x.hole(HK::Imm32, PS::InsImm, HT::Plan, 4, 1);
+    x.jccHole(cc, PS::BranchTarget, HT::Plan, 2);
     return;
   }
   if (name == "aload_getfield") {

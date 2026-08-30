@@ -7,7 +7,7 @@ Normative reference: docs/laws.md
 If this document conflicts with `docs/laws.md`, `docs/laws.md` wins.
 ```
 
-Version: 1.0.0
+Version: 1.1.0
 Status: normative for all compiled tiers — `baseline_noir`, `ir`, `passes`, `regalloc`,
 `codegen`, and `aot` consume this contract; `docs/deopt_backend.md` Part A (canonical T0 state model) and
 `docs/stencils.md` §8 (T0-compatible T1 frames) are built on it.
@@ -150,11 +150,24 @@ receiver's or class object's monitor before execution (a null receiver traps at 
   unreachable-guard raising `InternalError`); the compiler lowers the dense switch to a jump table — the
   portable direct-threaded form. The architectural requirement (Amendment B.1) is **minimal dispatch
   overhead, not a particular compiler extension**.
-- **The computed-goto upgrade is the named v1 milestone:** one TU compiled with `gnu++26`
-  (labels-as-values) plus a shared opcode-handler-body table, selected at build time; semantics identical
-  by construction — same handler bodies, different dispatch. **One loop over an explicit frame stack:**
-  Java calls never recurse in C++ (`StackOverflowError` must be a Java-visible trap at `maxFrames`, and
-  deopt needs materializable frames — the frame stack IS the state).
+- **The computed-goto upgrade is LANDED (v1.1.0, MSG-20260830-005):** `B2_INTERP_COMPUTED_GOTO`
+  (CMake option, default ON for GNU/Clang, self-disabling elsewhere) compiles `Interp.cpp` as
+  `gnu++26` and dispatches through a designated-initializer label table with the indirect branch
+  replicated at EVERY handler tail (`B2_NEXT` -> `B2_DISPATCH`), so the branch predictor learns
+  per-opcode transitions instead of sharing one jump site with the whole opcode mix. Semantics are
+  identical by construction — one shared set of handler bodies (`B2_TARGET`/`B2_NEXT` macros), same
+  fetch/probe/stats order, same redispatch-on-catch. The differential proof is
+  **`interp_portable_tests`**: the same sources compiled strict-c++26 (switch core) running the same
+  corpus against the same goldens (Law 36). The exhaustiveness guarantee stays with the portable
+  build's `-Wswitch`; the computed-goto build adds a designated-initializer duplicate check (compile
+  error) and a null-scan refusal (Rule 47) for missing table entries. **One loop over an explicit frame
+  stack:** Java calls never recurse in C++ (`StackOverflowError` must be a Java-visible trap at
+  `maxFrames`, and deopt needs materializable frames — the frame stack IS the state).
+- **`fr` is a fetch-time binding, not a function-scope reference** (v1.1.0): the frame pointer is
+  re-acquired at every fetch because `frames_` mutates on calls, returns, and unwinds. In source form
+  `fr` is a macro over the frame pointer; the discipline it makes load-bearing: every `frames_`
+  mutation site breaks or returns immediately (the return handler re-binds its own callee/caller
+  locals), so no handler observes a frame through a stale binding.
 - **Hot-path law compliance (Rules 6, 7, 8, 9, 16, 118):** the dispatch switch and its fast paths contain
   no C++ exceptions, no allocation, no RTTI, no `std::function`/`shared_ptr`, no string work, no locks.
   Sanctioned allocation sites, each documented at its definition in `Interp.cpp`: **frame pushes** (every
@@ -561,16 +574,21 @@ Consolidated honest list (each is tracked; none is a silent gap):
   pins the Java-correct reading); the field-name index is encoded into the class registry; `findClinit`'s
   "invalid" MethodId is expressed via `needsInit` because `MethodId{0}` is valid; `typeName` says "bottom"
   where the dump pins "bot".
-- **Not yet built (charter, later deliverables):** superinstructions (deliverable 6), profile export with
-  Rule 44 confidence metadata (deliverable 9), computed-goto dispatch (§4).
+- **Not yet built (charter, later deliverables):** superinstructions (deliverable 6, T1-side; the
+  T0-side quickening seam is already executed — §7), profile export with
+  Rule 44 confidence metadata (deliverable 9). Computed-goto dispatch (§4) LANDED in v1.1.0.
 
 ## 13. Change control
 
-- This contract is versioned (this document is 1.0.0). **Any change to §1 (the T0 frame), §2 (the value
-  model), §3 (the deopt entry contract), or §10 (the state-dump fixture format) requires a version bump
-  and an ADVISORY to all consuming teams** (`baseline_noir`, `ir`, `passes`, `regalloc`, `codegen`, `aot`)
-  under the message system (`docs/teams/messaging.md`, team key `all`): those sections define the state
-  every tier must reconstruct and the fixture format every tier's deopt tests pin against.
+- This contract is versioned (this document is 1.1.0; v1.0.0 was the initial publication, v1.1.0 lands
+  the §4 computed-goto dispatch milestone — MSG-20260830-005). **Any change to §1 (the T0 frame), §2
+  (the value model), §3 (the deopt entry contract), or §10 (the state-dump fixture format) requires a
+  version bump and an ADVISORY to all consuming teams** (`baseline_noir`, `ir`, `passes`, `regalloc`,
+  `codegen`, `aot`) under the message system (`docs/teams/messaging.md`, team key `all`): those
+  sections define the state every tier must reconstruct and the fixture format every tier's deopt
+  tests pin against. §4 (dispatch model) changes additionally require the portable differential test
+  to pass unchanged (the two dispatchers must stay observationally identical — the §4 upgrade itself
+  is exactly such a change).
 - **Quickened-id changes (§7) — global field offsets, MethodIds, or IC site ids from the real quickener —
   go through an RFC to this team** and bump the contract: the interim v0 encodings are not permanent.
 - `include/b2/interp/Interp.h` (and `Frame.h`'s dump-format block) are the code twins of this document;
