@@ -162,6 +162,25 @@ enum class NodeKind : std::uint16_t {
   FrameState,      // [locals...] ; payload = FrameStateId (desc index);
                    //   the deopt reconstruction state (Rule 5)
 
+  // --- v2 additions (MSG-20260831-007): graph-builder vocabulary --------------
+  // Appended AFTER v1's last kind so every v1 kind VALUE is unchanged
+  // (serialization stability, Rule 31); docs/ir_spec.md groups them by
+  // category. These are the tests/compositions the RBC->IR builder needs to
+  // express JVM branching, guarding, and uninitialized frame slots.
+  Undef,           // -> Bottom: the uninitialized-slot placeholder (T0's
+                   //   Bottom-tagged Value). Legal ONLY as a FrameState input
+                   //   or a Phi value input (the "Bottom on this path"
+                   //   marker); every typed-operand use is a verifier error.
+  Not,             // [int] -> int : logical complement (0 -> 1, nonzero -> 0)
+  IsNull,          // [ref] -> int : 1 if null else 0 (Null <: Ref accepted)
+  RefEq,           // [ref, ref] -> int : reference identity (1/0); if_acmp*
+  EqI,             // [int, int] -> int : 0/1 boolean test (if_icmp* family)
+  NeI,
+  LtI,
+  LeI,
+  GtI,
+  GeI,
+
   _Count
 };
 

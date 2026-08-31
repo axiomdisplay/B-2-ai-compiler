@@ -76,7 +76,7 @@ B2_TEST(printer_contains_expected_node_lines) {
   ir::Graph g;
   buildRichGraph(g);
   const std::string p = ir::print(g);
-  CHECK(p.find("; B-2 IR v1 nodes=") == 0);
+  CHECK(p.find("; B-2 IR v2 nodes=") == 0);
   CHECK(p.find("Start") != std::string::npos);
   CHECK(p.find("CallVirtual") != std::string::npos);
   CHECK(p.find("kind=nullcheck deopt=2") != std::string::npos);
@@ -283,6 +283,7 @@ B2_TEST(ir_node_registry_rows_match_the_spec_document_counts) {
     case NodeKind::ConstantF: case NodeKind::ConstantD:
     case NodeKind::ConstantNull: case NodeKind::ConstantSym:
     case NodeKind::Parameter:
+    case NodeKind::Undef:
       ++constants; break;
     case NodeKind::AddI: case NodeKind::SubI: case NodeKind::MulI:
     case NodeKind::DivI: case NodeKind::RemI: case NodeKind::NegI:
@@ -296,9 +297,14 @@ B2_TEST(ir_node_registry_rows_match_the_spec_document_counts) {
     case NodeKind::DivF: case NodeKind::RemF: case NodeKind::NegF:
     case NodeKind::AddD: case NodeKind::SubD: case NodeKind::MulD:
     case NodeKind::DivD: case NodeKind::RemD: case NodeKind::NegD:
+    case NodeKind::Not:
       ++arith; break;
     case NodeKind::CmpI: case NodeKind::CmpL: case NodeKind::CmpFl:
     case NodeKind::CmpFg: case NodeKind::CmpDl: case NodeKind::CmpDg:
+    case NodeKind::IsNull: case NodeKind::RefEq:
+    case NodeKind::EqI: case NodeKind::NeI:
+    case NodeKind::LtI: case NodeKind::LeI:
+    case NodeKind::GtI: case NodeKind::GeI:
       ++cmp; break;
     case NodeKind::I2L: case NodeKind::I2F: case NodeKind::I2D:
     case NodeKind::L2I: case NodeKind::L2F: case NodeKind::L2D:
@@ -334,13 +340,17 @@ B2_TEST(ir_node_registry_rows_match_the_spec_document_counts) {
   CHECK(calls == 6);
   CHECK(typeOps == 2);
   CHECK(guards == 1);
-  CHECK(constants == 7);
-  CHECK(arith == 36);
-  CHECK(cmp == 6);
+  CHECK(constants == 8);
+  CHECK(arith == 37);
+  CHECK(cmp == 14);
   CHECK(conv == 23);
   CHECK(merges == 1);
   CHECK(vector == 9);
   CHECK(pea == 2);
   CHECK(tagged == 3);
   CHECK(state == 1);
+  CHECK(control + memory + calls + typeOps + guards + constants + arith +
+            cmp + conv + merges + vector + pea + tagged + state ==
+        ir::nodeKindCount());
+  CHECK(ir::nodeKindCount() == 137);
 }

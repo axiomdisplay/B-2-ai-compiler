@@ -310,6 +310,30 @@ constexpr std::array<NodeInfo, static_cast<std::size_t>(NodeKind::_Count)>
 
   // --- state --------------------------------------------------------------------
   makeRow("FrameState", NC::State, 0, true, IR::Data, false, EK::Pure, {}),
+
+  // --- v2 additions (MSG-20260831-007): graph-builder vocabulary --------------
+  // Appended after v1's last row so kind VALUES are unchanged (Rule 31).
+  // Undef is the uninitialized-slot placeholder: FrameState / Phi inputs only
+  // (the verifier rejects every typed-operand use; its Bottom type is
+  // assignable to nothing).
+  makeRow("Undef", NC::Value, 0, false, IR::None, false, EK::Pure, {}),
+  makeRow("Not", NC::Value, 1, false, IR::None, false, EK::Pure, {IR::Data}),
+  makeRow("IsNull", NC::Value, 1, false, IR::None, false, EK::Pure,
+          {IR::Data}),
+  makeRow("RefEq", NC::Value, 2, false, IR::None, false, EK::Pure,
+          {IR::Data, IR::Data}),
+  makeRow("EqI", NC::Value, 2, false, IR::None, false, EK::Pure,
+          {IR::Data, IR::Data}),
+  makeRow("NeI", NC::Value, 2, false, IR::None, false, EK::Pure,
+          {IR::Data, IR::Data}),
+  makeRow("LtI", NC::Value, 2, false, IR::None, false, EK::Pure,
+          {IR::Data, IR::Data}),
+  makeRow("LeI", NC::Value, 2, false, IR::None, false, EK::Pure,
+          {IR::Data, IR::Data}),
+  makeRow("GtI", NC::Value, 2, false, IR::None, false, EK::Pure,
+          {IR::Data, IR::Data}),
+  makeRow("GeI", NC::Value, 2, false, IR::None, false, EK::Pure,
+          {IR::Data, IR::Data}),
 };
 
 const NodeInfo kBadNodeInfo = [] {

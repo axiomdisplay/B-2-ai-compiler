@@ -4,6 +4,7 @@ add_executable(b2_ir_tests
   EffectTests.cpp
   VerifierTests.cpp
   PrinterTests.cpp
+  V2Tests.cpp
 )
 
 target_link_libraries(b2_ir_tests PRIVATE b2::ir)

@@ -43,6 +43,13 @@ struct Verifier {
 
   // --- classification predicates ------------------------------------------
   [[nodiscard]] static bool producesControl(NodeKind k) noexcept {
+    // v2 (MSG-20260831-007): control chains through EVERY fixed node - a
+    // node that consumes a Ctrl input is pinned into the control flow and
+    // produces control for the fixed nodes after it (Graal's fixed-node
+    // discipline). Terminals (Return/Unwind/Deopt/End) end chains. v1's
+    // sibling-control graphs remain legal: this only ADDS legal Ctrl-input
+    // producers, it removes none - and without it, a branch or terminal
+    // following a same-block store would be schedulable BEFORE the store.
     switch (k) {
     case NodeKind::Start:
     case NodeKind::Region:
@@ -59,6 +66,29 @@ struct Verifier {
     case NodeKind::CallDynamic:
     case NodeKind::CallExcept:
     case NodeKind::LoadException:
+    // Fixed nodes (consume Ctrl, produce Ctrl):
+    case NodeKind::If:
+    case NodeKind::Switch:
+    case NodeKind::LoadField:
+    case NodeKind::StoreField:
+    case NodeKind::LoadStatic:
+    case NodeKind::StoreStatic:
+    case NodeKind::LoadElem:
+    case NodeKind::StoreElem:
+    case NodeKind::MemBar:
+    case NodeKind::MonitorEnter:
+    case NodeKind::MonitorExit:
+    case NodeKind::New:
+    case NodeKind::NewArray:
+    case NodeKind::NewRefArray:
+    case NodeKind::NewMultiArray:
+    case NodeKind::ClassInit:
+    case NodeKind::CheckCast:
+    case NodeKind::Guard:
+    case NodeKind::RepTransitionGuard:
+    case NodeKind::Materialize:
+    case NodeKind::VectorLoad:
+    case NodeKind::VectorStore:
       return true;
     default:
       return false;
@@ -86,9 +116,51 @@ struct Verifier {
     case NodeKind::Materialize:
     case NodeKind::VectorStore:
       return true;
+    case NodeKind::Phi:
+      // v2 (MSG-20260831-007): the memory-state MERGE (Graal's MemoryPhi
+      // shape). Legal only when every value input is itself a memory-state
+      // producer (transitively) - checked in checkMemoryPhiInputs / the
+      // role pass, so a Phi used as a Mem input can never smuggle a pure
+      // value into the memory chain.
+      return true;
     default:
       return false;
     }
+  }
+
+  // v2: a Phi feeding a Mem slot (or appearing inside a memory chain) must
+  // have every value input (slots 1..) be a memory-state producer, allowing
+  // nested memory Phis. Returns the offending input id, or kInvalidNodeId.
+  // Depth-bounded: malformed graphs can contain Phi cycles.
+  [[nodiscard]] NodeId memoryPhiOffender(NodeId phi, std::uint32_t depth) {
+    if (depth > g.nodeCount() + 1) {
+      return phi; // pathological nesting depth: report the outer Phi
+    }
+    const Node& p = g.node(phi);
+    for (std::uint16_t s = 1; s < p.numInputs; ++s) {
+      const NodeId in = g.input(phi, s);
+      if (in == phi) {
+        continue; // self input: loop-invariant marker, not a chain link
+      }
+      const NodeId off = memoryChainOffender(in, depth + 1);
+      if (off != kInvalidNodeId) {
+        return off;
+      }
+    }
+    return kInvalidNodeId;
+  }
+
+  // One link of the memory-chain legality check: node `cur` must be a
+  // memory-state producer (Phi handled recursively). Returns the first
+  // offending node id, or kInvalidNodeId when `cur` is fine.
+  [[nodiscard]] NodeId memoryChainOffender(NodeId cur, std::uint32_t depth) {
+    if (!validId(cur)) {
+      return kInvalidNodeId; // dangling ids are reported structurally
+    }
+    if (g.node(cur).kind == NodeKind::Phi) {
+      return memoryPhiOffender(cur, depth);
+    }
+    return producesMemoryState(g.node(cur).kind) ? kInvalidNodeId : cur;
   }
 
   [[nodiscard]] static bool isTerminal(NodeKind k) noexcept {
@@ -154,7 +226,13 @@ struct Verifier {
     case NodeKind::ShlI: case NodeKind::ShrI: case NodeKind::UShrI:
     case NodeKind::AndI: case NodeKind::OrI: case NodeKind::XorI:
     case NodeKind::CmpI:
+    case NodeKind::EqI: case NodeKind::NeI:
+    case NodeKind::LtI: case NodeKind::LeI:
+    case NodeKind::GtI: case NodeKind::GeI:
       a = IRType::Int; b = IRType::Int; return true;
+    case NodeKind::RefEq:
+      // v2: reference identity test (if_acmp*); Null <: Ref on either side.
+      a = IRType::Ref; b = IRType::Ref; return true;
     case NodeKind::AddL: case NodeKind::SubL: case NodeKind::MulL:
     case NodeKind::DivL: case NodeKind::RemL:
     case NodeKind::AndL: case NodeKind::OrL: case NodeKind::XorL:
@@ -179,6 +257,12 @@ struct Verifier {
     switch (k) {
     case NodeKind::NegI:
       a = IRType::Int; return true;
+    case NodeKind::Not:
+      // v2: logical complement of a boolean-test Int.
+      a = IRType::Int; return true;
+    case NodeKind::IsNull:
+      // v2: null test; Null <: Ref accepted (ConstantNull feeds it).
+      a = IRType::Ref; return true;
     case NodeKind::NegL:
       a = IRType::Long; return true;
     case NodeKind::NegF:
@@ -213,13 +297,17 @@ struct Verifier {
       diag(n, "reserved field must be 0 (corrupt node record)");
     }
 
-    // Structural: ids alive, no self reference.
+    // Structural: ids alive, no self reference. EXEMPTION (v2,
+    // MSG-20260831-007): a Phi value input may be the Phi itself - the
+    // loop-invariant marker of the standard sea-of-nodes loop phi (the
+    // value flows around the backedge unchanged); the graph builder relies
+    // on it whenever a slot's backedge definition is the header phi.
     for (std::uint16_t s = 0; s < nd.numInputs; ++s) {
       const NodeId in = g.input(n, s);
       if (!validId(in)) {
         diag(n, "input slot " + std::to_string(s) + ": dangling NodeId " +
                     std::to_string(in));
-      } else if (in == n) {
+      } else if (in == n && !(nd.kind == NodeKind::Phi && s >= 1)) {
         diag(n, "input slot " + std::to_string(s) + ": self reference");
       } else if (g.node(in).isDead()) {
         diag(n, "input slot " + std::to_string(s) + ": n" +
@@ -275,6 +363,15 @@ struct Verifier {
           diag(n, "mem input slot " + std::to_string(s) + ": n" +
                       std::to_string(in) + " (" + info(prod.kind).name +
                       ") does not produce memory state");
+        } else if (prod.kind == NodeKind::Phi) {
+          const NodeId off = memoryPhiOffender(in, 0);
+          if (off != kInvalidNodeId) {
+            diag(n, "mem input slot " + std::to_string(s) +
+                        ": Phi n" + std::to_string(in) +
+                        " has value input n" + std::to_string(off) +
+                        " (" + info(g.node(off).kind).name +
+                        ") which does not produce memory state");
+          }
         }
         break;
       case InputRole::FrameState:
@@ -289,6 +386,17 @@ struct Verifier {
       case InputRole::Data:
       case InputRole::None:
         break;
+      }
+
+      // v2 (MSG-20260831-007): Undef is the uninitialized-slot placeholder.
+      // It may feed a FrameState (a Bottom-tagged deopt slot) or a Phi (the
+      // "Bottom on this path" marker); every other use would read an
+      // uninitialized value, which verified RBC never does.
+      if (prod.kind == NodeKind::Undef && nd.kind != NodeKind::FrameState &&
+          !(nd.kind == NodeKind::Phi && s >= 1)) {
+        diag(n, "Undef may only feed a FrameState or a Phi value input; n" +
+                    std::to_string(n) + " (" + info(nd.kind).name +
+                    ") reads it at slot " + std::to_string(s));
       }
     }
 
@@ -571,7 +679,8 @@ struct Verifier {
 
   // --- pass 2: memory chain continuity (Rules 40, 121) -------------------------
   void checkMemoryChains() {
-    std::vector<std::uint32_t> stamp(g.nodeCount(), 0);
+    std::vector<std::uint32_t> onPath(g.nodeCount(), 0);
+    std::vector<std::uint32_t> doneStamp(g.nodeCount(), 0);
     std::uint32_t generation = 0;
     for (NodeId n = 0; n < g.nodeCount(); ++n) {
       const Node& nd = g.node(n);
@@ -591,53 +700,101 @@ struct Verifier {
         continue;
       }
       // Walk back through memory-state producers; every link must produce
-      // memory state and the chain must terminate at Start.
+      // memory state and the chain must terminate at Start. v2: the chain
+      // may pass through memory Phis (control merges), which fork the walk
+      // over the Phi's value inputs. DFS coloring: onPath marks the current
+      // branch (a revisit from the SAME branch is a cycle), done marks
+      // nodes proven on any earlier branch (legal DAG sharing).
       ++generation;
-      NodeId cur = g.input(n, memSlot);
+      struct WalkFrame {
+        NodeId n;
+        std::uint16_t child; // next child index to visit
+      };
+      std::vector<WalkFrame> stack;
+      if (validId(g.input(n, memSlot))) {
+        stack.push_back({g.input(n, memSlot), 0});
+        onPath[stack.back().n] = generation;
+      }
       std::uint32_t steps = 0;
       const std::uint32_t maxSteps = g.nodeCount() + 1;
-      bool ok = true;
-      while (validId(cur) && cur != g.startNode()) {
+      while (!stack.empty()) {
         if (steps++ > maxSteps) {
           diag(n, "memory chain walk exceeded graph size (cycle?)");
-          ok = false;
           break;
         }
-        if (stamp[cur] == generation) {
-          diag(n, "memory chain cycle detected at n" + std::to_string(cur));
-          ok = false;
-          break;
-        }
-        stamp[cur] = generation;
-        const Node& c = g.node(cur);
-        if (!producesMemoryState(c.kind)) {
-          diag(n, "memory chain passes through n" + std::to_string(cur) +
-                      " (" + info(c.kind).name +
-                      ") which does not produce memory state");
-          ok = false;
-          break;
-        }
-        // Continue through the node's own Mem input.
-        const NodeInfo& crow = info(c.kind);
-        std::uint16_t cmem = 0xFFFF;
-        for (std::uint16_t s = 0; s < crow.numFixed && s < 6; ++s) {
-          if (crow.roles[s] == InputRole::Mem) {
-            cmem = s;
-            break;
+        WalkFrame& top = stack.back();
+        const Node& c = g.node(top.n);
+        // Children of a memory Phi are its value inputs (slot 0 is the
+        // region); every other memory producer continues at its own Mem
+        // input; Start (and chain roots) have none.
+        std::uint16_t numChildren = 0;
+        bool isPhi = c.kind == NodeKind::Phi;
+        if (isPhi) {
+          numChildren = c.numInputs > 1
+                            ? static_cast<std::uint16_t>(c.numInputs - 1)
+                            : 0;
+        } else {
+          const NodeInfo& crow = info(c.kind);
+          for (std::uint16_t s = 0; s < crow.numFixed && s < 6; ++s) {
+            if (crow.roles[s] == InputRole::Mem) {
+              if (s < c.numInputs) {
+                numChildren = 1;
+              }
+              break;
+            }
           }
         }
-        if (cmem == 0xFFFF) {
-          break; // Start: no mem input
-        }
-        if (cmem >= c.numInputs) {
-          diag(n, "memory chain broken: n" + std::to_string(cur) +
-                      " is missing its mem input");
-          ok = false;
+        if (!isPhi && !producesMemoryState(c.kind)) {
+          diag(n, "memory chain passes through n" + std::to_string(top.n) +
+                      " (" + info(c.kind).name +
+                      ") which does not produce memory state");
           break;
         }
-        cur = g.input(cur, cmem);
+        if (top.child >= numChildren) {
+          // Node fully proven on this branch.
+          onPath[top.n] = 0;
+          doneStamp[top.n] = generation;
+          stack.pop_back();
+          continue;
+        }
+        const std::uint16_t childIdx = top.child++;
+        NodeId child{};
+        if (isPhi) {
+          // Self inputs are the loop-invariant marker: nothing to prove.
+          if (g.input(top.n, static_cast<std::uint16_t>(childIdx + 1)) ==
+              top.n) {
+            continue;
+          }
+          child = g.input(top.n, static_cast<std::uint16_t>(childIdx + 1));
+        } else {
+          const NodeInfo& crow = info(c.kind);
+          for (std::uint16_t s = 0; s < crow.numFixed && s < 6; ++s) {
+            if (crow.roles[s] == InputRole::Mem) {
+              child = g.input(top.n, s);
+              break;
+            }
+          }
+        }
+        if (!validId(child)) {
+          continue; // dangling ids are reported structurally
+        }
+        if (child == g.startNode()) {
+          continue; // proven: terminates at Start
+        }
+        if (onPath[child] == generation) {
+          diag(n, "memory chain cycle detected at n" +
+                      std::to_string(child));
+          break;
+        }
+        if (doneStamp[child] == generation) {
+          continue; // proven on an earlier branch (legal DAG sharing)
+        }
+        stack.push_back({child, 0});
+        onPath[child] = generation;
       }
-      (void)ok;
+      for (const WalkFrame& f : stack) {
+        onPath[f.n] = 0; // unwind partial state on early exit
+      }
     }
   }
 

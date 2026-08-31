@@ -1,4 +1,4 @@
-# B-2 Sea-of-Nodes IR Specification (v1)
+# B-2 Sea-of-Nodes IR Specification (v2)
 
 ```text
 Normative reference: docs/laws.md
@@ -84,19 +84,32 @@ Every node kind fixes a signature (registry row):
 - an optional mandatory trailing `FrameState` input (checked after the
   variadic tail).
 
-Control producers: `Start`, `Region`, `IfTrue`, `IfFalse`, `SwitchCase`,
-`SwitchDefault`, `LoopBegin`, `LoopEnd`, `LoopExit`, `Call*`, `CallExcept`,
-`LoadException`. Terminals (`Return`, `Unwind`, `Deopt`, `End`) produce
-neither control nor values and must have no users.
+Control producers (v2): `Start`, `Region`, `IfTrue`, `IfFalse`,
+`SwitchCase`, `SwitchDefault`, `LoopBegin`, `LoopEnd`, `LoopExit`, `Call*`,
+`CallExcept`, `LoadException`, and EVERY fixed node — a node whose registry
+row consumes a `Ctrl` input (`If`, `Switch`, `Guard`, `RepTransitionGuard`,
+loads, stores, barriers, monitors, allocations, `ClassInit`, `CheckCast`,
+`Materialize`, `VectorLoad/Store`) produces control for the fixed nodes
+after it. This is Graal's fixed-node discipline: control chains through the
+schedule, so a branch or terminal following a same-block store cannot be
+scheduled before it. Terminals (`Return`, `Unwind`, `Deopt`, `End`) end
+chains: they produce neither control nor values and must have no users.
 
 Memory-state producers (legal `Mem` inputs): `Start`, `StoreField`,
 `StoreStatic`, `StoreElem`, `MemBar`, `MonitorEnter`, `MonitorExit`, `New`,
 `NewArray`, `NewRefArray`, `NewMultiArray`, `ClassInit`, `Call*`,
-`Materialize`, `VectorStore`. Loads read a memory state but do not produce
-one (the sea-of-nodes memory model: writers chain, readers point at the
-current state). `Start` is the origin of BOTH control and memory.
+`Materialize`, `VectorStore`, and `Phi` — the v2 memory-state MERGE
+(Graal's MemoryPhi shape). A `Phi` used as a `Mem` input must have every
+value input be a memory-state producer (transitively; the verifier rejects
+a pure value smuggled into the memory chain). Loads read a memory state but
+do not produce one (the sea-of-nodes memory model: writers chain, readers
+point at the current state). `Start` is the origin of BOTH control and
+memory.
 
-## 4. Node kinds (127)
+v1 graphs remain legal under v2: the added producers only widen the set of
+legal `Ctrl`/`Mem` inputs.
+
+## 4. Node kinds (137)
 
 Payload conventions below are normative; `payload2` marked "—" is unused
 (and must be 0 for serialization stability).
@@ -171,7 +184,10 @@ block's entry is `LoadException` on the caught-exception control path.
 
 Deopts when the condition evaluates 0. Every guard carries a `FrameState`
 (Rule 5); speculative guards additionally carry complete `SpecMeta`
-(Rule 122, section 5.3). GuardKind taxonomy (Rule 32): `None`, `NullCheck`,
+(Rule 122, section 5.3). Guards GATE control (v2): a guard consumes a
+control predecessor and produces control for everything that must execute
+only if the guard holds — the graph builder places `NullCheck`/`BoundsCheck`/
+`ZeroCheck` guards in front of the memory ops and calls they protect. GuardKind taxonomy (Rule 32): `None`, `NullCheck`,
 `BoundsCheck`, `ZeroCheck`, `ClassCast`, `ArrayStore`, `TypeProfile`,
 `UnstableIf`, `UnstableSwitch`, `LoopLimit`, `Deoptimize`.
 
@@ -186,6 +202,13 @@ Deopts when the condition evaluates 0. Every guard carries a `FrameState`
 | `ConstantNull` | — | — / — | Null | Pure |
 | `ConstantSym` | — | s=SymbolId / — | Ref | Pure |
 | `Parameter` | — | #=index / IRType | IRType | Pure |
+| `Undef` | — | — / — | Bottom | Pure |
+
+`Undef` (v2) is the uninitialized-slot placeholder: T0's Bottom-tagged
+`Value`. It may feed ONLY a `FrameState` (a deopt slot that materializes
+Bottom) or a `Phi` value input (the "Bottom on this path" marker); every
+typed-operand use is a verifier error — verified RBC never reads an
+uninitialized slot.
 
 Float/double constants store exact bit patterns (NaN payloads and −0.0
 survive round-trips; pinned by test).
@@ -201,9 +224,17 @@ pattern matching):
   EXCEPT `ShlL/ShrL/UShrL` whose count operand stays `Int` (JVM rule).
 - Float (6): `AddF SubF MulF DivF RemF NegF` — `Float`.
 - Double (6): same with `D` — `Double`.
+- Logical (1, v2): `Not` [Int] → `Int` — boolean complement
+  (0 → 1, nonzero → 0).
 - Comparisons (6): `CmpI`, `CmpL`, `CmpFl`, `CmpFg`, `CmpDl`, `CmpDg` —
   result `Int` = `(a>b) − (a<b)`; the `l/g` variants fix NaN comparison
   direction (JVM `fcmpl`/`fcmpg`).
+- Boolean tests (8, v2 — the graph-builder branch/guard vocabulary):
+  `EqI NeI LtI LeI GtI GeI` [Int, Int] → `Int` (0/1, the `if_icmp*`
+  family), `RefEq` [Ref, Ref] → `Int` (identity, `if_acmp*`; Null legal on
+  either side), `IsNull` [Ref] → `Int` (1 if null; Null legal). `If`
+  conditions and `Guard` conditions are composed from these (plus `Not`,
+  `AndI`/`OrI`) so that IfTrue is always the TAKEN edge.
 
 All Pure. `Div`/`Rem` trap semantics are carried by explicit guards
 (`ZeroCheck`), not hidden effects.
@@ -223,7 +254,7 @@ Unary `[Data]` inputs, all Pure.
 
 | Kind | Inputs | Notes |
 |---|---|---|
-| `Phi` | [Ctrl(Region/LoopBegin), Data per pred] | Arity must be 1 + region predecessors; result type = join of value inputs |
+| `Phi` | [Ctrl(Region/LoopBegin), Data per pred] | Arity must be 1 + region predecessors; result type = join of value inputs. A value input may be the Phi ITSELF (v2: the loop-invariant marker — the value flows around the backedge unchanged; the structural self-reference check exempts Phis) or `Undef` (Bottom on that path) |
 
 ### 4.10 Vector / SIMD (9) — SWLP representation (Part XVIII)
 
@@ -362,14 +393,16 @@ diagnostics, never UB. Checks, in order:
 9. vector well-formedness: power-of-two lanes in [2,64], operand type/lane
    agreement, mask agreement, op legality per lane family;
 10. tagged transitions: valid reps; no unguarded Polymorphic transitions.
-
 The pipeline wiring (run-after-every-pass in debug builds) belongs to the
 Passes Team's pass registry; the reusable hook is this function.
 
 ## 8. Serialization (Rules 31, 38, 124)
 
 Versioned binary format, little-endian, layout documented in
-`compiler/ir/core/Serialize.cpp`. Magic `B2IR`, format version 1. Nodes in
+`compiler/ir/core/Serialize.cpp`. Magic `B2IR`, format version **2** (v2
+appended the graph-builder value kinds after `FrameState` and made
+guards/fixed nodes control producers; all v1 kind VALUES are unchanged, so
+v1 artifacts load unchanged — the reader accepts versions 1..2). Nodes in
 id order (tombstones included — ids preserved), side tables in id order,
 replacement log in log order. Byte-deterministic for the same graph state.
 
@@ -406,8 +439,9 @@ NaN payloads and −0.0.
 
 ## 10. Appendix B — category counts (test-pinned)
 
-control 15, memory 15, calls 6, type-ops 2, guards 1, constants/params 7,
-arithmetic 36, comparisons 6, conversions 23, merges 1, vector 9, PEA 2,
-tagged 3, state 1 — **127 kinds**.
+control 15, memory 15, calls 6, type-ops 2, guards 1, constants/params 8,
+arithmetic 37, comparisons 14, conversions 23, merges 1, vector 9, PEA 2,
+tagged 3, state 1 — **137 kinds** (v2: +`Undef`, +`Not`, +`RefEq`,
++`IsNull`, +`EqI..GeI`).
 `ir_node_registry_rows_match_the_spec_document_counts` fails if this table
 and the enum drift apart.

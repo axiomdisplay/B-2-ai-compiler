@@ -186,8 +186,14 @@ DeserializeResult deserializeInto(const std::uint8_t* data,
     return res;
   }
   if (version != kIrFormatVersion) {
-    fail("unsupported IR format version (Rule 31: stale artifact)");
-    return res;
+    if (version >= kIrMinReadVersion && version < kIrFormatVersion) {
+      // v1 artifact: kind values are unchanged (v2 only appended), and no
+      // v1 node can use a builder kind - proceed; replay rejects anything
+      // unexpected.
+    } else {
+      fail("unsupported IR format version (Rule 31: stale artifact)");
+      return res;
+    }
   }
 
   std::uint32_t nodeCount = 0;

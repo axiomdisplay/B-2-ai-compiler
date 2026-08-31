@@ -107,6 +107,11 @@ IRType resultTypeOf(const Graph& g, NodeId n) {
   case NodeKind::CmpI:
   case NodeKind::I2B: case NodeKind::I2C: case NodeKind::I2S:
   case NodeKind::Truncate:
+  // v2 boolean tests (graph-builder branch/guard conditions).
+  case NodeKind::Not: case NodeKind::IsNull: case NodeKind::RefEq:
+  case NodeKind::EqI: case NodeKind::NeI:
+  case NodeKind::LtI: case NodeKind::LeI:
+  case NodeKind::GtI: case NodeKind::GeI:
     return IRType::Int;
   case NodeKind::AddL: case NodeKind::SubL: case NodeKind::MulL:
   case NodeKind::DivL: case NodeKind::RemL: case NodeKind::NegL:
@@ -253,6 +258,10 @@ const char* depKindName(Dependency::Kind k) {
 void appendPayloadSuffix(std::string& out, const Graph& g, NodeId n) {
   const Node& nd = g.node(n);
   char buf[64];
+  const std::size_t mark = out.size(); // rollback point for empty suffixes
+  if (!out.empty() && out.back() != ' ') {
+    out += ' '; // separate payload from inputs (v2: was glued)
+  }
   switch (nd.kind) {
   case NodeKind::Parameter:
     std::snprintf(buf, sizeof(buf), "#%u : %s", nd.payload,
@@ -417,6 +426,9 @@ void appendPayloadSuffix(std::string& out, const Graph& g, NodeId n) {
   if (nd.specMeta != 0) {
     std::snprintf(buf, sizeof(buf), " spec=s%u", nd.specMeta - 1);
     out += buf;
+  }
+  if (out.size() == mark + 1 && out.back() == ' ') {
+    out.pop_back(); // no payload: drop the separator
   }
 }
 

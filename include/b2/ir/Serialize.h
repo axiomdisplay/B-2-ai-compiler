@@ -20,7 +20,15 @@
 namespace b2::ir {
 
 inline constexpr std::uint32_t kIrMagic = 0x52493242u; // 'B2IR' LE
-inline constexpr std::uint32_t kIrFormatVersion = 1;
+
+// v2 (MSG-20260831-007): appends the graph-builder value kinds after v1's
+// last kind (Undef/Not/IsNull/RefEq/EqI..GeI) and makes Guard / Rep
+// TransitionGuard control producers - all existing kind VALUES are
+// unchanged, so v1 artifacts deserialize unchanged (accepted for replay
+// compat); writers emit v2 (Rule 31: version bump on format change).
+inline constexpr std::uint32_t kIrFormatVersion = 2;
+// Reader-accepted versions (inclusive range, oldest first).
+inline constexpr std::uint32_t kIrMinReadVersion = 1;
 
 struct SerializeError {
   std::string message;
