@@ -118,6 +118,8 @@ Compile a Tier-1 stencil plan from verified RBC with the baseline driver:
 | `docs/stencils.md` | Precompiled stencil system: T1 copy-and-patch composition, stencil format and categories, Stencil Rules 1-10 (Amendment C) |
 | `docs/cpp26_standards.md` | C++26 code standards (CS-1..CS-13) and the Java/C++ two-domain testing contract |
 | `docs/rbc_spec.md` | Register Bytecode (RBC) specification: frame model, 150-opcode set, type system, verification rules, quickening, text format |
+| `docs/ir_spec.md` | Sea-of-nodes IR specification (T2/T3): storage model, IRType lattice, all 127 node kinds with input signatures/effects/verifier constraints, FrameState/virtual-object/SpecMeta/dependency structures, serializer format, printer format |
+| `docs/effect_system.md` | The explicit effect model (Rule 121): the 12 effect classes, the 144-entry reorder table with construction rules R1-R9, the compensation-node contract, enforcement |
 | `docs/interp_contract.md` | Tier-0 interpreter state contract (v1): the T0 frame, value model, deopt entry (`resume`), quickened-opcode pins, state-dump fixture format |
 | `docs/teams/README.md` | Team organization: nine teams of two AI roles (implementer + reviewer), including the GC Team |
 | `docs/teams/messaging.md` | Inter-team message system |
