@@ -6,6 +6,12 @@
 # driver are later deliverables.
 set(B2_PASSES_SOURCES
   src/GraphBuilder.cpp
+  src/Passes.cpp
+  src/PassSupport.cpp
+  src/Simplify.cpp
+  src/ControlFlow.cpp
+  src/DCE.cpp
+  src/GVN.cpp
 )
 
 add_library(b2_passes STATIC ${B2_PASSES_SOURCES})

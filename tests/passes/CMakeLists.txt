@@ -1,6 +1,7 @@
 add_executable(b2_passes_tests
   TestMain.cpp
   GraphBuilderTests.cpp
+  PassTests.cpp
 )
 
 target_link_libraries(b2_passes_tests PRIVATE b2::passes b2::ir b2::rbc)

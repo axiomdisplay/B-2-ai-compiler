@@ -20,12 +20,13 @@
 #include "b2/ir/Printer.h"
 #include "b2/ir/Verifier.h"
 #include "b2/passes/GraphBuilder.h"
+#include "b2/passes/Passes.h"
 #include "b2/rbc/RbcText.h"
 #include "b2/rbc/Verifier.h"
 
 namespace {
 
-int run(const std::string& text, bool quiet) {
+int run(const std::string& text, bool quiet, bool optimize) {
   const auto parsed = b2::rbc::parseRbcText(text);
   if (!parsed) {
     std::fprintf(stderr, "b2graph: parse error at offset %u: %s\n",
@@ -73,6 +74,38 @@ int run(const std::string& text, bool quiet) {
       ++failures;
       continue;
     }
+    if (optimize) {
+      // The early-cleanup + GVN pipeline (Rules 40/124: verified between
+      // passes, deterministic). Fail-closed on any verification or
+      // budget failure - the human review surface never shows an
+      // unverified graph.
+      const b2::passes::PassResult pr = b2::passes::runEarlyCleanup(g);
+      if (!pr.ok) {
+        std::fprintf(stderr, "b2graph: pass pipeline failed for %s:\n",
+                     m.name.c_str());
+        for (const b2::passes::PassDiag& d : pr.diags) {
+          std::fprintf(stderr, "  %s\n", d.message.c_str());
+        }
+        ++failures;
+        continue;
+      }
+      const b2::ir::VerifyResult irv2 = b2::ir::verify(g);
+      if (irv2.hasErrors()) {
+        std::fprintf(stderr,
+                     "b2graph: post-pipeline verification failed for %s\n",
+                     m.name.c_str());
+        ++failures;
+        continue;
+      }
+      if (!quiet) {
+        std::printf("  # pipeline: rounds=%u rewrites=%u removals=%u "
+                    "folds=%u gvn=%u converged=%d\n",
+                    pr.telemetry.rounds, pr.telemetry.rewrites,
+                    pr.telemetry.removals, pr.telemetry.folds,
+                    pr.telemetry.gvnDedups,
+                    pr.telemetry.converged ? 1 : 0);
+      }
+    }
     if (!quiet) {
       std::fputs(b2::ir::print(g).c_str(), stdout);
     }
@@ -84,16 +117,22 @@ int run(const std::string& text, bool quiet) {
 
 int main(int argc, char** argv) {
   bool quiet = false;
+  bool optimize = false;
   std::vector<std::string> files;
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "--quiet" || arg == "-q") {
       quiet = true;
+    } else if (arg == "-O" || arg == "--optimize") {
+      optimize = true;
     } else if (arg == "--help" || arg == "-h") {
       std::printf(
-          "usage: b2graph [--quiet] file.rbc...\n"
+          "usage: b2graph [--quiet] [-O] file.rbc...\n"
           "  parse RBC text, verify, build every method's IR graph,\n"
-          "  IR-verify, and print (the builder's debug surface)\n");
+          "  IR-verify, and print (the builder's debug surface)\n"
+          "  -O: run the early-cleanup + GVN pipeline after the build\n"
+          "      (verified between passes, deterministic; telemetry line\n"
+          "      per method)\n");
       return 0;
     } else {
       files.push_back(arg);
@@ -116,7 +155,7 @@ int main(int argc, char** argv) {
     if (!quiet) {
       std::printf("# %s\n", f.c_str());
     }
-    failures += run(ss.str(), quiet) == 0 ? 0 : 1;
+    failures += run(ss.str(), quiet, optimize) == 0 ? 0 : 1;
   }
   return failures == 0 ? 0 : 1;
 }

@@ -79,7 +79,15 @@ instruction's FrameState:
 |---|---|
 | NPE (field/array/monitor receivers, dispatching call receivers) | `Guard(NullCheck, Not(IsNull(x)))` |
 | AIOOBE (array loads/stores) | `Guard(BoundsCheck, AndI(GeI(idx, 0), LtI(idx, ArrayLength(a))))` |
-| ArithmeticException (idiv/irem/ldiv/lrem by zero) | `Guard(ZeroCheck, NeI(divisor, 0))` |
+| ArithmeticException (idiv/irem by zero) | `Guard(ZeroCheck, NeI(divisor, 0))` |
+| ArithmeticException (ldiv/lrem by zero) | `Guard(ZeroCheck, NeI(L2I(divisor), 0))` |
+
+The long-division guard narrows through `L2I`: `NeI` takes Int operands
+and there is no `NeL` kind. `L2I(x) == 0` for x = 0 OR x a nonzero
+multiple of 2^32, so the guard deopts on a non-trapping divisor — always
+observably equivalent (deopt-to-T0 re-execution), astronomically rare.
+The clean `CmpL(divisor, 0L)` comparison is blocked until the IR team
+fixes the `resultTypeOf(CmpL)` classification (MSG-009).
 
 Divide-by-zero on floats/doubles needs no guard (IEEE semantics). `checkcast`
 keeps its `ExceptionThrow` effect node (a Java exception, not a deopt);
@@ -186,7 +194,19 @@ calls leave dst unset (payload2 = Bottom).
 charter); the RBC op is the hook for tiers without their own polls. OSR
 entry construction (suite item 7) arrives with the tiering loop.
 
-## 11. Determinism (Rule 124)
+## 11. Errata (T2-IR3)
+
+The v2 arithmetic lowering indexed its kind tables by `op - Iadd`/`op -
+Ladd` without placeholder rows for the guarded div/rem/neg entries at
+offsets 3-5: `Ishl/Ishr/Iushr` lowered to the bitwise kinds and
+`Iand/Ior/Ixor` (and the long twins) read past the array - an
+out-of-bounds read that produced Start-kind nodes. The tables now carry
+placeholder rows and the opcode layout is pinned by `static_assert`s.
+Found by the pass suite's bitwise tests (the interp corpus has no
+bitwise programs); the long zero-guard's operand-type violation is fixed
+in the same pass (see the guard table above).
+
+## 12. Determinism (Rule 124)
 
 Fixed successor orders (taken edge first, switch cases in table order),
 blocks in pc order, Kahn tie-break by block index, memoized constants in

@@ -384,7 +384,8 @@ class Builder {
                                    std::vector<std::uint32_t>& targets,
                                    std::uint32_t& defaultTarget);
   ir::NodeId nullGuard(std::uint32_t pc, ir::NodeId obj);
-  ir::NodeId zeroGuard(std::uint32_t pc, ir::NodeId divisor);
+  ir::NodeId zeroGuard(std::uint32_t pc, ir::NodeId divisor,
+                       bool isLong = false);
   ir::NodeId boundsGuard(std::uint32_t pc, ir::NodeId array,
                          ir::NodeId index);
   [[nodiscard]] ir::IRType fieldResultType(const rbc::Const& c);
@@ -1298,9 +1299,24 @@ ir::NodeId Builder::nullGuard(std::uint32_t pc, ir::NodeId obj) {
   return curCtrl_;
 }
 
-ir::NodeId Builder::zeroGuard(std::uint32_t pc, ir::NodeId divisor) {
-  const ir::NodeId ne = g_.make(ir::NodeKind::NeI,
-                                {divisor, constInt(0)});
+ir::NodeId Builder::zeroGuard(std::uint32_t pc, ir::NodeId divisor,
+                               bool isLong) {
+  // Long divisors guard through L2I: NeI takes Int operands and there is
+  // no NeL kind. L2I(divisor) == 0 iff divisor is 0 OR a nonzero multiple
+  // of 2^32 - the guard then deopts on a non-trapping divisor, which is
+  // always observably equivalent (deopt-to-T0 re-execution; the spurious
+  // case is astronomically rare). The clean CmpL(divisor, 0L) comparison
+  // is blocked until the IR team fixes resultTypeOf(CmpL) - currently
+  // classified Long-producing although Node.h defines the result as int
+  // (reported as MSG-009 together with I2L and the fp-compare group).
+  ir::NodeId ne = divisor;
+  if (isLong) {
+    const ir::NodeId narrowed =
+        g_.make(ir::NodeKind::L2I, {divisor});
+    ne = g_.make(ir::NodeKind::NeI, {narrowed, constInt(0)});
+  } else {
+    ne = g_.make(ir::NodeKind::NeI, {divisor, constInt(0)});
+  }
   const ir::NodeId fs = fsAt(pc);
   curCtrl_ = g_.make(ir::NodeKind::Guard, {curCtrl_, ne, fs},
                      static_cast<std::uint32_t>(ir::GuardKind::ZeroCheck),
@@ -1667,8 +1683,26 @@ bool Builder::lowerInstruction(std::uint32_t pc, const rbc::Ins& ins) {
   case rbc::Op::Iadd: case rbc::Op::Isub: case rbc::Op::Imul:
   case rbc::Op::Ishl: case rbc::Op::Ishr: case rbc::Op::Iushr:
   case rbc::Op::Iand: case rbc::Op::Ior: case rbc::Op::Ixor: {
+    // The RBC opcode order (Iadd..Ixor) has Idiv/Irem/Ineg at offsets
+    // 3-5 - they lower through their own guarded cases below, so the
+    // table carries placeholder rows to keep the index arithmetic exact.
+    // The layout is pinned by static_asserts: an opcode renumbering can
+    // never silently reopen the out-of-bounds hole this table had in
+    // T2-IR2 (Iand/Ior/Ixor read past the end; shifts mapped to the
+    // bitwise kinds - caught by the pass suite's bitwise tests).
+    static_assert(static_cast<std::uint32_t>(rbc::Op::Idiv) -
+                      static_cast<std::uint32_t>(rbc::Op::Iadd) == 3u);
+    static_assert(static_cast<std::uint32_t>(rbc::Op::Ineg) -
+                      static_cast<std::uint32_t>(rbc::Op::Iadd) == 5u);
+    static_assert(static_cast<std::uint32_t>(rbc::Op::Ishl) -
+                      static_cast<std::uint32_t>(rbc::Op::Iadd) == 6u);
+    static_assert(static_cast<std::uint32_t>(rbc::Op::Ixor) -
+                      static_cast<std::uint32_t>(rbc::Op::Iadd) == 11u);
     static constexpr ir::NodeKind kinds[] = {
         ir::NodeKind::AddI, ir::NodeKind::SubI, ir::NodeKind::MulI,
+        ir::NodeKind::Start, // Idiv: guarded case below
+        ir::NodeKind::Start, // Irem: guarded case below
+        ir::NodeKind::Start, // Ineg: unary case below
         ir::NodeKind::ShlI, ir::NodeKind::ShrI, ir::NodeKind::UShrI,
         ir::NodeKind::AndI, ir::NodeKind::OrI, ir::NodeKind::XorI};
     const std::uint32_t base =
@@ -1702,8 +1736,21 @@ bool Builder::lowerInstruction(std::uint32_t pc, const rbc::Ins& ins) {
   case rbc::Op::Ladd: case rbc::Op::Lsub: case rbc::Op::Lmul:
   case rbc::Op::Lshl: case rbc::Op::Lshr: case rbc::Op::Lushr:
   case rbc::Op::Land: case rbc::Op::Lor: case rbc::Op::Lxor: {
+    // Same discipline as the int table above: Ldiv/Lrem/Lneg sit at
+    // offsets 3-5 with their own cases; layout pinned by asserts.
+    static_assert(static_cast<std::uint32_t>(rbc::Op::Ldiv) -
+                      static_cast<std::uint32_t>(rbc::Op::Ladd) == 3u);
+    static_assert(static_cast<std::uint32_t>(rbc::Op::Lneg) -
+                      static_cast<std::uint32_t>(rbc::Op::Ladd) == 5u);
+    static_assert(static_cast<std::uint32_t>(rbc::Op::Lshl) -
+                      static_cast<std::uint32_t>(rbc::Op::Ladd) == 6u);
+    static_assert(static_cast<std::uint32_t>(rbc::Op::Lxor) -
+                      static_cast<std::uint32_t>(rbc::Op::Ladd) == 11u);
     static constexpr ir::NodeKind kinds[] = {
         ir::NodeKind::AddL, ir::NodeKind::SubL, ir::NodeKind::MulL,
+        ir::NodeKind::Start, // Ldiv: guarded case below
+        ir::NodeKind::Start, // Lrem: guarded case below
+        ir::NodeKind::Start, // Lneg: unary case below
         ir::NodeKind::ShlL, ir::NodeKind::ShrL, ir::NodeKind::UShrL,
         ir::NodeKind::AndL, ir::NodeKind::OrL, ir::NodeKind::XorL};
     const std::uint32_t base = static_cast<std::uint32_t>(rbc::Op::Ladd);
@@ -1714,7 +1761,7 @@ bool Builder::lowerInstruction(std::uint32_t pc, const rbc::Ins& ins) {
   }
   case rbc::Op::Ldiv:
   case rbc::Op::Lrem: {
-    zeroGuard(pc, defReg(pc, ins.b));
+    zeroGuard(pc, defReg(pc, ins.b), /*isLong=*/true);
     const ir::NodeKind k = op == rbc::Op::Ldiv ? ir::NodeKind::DivL
                                                 : ir::NodeKind::RemL;
     setReg(pc, ins.dst,
