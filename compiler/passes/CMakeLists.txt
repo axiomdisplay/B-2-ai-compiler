@@ -12,6 +12,7 @@ set(B2_PASSES_SOURCES
   src/ControlFlow.cpp
   src/DCE.cpp
   src/GVN.cpp
+  src/Inline.cpp
 )
 
 add_library(b2_passes STATIC ${B2_PASSES_SOURCES})

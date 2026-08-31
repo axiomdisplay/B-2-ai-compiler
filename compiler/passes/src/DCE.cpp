@@ -21,6 +21,24 @@ namespace {
 // Named sweep cap (Rule 23): each iteration removes at least one node or
 // the sweep stops, so the cap only guards pathological graphs.
 constexpr std::uint32_t kMaxDceSweeps = 64;
+
+// True when any FrameState descriptor chains to `descId` through its
+// `caller` field (inlined-frame reconstruction data, ir_spec 5.1). Such a
+// FrameState node is deopt metadata even with zero live edge users: the
+// deoptimizer reconstructs the caller frame from the desc AND the node's
+// input edges, so removing the node would destroy the caller-frame slot
+// values (soundness: docs/inlining.md section 5 - the DCE protection
+// rule). The check is O(frame states), called only for userless
+// FrameState nodes.
+[[nodiscard]] bool isCallerChained(const ir::Graph& g,
+                                   std::uint32_t descId) {
+  for (std::uint32_t i = 0; i < g.frameStateCount(); ++i) {
+    if (g.frameState(i).caller == descId) {
+      return true;
+    }
+  }
+  return false;
+}
 } // namespace
 
 void runDCE(ir::Graph& g, PassTelemetry& t, Budget& b, const Junk& jk) {
@@ -33,6 +51,13 @@ void runDCE(ir::Graph& g, PassTelemetry& t, Budget& b, const Junk& jk) {
       }
       if (n == g.startNode()) {
         continue; // Start is the control/memory origin, always live
+      }
+      // Inlined-frame caller chains pin their target FrameState nodes
+      // (the desc reference is side-table data, invisible to use-def
+      // edges): a chained snapshot is live deopt metadata.
+      if (node.kind == ir::NodeKind::FrameState &&
+          isCallerChained(g, node.payload)) {
+        continue;
       }
       // Tombstone law: a node referenced by ANY node (live or dead) is
       // unremovable; kills free their tombstone-referenced operands only

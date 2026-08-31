@@ -44,6 +44,8 @@
 #include <deque>
 #include <unordered_map>
 
+#include "PassInternal.h"
+
 #include "b2/ir/Node.h"
 #include "b2/ir/Printer.h"
 #include "b2/ir/Verifier.h"
@@ -261,8 +263,16 @@ namespace {
 class Builder {
  public:
   Builder(const rbc::Method& m, SymbolResolver& res, ir::Graph& g,
-          ir::MethodId mid, BuildResult& out)
-      : m_(m), res_(res), g_(g), mid_(mid), out_(out) {}
+          ir::MethodId mid, BuildResult& out,
+          const detail::InlineSiteWiring* wiring = nullptr,
+          detail::InlineBodyResult* body = nullptr)
+      : m_(m), res_(res), g_(g), mid_(mid), out_(out), iw_(wiring),
+        body_(body) {
+    if (iw_ != nullptr) {
+      // Inline mode: deopt ids continue the caller graph's allocation.
+      nextDeoptId_ = iw_->deoptIdSeed;
+    }
+  }
 
   [[nodiscard]] BuildResult run();
 
@@ -409,6 +419,11 @@ class Builder {
   bool failed_ = false;
   std::uint64_t ticks_ = 0;
 
+  // Inline mode (null = standalone build): the call-site wiring and the
+  // exit collection target (docs/inlining.md section 4).
+  const detail::InlineSiteWiring* iw_ = nullptr;
+  detail::InlineBodyResult* body_ = nullptr;
+
   // Blocks / CFG (Phase B).
   std::vector<std::uint32_t> starts_;  // ascending block start pcs
   std::vector<std::uint32_t> blockOf_; // pc -> block
@@ -459,12 +474,23 @@ class Builder {
 // === PART 3: phases A-C ===
 
 BuildResult Builder::run() {
+  const std::uint32_t nodesBefore = g_.nodeCount();
   if (scanStructure() && computeBlocks() && computeOrder() &&
       stabilizeTypes() && materialize()) {
     patchBackedges();
-    removeTrivialPhis();
+    // Trivial-phi collapse is a CALLER-wide sweep; in inline mode the
+    // driver owns post-inline cleanup (the pipeline's fusion key), so the
+    // sweep is skipped to keep the inline transformation local.
+    if (iw_ == nullptr) {
+      removeTrivialPhis();
+    }
   }
   out_.ok = ok();
+  if (body_ != nullptr) {
+    body_->ok = ok();
+    body_->diags = out_.diags;
+    body_->nodesAdded = g_.nodeCount() - nodesBefore;
+  }
   return std::move(out_);
 }
 
@@ -491,8 +517,9 @@ bool Builder::scanStructure() {
                 std::to_string(nSlots()) + ")");
     return false;
   }
-  if (g_.nodeCount() != 1) {
+  if (iw_ == nullptr && g_.nodeCount() != 1) {
     // Node 0 = the constructor's Start; anything else means a used graph.
+    // (Inline mode builds into the caller's graph by design.)
     fail(0, "graph is not fresh (node 0 = Start expected)");
     return false;
   }
@@ -1180,8 +1207,13 @@ ir::NodeId Builder::fsAt(std::uint32_t pc) {
   if (fsCacheValid_ && fsCachePc_ == pc && fsCacheVersion_ == slotsVersion_) {
     return fsCache_;
   }
+  // Inline mode: every callee FrameState chains to the call-site snapshot
+  // (FrameStateDesc.caller) so deopt can reconstruct the inlined frame
+  // stack (Rule 75; the chain is the inlining depth seam, ir_spec 5.1).
+  const ir::FrameStateId caller =
+      iw_ != nullptr ? iw_->fsCaller : ir::kInvalidFrameState;
   const ir::NodeId fs = g_.makeFrameState(
-      mid_, pc, std::span<const ir::NodeId>(slots_));
+      mid_, pc, std::span<const ir::NodeId>(slots_), caller);
   fsCacheValid_ = true;
   fsCachePc_ = pc;
   fsCacheVersion_ = slotsVersion_;
@@ -1561,12 +1593,17 @@ bool Builder::lowerCall(std::uint32_t pc, const rbc::Ins& ins) {
                                   static_cast<std::uint32_t>(ret));
   const ir::NodeId except = g_.make(ir::NodeKind::CallExcept, {call});
 
-  if (coveredByHandler(pc)) {
+  if (coveredByHandler(pc) || (iw_ != nullptr && iw_->siteCovered)) {
     // Exception POLICY v1: exception deopt (class 2.3). The Deopt node's
     // control being the CallExcept signals the class; the exception value
     // is the CallExcept's value (transport convention for the deopt stub,
     // graph_builder.md section 5). T0 re-enters THE EXCEPTION ALGORITHM at
-    // the call pc with pendingException set.
+    // the call pc with pendingException set. Inline mode: the siteCovered
+    // extension routes a callee's ESCAPING nested-call exception the same
+    // way - the algorithm finds no handler in the callee, unwinds the
+    // reconstructed callee frame, and the deopt runtime re-enters the
+    // caller at the call pc with the pending exception (docs/inlining.md
+    // section 4).
     g_.make(ir::NodeKind::Deopt, {except, fs}, nextDeoptId());
   } else {
     g_.make(ir::NodeKind::Unwind, {except, except});
@@ -2278,6 +2315,18 @@ bool Builder::lowerTerminator(std::uint32_t pc, const rbc::Ins& ins) {
     return true;
   }
   if (isReturnOp(op)) {
+    if (iw_ != nullptr) {
+      // Inline exit: record the state flowing back to the call site; the
+      // driver merges the exits into the caller's control/memory/value
+      // (no Return terminal is created).
+      detail::InlineExit e;
+      e.ctrl = curCtrl_;
+      e.mem = curMem_;
+      e.value =
+          op == rbc::Op::Return ? ir::kInvalidNodeId : defReg(pc, ins.a);
+      body_->exits.push_back(e);
+      return true;
+    }
     if (op == rbc::Op::Return) {
       g_.make(ir::NodeKind::Return, {curCtrl_});
     } else {
@@ -2286,7 +2335,15 @@ bool Builder::lowerTerminator(std::uint32_t pc, const rbc::Ins& ins) {
     return true;
   }
   if (op == rbc::Op::Athrow) {
-    if (coveredByHandler(pc)) {
+    // Inline mode: an athrow ESCAPING the callee routes through the call
+    // site's policy - a covered site takes the deopt below (T0 re-executes
+    // the athrow in the reconstructed callee frame, finds no handler
+    // there, unwinds it, and the deopt runtime re-enters the caller at
+    // the call pc with the pending exception - the FrameState caller
+    // chain carries the stack, docs/inlining.md section 4); an uncovered
+    // site keeps the Unwind (the callee's exception value propagates out
+    // of the caller directly).
+    if (coveredByHandler(pc) || (iw_ != nullptr && iw_->siteCovered)) {
       // Caught athrow: deopt; T0 re-executes the athrow (idempotent: the
       // exception value rides in the FrameState's rA slot) and dispatches
       // through THE EXCEPTION ALGORITHM with full type info.
@@ -2346,38 +2403,59 @@ void Builder::materializeEntry(std::uint32_t b) {
   }
   if (b == 0) {
     // The implicit entry edge: control and memory from Start; parameters
-    // typed by the descriptor; every other slot Undef.
+    // typed by the descriptor; every other slot Undef. In inline mode the
+    // entry state is the call site's: control/memory predecessors and the
+    // caller's argument defs (receiver first) as the parameter locals.
     std::vector<ir::NodeId> entrySlots(nSlots(), ir::kInvalidNodeId);
-    std::vector<rbc::RType> params;
-    (void)rbc::parseParams(m_.descriptor, params);
-    std::uint32_t next = 0;
-    if (!m_.isStatic()) {
-      entrySlots[localIdx(0)] = g_.parameter(0, ir::IRType::Ref);
-      next = 1;
-    }
-    for (std::size_t i = 0; i < params.size() && next < m_.numLocals; ++i) {
-      entrySlots[localIdx(next)] = g_.parameter(next, rtypeToIr(params[i]));
-      ++next;
-    }
-    for (std::uint32_t s = 0; s < m_.numLocals; ++s) {
-      if (entrySlots[localIdx(s)] == ir::kInvalidNodeId) {
-        entrySlots[localIdx(s)] = undef();
+    if (iw_ != nullptr) {
+      const std::size_t take =
+          iw_->args.size() < m_.numLocals ? iw_->args.size()
+                                          : static_cast<std::size_t>(m_.numLocals);
+      for (std::size_t i = 0; i < take; ++i) {
+        entrySlots[localIdx(static_cast<std::uint32_t>(i))] = iw_->args[i];
+      }
+      for (std::uint32_t s = 0; s < nSlots(); ++s) {
+        if (entrySlots[s] == ir::kInvalidNodeId) {
+          entrySlots[s] = undef();
+        }
+      }
+    } else {
+      std::vector<rbc::RType> params;
+      (void)rbc::parseParams(m_.descriptor, params);
+      std::uint32_t next = 0;
+      if (!m_.isStatic()) {
+        entrySlots[localIdx(0)] = g_.parameter(0, ir::IRType::Ref);
+        next = 1;
+      }
+      for (std::size_t i = 0; i < params.size() && next < m_.numLocals; ++i) {
+        entrySlots[localIdx(next)] =
+            g_.parameter(next, rtypeToIr(params[i]));
+        ++next;
+      }
+      for (std::uint32_t s = 0; s < m_.numLocals; ++s) {
+        if (entrySlots[localIdx(s)] == ir::kInvalidNodeId) {
+          entrySlots[localIdx(s)] = undef();
+        }
+      }
+      for (std::uint32_t r = 0; r < m_.numRegs; ++r) {
+        entrySlots[regIdx(r)] = undef();
       }
     }
-    for (std::uint32_t r = 0; r < m_.numRegs; ++r) {
-      entrySlots[regIdx(r)] = undef();
-    }
+    const ir::NodeId entryCtrl0 =
+        iw_ != nullptr ? iw_->entryCtrl : g_.startNode();
+    const ir::NodeId entryMem0 =
+        iw_ != nullptr ? iw_->entryMem : g_.startNode();
     if (backPreds_[0].empty()) {
       // Plain entry: no merge, no phis.
-      curCtrl_ = g_.startNode();
-      curMem_ = g_.startNode();
+      curCtrl_ = entryCtrl0;
+      curMem_ = entryMem0;
       slots_ = std::move(entrySlots);
       return;
     }
     // Block 0 is also a loop header (a backward goto to pc 0).
     InEdge ie;
-    ie.ctrl = g_.startNode();
-    ie.mem = g_.startNode();
+    ie.ctrl = entryCtrl0;
+    ie.mem = entryMem0;
     ie.slots = std::move(entrySlots);
     in.push_back(std::move(ie));
   }
@@ -2649,6 +2727,27 @@ BuildResult buildGraph(const rbc::Method& m, SymbolResolver& res,
   BuildResult out;
   Builder builder(m, res, g, methodId, out);
   return builder.run();
+}
+
+// --- inline body build (the inliner's trusted seam; see PassInternal.h) ----
+
+detail::InlineBodyResult
+detail::buildInlineBody(const rbc::Method& m, SymbolResolver& res,
+                        ir::Graph& g, ir::MethodId frameMethodId,
+                        const detail::InlineSiteWiring& w) {
+  BuildResult out;
+  detail::InlineBodyResult body;
+  Builder builder(m, res, g, frameMethodId, out, &w, &body);
+  (void)builder.run();
+  const ir::NodeId firstNew =
+      body.nodesAdded <= g.nodeCount() ? g.nodeCount() - body.nodesAdded
+                                       : g.nodeCount();
+  for (ir::NodeId n = firstNew; n < g.nodeCount(); ++n) {
+    if (!g.node(n).isDead() && g.node(n).kind == ir::NodeKind::Deopt) {
+      ++body.deoptsEmitted;
+    }
+  }
+  return body;
 }
 
 } // namespace b2::passes

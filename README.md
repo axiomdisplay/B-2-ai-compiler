@@ -121,6 +121,7 @@ Compile a Tier-1 stencil plan from verified RBC with the baseline driver:
 | `docs/ir_spec.md` | Sea-of-nodes IR specification (T2/T3, v2): storage model, IRType lattice, all 137 node kinds with input signatures/effects/verifier constraints, fixed-node control chaining + memory Phis, FrameState/virtual-object/SpecMeta/dependency structures, serializer format, printer format |
 | `docs/effect_system.md` | The explicit effect model (Rule 121): the 12 effect classes, the 144-entry reorder table with construction rules R1-R9, the compensation-node contract, enforcement |
 | `docs/graph_builder.md` | The RBC-to-IR graph builder contract (T2 pipeline entry): SSA slot discipline, guard placement, FrameState policy, the v1 exception-deopt policy, class-init triggers, quickened ops, determinism |
+| `docs/inlining.md` | Inlining v1 — the ICDG direct-inline engine: the transformation and its soundness argument, the id-space contract (the CalleeSource), inlined-frame deopt/exception conventions, budgets, refusal catalog |
 | `docs/pass_contracts.md` | The T2/T3 optimization pass suite (v1): pass registry with contracts, the early-cleanup + GVN rewrite catalogs, the tombstone-law soundness protocol, budgets, kill switches, telemetry |
 | `docs/interp_contract.md` | Tier-0 interpreter state contract (v1): the T0 frame, value model, deopt entry (`resume`), quickened-opcode pins, state-dump fixture format |
 | `docs/teams/README.md` | Team organization: nine teams of two AI roles (implementer + reviewer), including the GC Team |

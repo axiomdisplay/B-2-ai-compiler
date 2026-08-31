@@ -23,11 +23,13 @@
 // removal mechanism is requested from the IR team (see messages/).
 
 #include <cstdint>
+#include <span>
 #include <vector>
 
 #include "b2/ir/Graph.h"
 #include "b2/ir/Node.h"
 #include "b2/ir/Types.h"
+#include "b2/passes/GraphBuilder.h"
 #include "b2/passes/Passes.h"
 
 namespace b2::passes::detail {
@@ -181,6 +183,51 @@ void unreachableSweep(ir::Graph& g, PassTelemetry& t, Budget& b,
 void rebuildRegions(ir::Graph& g, PassTelemetry& t, Budget& b,
                     const Junk& jk,
                     const std::vector<bool>* reach = nullptr);
+
+// --- inline body building (the inliner's builder seam) --------------------
+//
+// The inliner re-runs the RBC->IR builder over the callee INSIDE the
+// caller's graph (Graal-style): the entry state is the call site's control/
+// memory/arguments (no Start, no Parameters), every callee FrameState
+// chains to the call-site FrameState (Rule 75), return instructions
+// become normal exits (no Return terminals; the driver merges them), and
+// the exceptional escapes route through the caller's call-site policy
+// (docs/inlining.md section 4 is the normative contract).
+
+// Wiring for building one callee body into the caller graph.
+struct InlineSiteWiring {
+  ir::NodeId entryCtrl = ir::kInvalidNodeId; // the call's control predecessor
+  ir::NodeId entryMem = ir::kInvalidNodeId;  // the call's memory predecessor
+  std::span<const ir::NodeId> args;          // caller arg defs (receiver first)
+  ir::FrameStateId fsCaller = ir::kInvalidFrameState; // call-site fs desc id
+  bool siteCovered = false;   // caller's handler table covers the call pc
+  std::uint32_t deoptIdSeed = 0; // first deopt id this body may allocate
+};
+
+// One normal return exit of an inlined body (the state that flows back to
+// the call site on that path). `value` is invalid for void returns.
+struct InlineExit {
+  ir::NodeId ctrl = ir::kInvalidNodeId;
+  ir::NodeId mem = ir::kInvalidNodeId;
+  ir::NodeId value = ir::kInvalidNodeId;
+};
+
+struct InlineBodyResult {
+  bool ok = false;
+  std::uint32_t nodesAdded = 0;   // nodes appended to the caller graph
+  std::uint32_t deoptsEmitted = 0;
+  std::vector<InlineExit> exits;  // normal exits, in materialization order
+  std::vector<BuildDiag> diags;   // builder refusals, bounded (pc + message)
+};
+
+// Builds `m` into `g` in inline mode per `w`. The graph is NOT required to
+// be fresh (the caller's nodes are already there); nodes append. Callers
+// must have validated the callee builds at all (trial build) and that the
+// argument window matches - this entry point is the trusted seam, exactly
+// like buildGraph is for standalone builds.
+[[nodiscard]] InlineBodyResult
+buildInlineBody(const rbc::Method& m, SymbolResolver& res, ir::Graph& g,
+                ir::MethodId frameMethodId, const InlineSiteWiring& w);
 
 // --- pass entry points -----------------------------------------------------
 

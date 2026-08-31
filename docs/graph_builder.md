@@ -214,3 +214,39 @@ first-encounter order, one deopt-id counter, `CounterResolver` interning in
 encounter order: the same (method, resolver ids) produces identical node
 ids, printed dumps, and serialized bytes — pinned by tests (build twice,
 compare bytes; the corpus sweep does it per method).
+
+## 13. The inline-build seam (inlining v1)
+
+The builder has a second entry point, `detail::buildInlineBody`
+(PassInternal.h): the same RBC->IR lowering re-runs over a callee
+INSIDE the caller's graph (Graal-style), wired to one call site.
+`docs/inlining.md` is the normative contract for the driver that calls
+it; the builder-side differences are:
+
+- **Entry**: no `Start`, no `Parameter` nodes. The entry control and
+  memory are the call site's predecessors (`C.input(0)`,
+  `C.input(1)`); the callee's parameter locals (receiver first) are
+  the call's argument defs, remaining locals and all working
+  registers start `Undef`; a loop header at pc 0 seeds its entry edge
+  the same way. The graph is NOT required to be fresh.
+- **Returns**: return instructions record exits —
+  `(control, memory, value)` triples — instead of creating `Return`
+  terminals; the driver merges them at the call site.
+- **FrameStates**: every callee snapshot chains to the call-site
+  FrameState's descriptor (`FrameStateDesc.caller`, Rule 75); the
+  deopt ids continue the caller graph's allocation (the caller's
+  max + 1 seeds the counter).
+- **Exception escapes**: `coveredByHandler(pc) || siteCovered` governs
+  both the athrow and the call continuation — a covered CALL SITE
+  routes the callee's escaping exceptions to deopts (the shapes are
+  the existing conventions; inlining.md section 4 has the soundness
+  argument), an uncovered site keeps the `Unwind` with the callee's
+  exception value.
+- **Trivial-phi collapse is skipped** in inline mode (it is a
+  caller-wide sweep; the pipeline's fusion key owns post-inline
+  cleanup), and `scanStructure`'s fresh-graph check does not apply.
+
+The trial build (the same body through the ordinary `buildGraph` into
+a scratch graph) proves buildability and counts return terminals; the
+inline build is the same lowering with the different wiring, so
+determinism carries over unchanged.

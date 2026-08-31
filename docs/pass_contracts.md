@@ -132,6 +132,14 @@ Never removed (v1 conservatisms, each documented and tested):
   opaque at IR level (FieldId payloads are frontend-side).
 - **Stores, calls, allocations, casts, guards, control** — observable by
   definition.
+- **Chained FrameStates** (inlining v1 addition, docs/inlining.md
+  section 4) — a FrameState whose descriptor is the `caller` target of
+  another descriptor is inlined-frame reconstruction data: the
+  reference is side-table state, invisible to use-def edges, so a
+  userless chained snapshot stays live (its input edges ARE the
+  caller-frame slot values the deoptimizer needs). Without this guard
+  DCE would destroy caller-frame reconstruction while the graph stays
+  verifier-clean.
 
 ## 5. The simplify rewrite catalogs (keys 13-16)
 
@@ -281,3 +289,5 @@ surface (telemetry line per method).
 | Div/rem DCE | guard-adjacency proof |
 | Tombstone/dead-fork reclamation | IR team: sanctioned removal API or verifier dead-node skip (MSG-009) |
 | CmpL-based long zero-guards | IR core classifies CmpL as Long-producing (MSG-009); the L2I composition is sound (over-deopts only) |
+| Inlining registry rows (suite 21-34 speculation family) | profile import (icdg.md Phase 1) + Rule 1's tier-filter mechanism; the direct-inline driver itself is delivered (docs/inlining.md) |
+| Inline verification of caller-chain fs liveness | IR team: the verifier checks chains acyclic but not that chain targets' nodes are alive (the DCE-side protection is the interim soundness fix; MSG-20260901-002) |

@@ -20,13 +20,14 @@
 #include "b2/ir/Printer.h"
 #include "b2/ir/Verifier.h"
 #include "b2/passes/GraphBuilder.h"
+#include "b2/passes/Inline.h"
 #include "b2/passes/Passes.h"
 #include "b2/rbc/RbcText.h"
 #include "b2/rbc/Verifier.h"
 
 namespace {
 
-int run(const std::string& text, bool quiet, bool optimize) {
+int run(const std::string& text, bool quiet, bool optimize, bool inl) {
   const auto parsed = b2::rbc::parseRbcText(text);
   if (!parsed) {
     std::fprintf(stderr, "b2graph: parse error at offset %u: %s\n",
@@ -52,7 +53,11 @@ int run(const std::string& text, bool quiet, bool optimize) {
       ++failures;
       continue;
     }
-    b2::passes::CounterResolver resolver;
+    // The unified method-id space: the source doubles as the build
+    // resolver (program methods = table indices, externals above the
+    // table), so the build's call payloads and the inline resolution
+    // agree by construction (docs/inlining.md section 3).
+    b2::passes::ProgramCalleeSource resolver(prog);
     b2::ir::Graph g;
     const b2::passes::BuildResult br = b2::passes::buildGraph(
         m, resolver, g, static_cast<b2::ir::MethodId>(i));
@@ -73,6 +78,42 @@ int run(const std::string& text, bool quiet, bool optimize) {
       }
       ++failures;
       continue;
+    }
+    if (inl) {
+      // The ICDG direct-inline engine (docs/inlining.md): the same
+      // resolver built the graph (the unified id space), the verifier
+      // runs after every site, decisions + telemetry per method.
+      // Fail-closed on any failure - the review surface never shows an
+      // unverified graph.
+      const b2::passes::InlineResult ir =
+          b2::passes::runInlining(g, resolver);
+      if (!ir.ok) {
+        std::fprintf(stderr, "b2graph: inlining failed for %s:\n",
+                     m.name.c_str());
+        for (const b2::passes::InlineDiag& d : ir.diags) {
+          std::fprintf(stderr, "  n%u: %s\n", d.node, d.message.c_str());
+        }
+        ++failures;
+        continue;
+      }
+      if (!quiet) {
+        std::printf("  # inline: sites=%u inlined=%u refused=%u nodes=+%u "
+                    "deopts=+%u merges=%u depth=%u converged=%d\n",
+                    ir.telemetry.sitesConsidered, ir.telemetry.sitesInlined,
+                    ir.telemetry.sitesRefused, ir.telemetry.nodesAdded,
+                    ir.telemetry.deoptsEmitted, ir.telemetry.exitMerges,
+                    ir.telemetry.maxDepthReached,
+                    ir.telemetry.converged ? 1 : 0);
+        for (const b2::passes::InlineDecision& d : ir.decisions) {
+          std::printf("  # inline n%u -> m%u d%u: %s (%s; insns=%u slots=%u "
+                      "nodes=%u)\n",
+                      d.call, d.target, d.depth,
+                      d.action == b2::passes::InlineAction::DirectInline
+                          ? "DIRECT-INLINE"
+                          : "KEEP-INDIRECT",
+                      d.reason, d.calleeInsns, d.calleeSlots, d.calleeNodes);
+        }
+      }
     }
     if (optimize) {
       // The early-cleanup + GVN pipeline (Rules 40/124: verified between
@@ -118,6 +159,7 @@ int run(const std::string& text, bool quiet, bool optimize) {
 int main(int argc, char** argv) {
   bool quiet = false;
   bool optimize = false;
+  bool inl = false;
   std::vector<std::string> files;
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
@@ -125,11 +167,16 @@ int main(int argc, char** argv) {
       quiet = true;
     } else if (arg == "-O" || arg == "--optimize") {
       optimize = true;
+    } else if (arg == "--inline" || arg == "-i") {
+      inl = true;
     } else if (arg == "--help" || arg == "-h") {
       std::printf(
-          "usage: b2graph [--quiet] [-O] file.rbc...\n"
+          "usage: b2graph [--quiet] [-O] [--inline] file.rbc...\n"
           "  parse RBC text, verify, build every method's IR graph,\n"
           "  IR-verify, and print (the builder's debug surface)\n"
+          "  --inline: run the ICDG direct-inline engine before the\n"
+          "      pipeline (verified after every site; decision log +\n"
+          "      telemetry line per method; docs/inlining.md)\n"
           "  -O: run the early-cleanup + GVN pipeline after the build\n"
           "      (verified between passes, deterministic; telemetry line\n"
           "      per method)\n");
@@ -155,7 +202,7 @@ int main(int argc, char** argv) {
     if (!quiet) {
       std::printf("# %s\n", f.c_str());
     }
-    failures += run(ss.str(), quiet, optimize) == 0 ? 0 : 1;
+    failures += run(ss.str(), quiet, optimize, inl) == 0 ? 0 : 1;
   }
   return failures == 0 ? 0 : 1;
 }
