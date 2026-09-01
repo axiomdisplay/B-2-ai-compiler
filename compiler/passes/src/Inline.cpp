@@ -1,30 +1,56 @@
-// B-2 Passes - the T2 inlining driver: the ICDG direct-inline engine.
+// B-2 Passes - the T2 inlining driver: direct-inline (v1) + guard-inline
+// (v2, the ICDG Phase 2 ingestion).
 //
 // WHY THIS FILE EXISTS:
-// This is the executable side of docs/inlining.md (the normative v1
-// contract) over docs/icdg.md (the decision engine design). The driver
-// walks the caller graph in node-id order, resolves direct-call targets
-// through the CalleeSource (the id-space authority), applies the v1 cost
-// model (Rule 45: refusals are budgeted, not guessed), re-builds each
-// profitable callee INTO the caller graph through the builder's inline
-// seam (detail::buildInlineBody), merges the exit states, rewires the
-// call's users by role, and kills the call + its exceptional projection
-// under the tombstone law (detail::kill). Every decision - inline or
-// refuse - lands in the decision log with a structured reason
-// (icdg.md 19). The IR verifier runs after every site (Rule 40);
-// failures stop the run fail-closed.
+// This is the executable side of docs/inlining.md (the normative
+// implementation contract) over docs/icdg.md (the decision engine
+// design). The driver walks the caller graph in node-id order, resolves
+// call targets through the CalleeSource (the id-space authority),
+// applies the cost model (Rule 45: refusals are budgeted, not guessed),
+// re-builds each profitable callee INTO the caller graph through the
+// builder's inline seam (detail::buildInlineBody), merges the exit
+// states, rewires the call's users by role, and kills the call + its
+// exceptional projection under the tombstone law (detail::kill). Every
+// decision - inline or refuse - lands in the decision log with a
+// structured reason (icdg.md 19). The IR verifier runs after every site
+// (Rule 40); failures stop the run fail-closed.
+//
+// v2 - GUARD-INLINE (docs/inlining.md section 9): when a dispatch
+// profile is attached (InlineConfig::profile), CallVirtual /
+// CallInterface sites are classified against it; a monomorphic site
+// (one receiver class, target agreeing with the call resolution,
+// confidence over the Rule 44 thresholds) is inlined behind a
+// TypeProfile guard:
+//
+//   InstanceOf(recv, profiledClass)          // the guard condition
+//   Guard [ctrl, cond, call-fs]              // deopts at the call pc
+//   <the callee body, entry control = guard> // the v1 inline machinery
+//
+// Deopt at the guard re-enters T0 AT THE CALL PC with the call-site
+// FrameState, T0 re-executes the invoke, and dispatch proceeds exactly
+// as without inlining (the failure path runs BEFORE any body effect, so
+// re-execution is sound - docs/inlining.md section 9's soundness core).
+// Rule 122 rides complete on the guard: TypeMonomorphic SpecMeta (PGO
+// source, confidence snapshot), a ClassHierarchy dependency (Rule 42)
+// keyed by the profiled class's TypeId, the deopt target, and the
+// measured body cost. A profiled class of java/lang/Object refuses
+// (InstanceOf is a subtype check: not exact for Object - the one class
+// whose check would admit receivers that dispatch differently).
 //
 // Determinism (Rule 124): sites in id order; a site's body sites are
 // processed immediately after it (depth + 1) in id order; trials are
-// cached per callee body pointer; node creation order is the builder's.
+// cached per callee body pointer; node creation order is the builder's;
+// the profile is consumed read-only.
 //
 // SOUNDNESS CORE (docs/inlining.md section 4):
 // - control: the callee's entry control is the call's control
-//   predecessor; every return exit becomes a predecessor of the exit
-//   merge (Region; single exits wire directly).
-// - memory: the callee's entry memory is the call's memory predecessor;
-//   each exit's memory state merges through a memory Phi (memory-state
-//   producers only - the sea-of-nodes memory chain never dangles).
+//   predecessor (guard-inline: the TypeProfile guard, chained after the
+//   builder's null guard); every return exit becomes a predecessor of
+//   the exit merge (Region; single exits wire directly).
+// - memory: the callee's entry memory is the call's memory predecessor
+//   (the TypeProfile guard touches no memory); each exit's memory state
+//   merges through a memory Phi (memory-state producers only - the
+//   sea-of-nodes memory chain never dangles).
 // - values: parameters are the caller's argument defs (receiver first);
 //   the merged return value replaces the call in value position.
 // - deopt: every callee FrameState chains to the call-site snapshot
@@ -59,8 +85,31 @@ namespace {
 
 constexpr const char* kRInlined =
     "direct inline: resolvable single body (static proof)";
+constexpr const char* kRGuardInlined =
+    "guard inline: monomorphic type profile (guard + SpecMeta + "
+    "class-hierarchy dependency)";
 constexpr const char* kRUnresolved =
     "target unresolved (external method or ambiguous id)";
+constexpr const char* kRNoRow =
+    "no dispatch profile row for the site (not executed in T0)";
+constexpr const char* kRKindMismatch =
+    "profile row kind disagrees with the call site (mismatched profile)";
+constexpr const char* kRNoEntry =
+    "profile has no receiver entry (builtin/count-only site)";
+constexpr const char* kRMega =
+    "megamorphic dispatch site (sticky frozen histogram)";
+constexpr const char* kRBimorphic =
+    "bimorphic dispatch site (two-target guard is the follow-up)";
+constexpr const char* kRPoly =
+    "polymorphic dispatch site (3 receiver classes)";
+constexpr const char* kRThinProfile =
+    "site total below the observation floor (Rule 44)";
+constexpr const char* kRLowConfidence =
+    "profile confidence below the guard threshold (Rule 44)";
+constexpr const char* kRTargetMismatch =
+    "profile target disagrees with the call-site resolution";
+constexpr const char* kRUniversalRecv =
+    "profiled receiver class is java/lang/Object (guard not exact)";
 constexpr const char* kRFlags =
     "callee flags refuse inlining (synchronized/abstract/native)";
 constexpr const char* kRInsns = "callee too large (instruction cap)";
@@ -120,6 +169,111 @@ constexpr const char* kRInconsistent =
     }
   }
   return max;
+}
+
+// --- GuardInline classification (ICDG Phase 2; docs/inlining.md section 9) ---
+//
+// The dispatch-state classification + stability scoring over the raw T0
+// histogram (icdg.md SS5/SS6 reduced to the v2 mono-only policy). The
+// policy is the consumer's (interp_contract.md SS8.1: T0 produces the
+// data, never the policy); the profile is consumed read-only and must
+// outlive the run (it is a compilation input, like the RBC itself).
+
+// The classified monomorphic site: what the guard construction needs.
+// `entry` points into the profile snapshot (owner: the caller of
+// runInlining; valid for the run's duration).
+struct GuardPlan {
+  const ProfileEntry* entry = nullptr; // the monomorphic entry
+  std::uint32_t siteCount = 0;         // profile site total (the decision log)
+  std::uint32_t recvCount = 0;         // the entry's count
+  std::uint32_t confidenceBP = 0;      // recvCount / siteCount, basis points
+};
+
+// One classification: `reason == nullptr` means monomorphic (plan set);
+// every non-null reason is the refusal's explanation (icdg.md 19).
+struct SiteClass {
+  const char* reason = nullptr;
+  GuardPlan plan;
+};
+
+[[nodiscard]] SiteClass classifySite(const DispatchProfile& prof,
+                                     ir::NodeKind callKind,
+                                     ir::MethodId method, std::uint32_t pc,
+                                     const InlineConfig& cfg) {
+  SiteClass out;
+  const ProfileSiteKind want =
+      callKind == ir::NodeKind::CallVirtual ? ProfileSiteKind::Virtual
+                                            : ProfileSiteKind::Interface;
+  const std::uint32_t m = method;
+  if (m >= prof.sites.size() || pc >= prof.sites[m].size()) {
+    out.reason = kRNoRow; // the site never dispatched in the T0 run
+    return out;
+  }
+  const ProfileSite& ps = prof.sites[m][pc];
+  if (ps.kind != want) {
+    out.reason = kRKindMismatch; // the snapshot is not this program's
+    return out;
+  }
+  if (ps.megamorphic) {
+    out.reason = kRMega; // sticky: > 3 distinct receiver classes
+    return out;
+  }
+  // Observed entries in first-seen order (zero counts are unused tail
+  // slots by the T0 construction).
+  const ProfileEntry* entries[3] = {};
+  std::size_t observed = 0;
+  for (const ProfileEntry& e : ps.entries) {
+    if (e.count != 0) {
+      if (observed < 3) {
+        entries[observed] = &e;
+      }
+      ++observed;
+    }
+  }
+  if (observed == 0) {
+    out.reason = kRNoEntry; // count-only row (builtin executions)
+    return out;
+  }
+  if (observed >= 3) {
+    out.reason = kRPoly;
+    return out;
+  }
+  if (observed == 2) {
+    out.reason = kRBimorphic; // the two-target guard is the follow-up
+    return out;
+  }
+  // Rule 44 confidence: the site must have said something, and the one
+  // entry must own (almost) all of it. 64-bit math: counts saturate at
+  // 2^32-1 and the products overflow 32 bits long before.
+  if (ps.count < cfg.guardMinObservations) {
+    out.reason = kRThinProfile;
+    return out;
+  }
+  const std::uint64_t got =
+      static_cast<std::uint64_t>(entries[0]->count) * 10000u;
+  const std::uint64_t need =
+      static_cast<std::uint64_t>(ps.count) * cfg.guardMinRatioBP;
+  if (got < need) {
+    out.reason = kRLowConfidence;
+    return out;
+  }
+  if (entries[0]->recvClass.empty()) {
+    out.reason = kRNoEntry; // static-resolution sentinel, not a receiver
+    return out;
+  }
+  if (entries[0]->recvClass == "java/lang/Object") {
+    // InstanceOf is a subtype check: for Object it admits every
+    // non-array receiver, including receivers that dispatch this site
+    // differently (the builtin family) - the one non-exact case.
+    out.reason = kRUniversalRecv;
+    return out;
+  }
+  out.plan.entry = entries[0];
+  out.plan.siteCount = ps.count;
+  out.plan.recvCount = entries[0]->count;
+  out.plan.confidenceBP =
+      static_cast<std::uint32_t>(std::min<std::uint64_t>(10000u, got / ps.count));
+  return out;
 }
 
 // The exceptional continuation of one call site (builder-canonical
@@ -203,16 +357,26 @@ class Inliner {
   }
 
  private:
-  // Processes live CallStatic sites with ids in [first, limit) at `depth`
+  // Processes live call sites with ids in [first, limit) at `depth`
   // (recursion: a successful inline's own body sites run at depth + 1
   // with the callee pushed on the stack - recursion control, icdg.md 12).
-  // Junk sinks (this run's tombstone-law anchors, including the call
-  // sinks the kills create) are never sites.
+  // Direct (CallStatic) always; virtual/interface only when a dispatch
+  // profile is attached (no profile = the sites are out of scope, the
+  // pinned v1-identical behavior). Junk sinks (this run's tombstone-law
+  // anchors, including the call sinks the kills create) are never sites.
   void processRange(ir::NodeId first, ir::NodeId limit, std::uint32_t depth,
                     std::vector<const rbc::Method*>& stack) {
+    const bool considerVirtual = cfg_.profile != nullptr;
     for (ir::NodeId id = first; id < limit && out_.ok; ++id) {
       const ir::Node& nd = g_.node(id);
-      if (nd.isDead() || nd.kind != ir::NodeKind::CallStatic) {
+      if (nd.isDead()) {
+        continue;
+      }
+      const bool isSite =
+          nd.kind == ir::NodeKind::CallStatic ||
+          (considerVirtual && (nd.kind == ir::NodeKind::CallVirtual ||
+                               nd.kind == ir::NodeKind::CallInterface));
+      if (!isSite) {
         continue;
       }
       if (detail::isJunkSink(jk_, id)) {
@@ -244,10 +408,52 @@ class Inliner {
     d.depth = depth;
     d.target = g_.node(call).payload;
 
+    const ir::NodeKind callKind = g_.node(call).kind;
+    const bool virtualSite = callKind == ir::NodeKind::CallVirtual ||
+                             callKind == ir::NodeKind::CallInterface;
+
     // Graph-level budgets first (site cap; the node cap needs the trial).
     if (out_.telemetry.sitesInlined >= cfg_.maxSitesPerGraph) {
       (void)refuse(d, kRSites, /*budgetStop=*/true);
       return nullptr;
+    }
+
+    // GuardInline prelude (virtual/interface only; the profile gates the
+    // whole family, so no-profile runs never reach here): recover the
+    // site key from the call's trailing FrameState, classify the profile
+    // row, and pin the profile numbers into the decision.
+    GuardPlan gp;
+    if (virtualSite) {
+      const std::uint16_t nInPre = g_.numInputs(call);
+      ir::NodeId fsPre = ir::kInvalidNodeId;
+      if (nInPre >= 3) {
+        fsPre = g_.input(call, nInPre - 1);
+      }
+      if (fsPre == ir::kInvalidNodeId ||
+          g_.node(fsPre).kind != ir::NodeKind::FrameState ||
+          g_.node(fsPre).isDead() ||
+          g_.node(fsPre).payload >= g_.frameStateCount()) {
+        (void)refuse(d, kRShape, false);
+        return nullptr;
+      }
+      const ir::FrameStateDesc& fd = g_.frameState(g_.node(fsPre).payload);
+      const SiteClass sc =
+          classifySite(*cfg_.profile, callKind, fd.method, fd.pc, cfg_);
+      if (sc.reason != nullptr) {
+        (void)refuse(d, sc.reason, false);
+        return nullptr;
+      }
+      gp = sc.plan;
+      d.siteCount = gp.siteCount;
+      d.recvCount = gp.recvCount;
+      // Agreement: the profile entry must name the SAME target the call
+      // resolved to (the unified space: both are program table indices).
+      // A mismatch means the snapshot does not describe this build; the
+      // only safe action is KeepIndirect (never a mis-inline).
+      if (gp.entry->target != d.target) {
+        (void)refuse(d, kRTargetMismatch, false);
+        return nullptr;
+      }
     }
 
     // Resolve the target through the id-space authority.
@@ -355,13 +561,66 @@ class Inliner {
 
     // The real build: the callee's RBC -> IR, into this graph, wired to
     // the call site (trusted seam; the trial guarantees buildability).
+    // GuardInline installs the TypeProfile guard FIRST: the body chains
+    // after it in the control flow, and its deopt ids seed above the
+    // guard's.
+    if (virtualSite && args.empty()) {
+      // A virtual site with no receiver argument is not builder output
+      // (the receiver defense); refuse rather than guess.
+      (void)refuse(d, kRArgs, false);
+      return nullptr;
+    }
+    ir::NodeId entryCtrl = g_.input(call, 0);
+    if (virtualSite) {
+      // The TypeProfile guard (docs/inlining.md section 9): condition =
+      // InstanceOf(receiver, profiled class). The profiled class's ir
+      // TypeId resolves through THIS run's resolver (the NAME bridges
+      // the runtime ClassId space and the resolver's TypeId space - the
+      // same space the graph was built with, so the payload agrees with
+      // every other class reference in the graph). Control chains after
+      // the call's old ctrl predecessor (the builder's null guard for
+      // receiver ops); the FrameState is the call-site snapshot, so a
+      // guard deopt re-enters T0 AT THE CALL PC and re-executes the
+      // invoke (sound: the guard runs BEFORE any body effect; docs/
+      // inlining.md section 4 rejects re-execution only for MID-BODY
+      // escapes).
+      const ir::TypeId guardType =
+          src_.resolver().classId(gp.entry->recvClass);
+      const ir::NodeId cond = g_.make(ir::NodeKind::InstanceOf, {args[0]},
+                                      guardType);
+      const std::uint32_t guardDeopt = 1 + maxDeoptId(g_);
+      const ir::NodeId guardNode = g_.make(
+          ir::NodeKind::Guard, {entryCtrl, cond, fsNode},
+          static_cast<std::uint32_t>(ir::GuardKind::TypeProfile),
+          guardDeopt);
+      entryCtrl = guardNode;
+      // Rule 122 (complete field set) + Rule 42 (no assumption without
+      // invalidation): PGO-sourced speculation, enforced by guardNode,
+      // invalidated by a ClassHierarchy dependency on the profiled
+      // class (the exact C2 shape - a future subclass that changes
+      // dispatch at this site fires the dependency, not a wrong
+      // execution).
+      const ir::DependencyId dep = g_.addDependency(
+          ir::Dependency{ir::Dependency::Kind::ClassHierarchy, guardType});
+      ir::SpecMeta sm;
+      sm.kind = ir::SpecMeta::Kind::TypeMonomorphic;
+      sm.source = ir::SpecMeta::Source::PGO;
+      sm.confidence = gp.confidenceBP; // the Rule 44 snapshot, basis pts
+      sm.guard = guardNode;
+      sm.deoptTarget = guardDeopt;
+      sm.cost = d.calleeNodes;         // measured trial cost (Rule 45)
+      sm.dependency = dep;
+      sm.rollback = ir::SpecMeta::Rollback::None;
+      g_.attachSpecMeta(guardNode, g_.addSpecMeta(sm));
+      ++out_.telemetry.guardsEmitted;
+    }
     detail::InlineSiteWiring w;
-    w.entryCtrl = g_.input(call, 0);
+    w.entryCtrl = entryCtrl;
     w.entryMem = g_.input(call, 1);
     w.args = std::span<const ir::NodeId>(args);
     w.fsCaller = g_.node(fsNode).payload;
     w.siteCovered = sc.covered;
-    w.deoptIdSeed = 1 + maxDeoptId(g_);
+    w.deoptIdSeed = 1 + maxDeoptId(g_); // after the guard: guardDeopt + 1
     detail::InlineBodyResult body = detail::buildInlineBody(
         m, src_.resolver(), g_, callee.frameMethodId, w);
     if (!body.ok || body.exits.empty()) {
@@ -496,10 +755,14 @@ class Inliner {
     }
 
     // Success: record the decision and the telemetry.
-    d.action = InlineAction::DirectInline;
-    d.reason = kRInlined;
+    d.action = virtualSite ? InlineAction::GuardInline
+                           : InlineAction::DirectInline;
+    d.reason = virtualSite ? kRGuardInlined : kRInlined;
     out_.decisions.push_back(d);
     ++out_.telemetry.sitesInlined;
+    if (virtualSite) {
+      ++out_.telemetry.sitesGuardInlined;
+    }
     out_.telemetry.nodesAdded += body.nodesAdded;
     out_.telemetry.deoptsEmitted += body.deoptsEmitted;
     return callee.method;

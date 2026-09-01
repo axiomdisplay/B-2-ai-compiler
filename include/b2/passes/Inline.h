@@ -1,7 +1,8 @@
 #pragma once
-// B-2 Passes - T2 inlining v1: the ICDG direct-inline engine (charter
-// items 24/29/30/31 of docs/teams/passes-team.md; the ICDG contract is
-// docs/icdg.md; the normative v1 implementation contract is
+// B-2 Passes - T2 inlining v2: direct-inline (v1) + guard-inline (the
+// ICDG Phase 2 ingestion; charter items 24/29/30/31 + the profile-driven
+// item 25 of docs/teams/passes-team.md; the ICDG contract is
+// docs/icdg.md; the normative implementation contract is
 // docs/inlining.md).
 //
 // WHY THIS FILE EXISTS:
@@ -14,14 +15,23 @@
 // snapshot (Rule 75 - deopt reconstructs the inlined frame stack), and
 // every decision is recorded with a structured explanation (icdg.md 19).
 //
-// SCOPE (v1, icdg.md Phase 2 "T2 simple inlining" on the static-proof
-// path):
-// - Direct calls only. Virtual/interface devirtualization needs the
-//   dispatch profile (icdg.md Phase 1) and CHA - both arrive with the
-//   PGO-driven passes (Rule 1: tier filters then, not now).
-// - No speculation: the target is a compile-time-resolvable single body
-//   (StaticProof source, icdg.md 6), so no guards and no SpecMeta are
-//   attached. GuardInline (TypeProfile guards) is the Phase 2+ growth.
+// v2 adds GUARD-INLINE (icdg.md Phase 2 "T2 devirtualization" over the
+// Phase 1 profile): a monomorphic CallVirtual/CallInterface site whose
+// T0 dispatch profile names one receiver class is inlined behind a
+// TypeProfile guard - the failure path deopts at the call pc and T0
+// re-executes the invoke, so any receiver the guard rejects dispatches
+// exactly as before. Complete Rule 122 SpecMeta + a ClassHierarchy
+// dependency (Rule 42) ride on the guard. The classification policy
+// lives HERE (the consumer), never in T0 (interp_contract.md SS8.1:
+// "the team produces the data, not the policy").
+//
+// SCOPE:
+// - Direct calls: the v1 static-proof path (no speculation), unchanged.
+// - Virtual/interface: guard-inlined ONLY when a dispatch profile is
+//   attached (InlineConfig::profile); without one the engine does not
+//   even consider the site - v1 behavior, byte-identical (the pinned
+//   zero-regression property). Bimorphic/polymorphic sites refuse (the
+//   two-target guard is charter item 26, the documented follow-up).
 // - The engine is a do-not-inline engine first: every refusal is a
 //   KeepIndirect with a reason (icdg.md 12).
 //
@@ -34,6 +44,7 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "b2/ir/Graph.h"
@@ -41,6 +52,64 @@
 #include "b2/rbc/Rbc.h"
 
 namespace b2::passes {
+
+// --- ICDG Phase 2: the T0 dispatch-profile snapshot (icdg.md SS7/SS24) ------
+//
+// The raw per-site dispatch histogram exactly as T0 records it
+// (docs/interp_contract.md SS8.1, v1.2.0), with one representation
+// change: receiver CLASS IDS are resolved to internal NAMES, because the
+// IR-side TypeId the guard needs lives in the CalleeSource's resolver
+// space, and the NAME is the bridge between the two id spaces. The
+// snapshot is a compilation INPUT (like the RBC text), not IR state, so
+// strings are legal here (Rule 16 scopes to the graph).
+//
+// Site key: (caller MethodId, call pc) - recovered from the call node's
+// trailing FrameState descriptor (FrameStateDesc.method/.pc, the builder
+// pins the fs at the call pc). The engine classifies; T0 stays data-only.
+//
+// CONSTRUCTION: whoever owns a T0 run converts (b2graph --pgo, the
+// tests); compiler/passes/tools/DispatchProfileSnapshot.h is the shared
+// converter (it includes the interp headers, so only interp-linking
+// integrators may use it - the passes LIBRARY stays interp-free).
+
+// The invoke family of a profiled site. The 1:1 mirror of interp's
+// DispatchSiteKind (interp_contract.md SS8.1); passes-local so this
+// header does not include interp headers.
+enum class ProfileSiteKind : std::uint8_t {
+  Virtual,    // invokevirtual / invokevirtual_quick
+  Interface,  // invokeinterface / invokeinterface_quick
+  Special,    // invokespecial / invokespecial_quick
+  Static,     // invokestatic / invokestatic_quick
+};
+
+// Sentinel target id: the site total counted but no RBC target was
+// resolved (builtin execution; T0 stores no entry for these either).
+inline constexpr std::uint32_t kProfileNoTarget = 0xFFFF'FFFFu;
+
+// One receiver-class observation at one site (icdg.md SS4.3
+// DispatchCandidate's raw-data form). `recvClass` empty = the
+// static-resolution sentinel (special/static families key entries by
+// target, not receiver). `count` zero = unused slot.
+struct ProfileEntry {
+  std::string recvClass;                 // internal name, "" = sentinel
+  std::uint32_t target = kProfileNoTarget; // program method table index
+  std::uint32_t count = 0;               // saturating observations
+};
+
+// The per-site profile (the raw T0 shape: first-seen entry order,
+// frozen by the sticky megamorphic flag; deterministic by construction).
+struct ProfileSite {
+  ProfileSiteKind kind = ProfileSiteKind::Virtual;
+  bool megamorphic = false; // sticky: > 3 distinct receiver classes
+  std::uint32_t count = 0;  // saturating successful dispatches at the site
+  ProfileEntry entries[3];
+};
+
+// The snapshot: [methodIdx][pc] -> site profile, the T0 storage shape.
+struct DispatchProfile {
+  std::vector<std::vector<ProfileSite>> sites;
+};
+
 
 // --- callee resolution (the id-space seam) ----------------------------------
 //
@@ -126,6 +195,15 @@ inline constexpr std::uint32_t kMaxInlineDepth = 3;         // nesting depth
 inline constexpr std::uint32_t kMaxInlineSitesPerGraph = 64;
 inline constexpr std::uint32_t kMaxInlineNodesPerGraph = 4096;
 
+// GuardInline thresholds (Rule 23; Rule 44: no profile data without
+// confidence). `guardMinObservations` is the site total below which the
+// profile says nothing; `guardMinRatioBP` is the minimum share (basis
+// points, 0..10000) the monomorphic entry must hold of that total - a
+// site mixing RBC dispatches with builtin executions (count-only) or
+// with deopted classes falls below and refuses.
+inline constexpr std::uint32_t kGuardInlineMinObservations = 3;
+inline constexpr std::uint32_t kGuardInlineMinRatioBP = 9000;
+
 struct InlineConfig {
   // Rules 132/144: the kill switch. Disabled = a successful no-op (zero
   // decisions, zero telemetry, byte-identical graph).
@@ -137,17 +215,34 @@ struct InlineConfig {
   std::uint32_t maxDepth = kMaxInlineDepth;
   std::uint32_t maxSitesPerGraph = kMaxInlineSitesPerGraph;
   std::uint32_t maxNodesPerGraph = kMaxInlineNodesPerGraph;
+
+  // ICDG Phase 2: the T0 dispatch profile snapshot. Null (default) =
+  // direct calls only - CallVirtual/CallInterface sites are not even
+  // considered, and the run is byte-identical to v1 (graphs, telemetry,
+  // decision log). Non-null: virtual/interface sites are considered,
+  // classified against the profile, and monomorphic sites guard-inline.
+  // The snapshot must be keyed by THIS program's method table (the site
+  // key is (table index, pc)); a mismatched snapshot only ever refuses
+  // (the agreement check), never mis-inlines.
+  const DispatchProfile* profile = nullptr;
+
+  std::uint32_t guardMinObservations = kGuardInlineMinObservations;
+  std::uint32_t guardMinRatioBP = kGuardInlineMinRatioBP;
 };
 
 // --- decisions (icdg.md 19: every decision is explainable) -------------------
 
 enum class InlineAction : std::uint8_t {
   DirectInline = 0, // the call site is replaced by the callee body
-  KeepIndirect,     // the call stays (every v1 refusal is this)
+  GuardInline,     // replaced by guard + callee body (speculative, Rule 3)
+  KeepIndirect,    // the call stays (every refusal is this)
 };
 
 // One decision record. Reason strings are static (no per-decision
 // allocation; the log is a compilation artifact, never IR state).
+// siteCount/recvCount carry the profile numbers behind a GuardInline
+// decision (the site total and the monomorphic entry's count) so the
+// log explains the confidence, icdg.md 19.
 struct InlineDecision {
   ir::NodeId call = ir::kInvalidNodeId;
   ir::MethodId target = 0;
@@ -156,6 +251,8 @@ struct InlineDecision {
   std::uint32_t calleeInsns = 0;
   std::uint32_t calleeSlots = 0;
   std::uint32_t calleeNodes = 0; // 0 = not measured (pre-trial refusal)
+  std::uint32_t siteCount = 0;   // profile site total (GuardInline only)
+  std::uint32_t recvCount = 0;   // profiled entry count (GuardInline only)
   const char* reason = "";
 };
 
@@ -163,8 +260,10 @@ struct InlineDecision {
 
 struct InlineTelemetry {
   std::uint32_t sitesConsidered = 0;
-  std::uint32_t sitesInlined = 0;
+  std::uint32_t sitesInlined = 0;    // direct + guard (the budget counts both)
+  std::uint32_t sitesGuardInlined = 0; // the speculative subset
   std::uint32_t sitesRefused = 0;
+  std::uint32_t guardsEmitted = 0;   // TypeProfile guards installed
   std::uint32_t nodesAdded = 0;    // nodes appended by inlined bodies
   std::uint32_t deoptsEmitted = 0; // deopt points created inside bodies
   std::uint32_t exitMerges = 0;    // Region+Phi exit merges created
@@ -188,14 +287,16 @@ struct InlineResult {
   [[nodiscard]] bool hasErrors() const noexcept { return !ok; }
 };
 
-// Runs the direct-inline engine over `g`. PRECONDITION: g is a verified
-// graph (builder output or post-pipeline). Sites are considered in node-id
-// order; a successful inline is followed by its body's own call sites
-// (depth + 1, recursion-controlled), then the next root site. The IR
-// verifier runs after every site; any failure stops the run fail-closed
-// with diagnostics (the graph is left in the post-last-good-site state).
-// Deterministic (Rule 124): same (graph, source, config) => same decisions
-// and the same resulting graph bytes.
+// Runs the direct- + guard-inline engine over `g`. PRECONDITION: g is
+// a verified graph (builder output or post-pipeline). Sites are
+// considered in node-id order; a successful inline is followed by its
+// body's own call sites (depth + 1, recursion-controlled), then the next
+// root site. The IR verifier runs after every site; any failure stops
+// the run fail-closed with diagnostics (the graph is left in the
+// post-last-good-site state). Deterministic (Rule 124): same (graph,
+// source, config, profile) => same decisions and the same resulting
+// graph bytes. With cfg.profile == null, virtual/interface sites are
+// not considered (v1 behavior, byte-identical).
 [[nodiscard]] InlineResult runInlining(ir::Graph& g, InlineCalleeSource& src,
                                        const InlineConfig& cfg = {});
 

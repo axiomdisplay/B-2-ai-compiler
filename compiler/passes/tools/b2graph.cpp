@@ -8,6 +8,17 @@
 // lowering decisions (docs/graph_builder.md) and the smoke test the T2
 // pipeline will grow from.
 //
+// --pgo (ICDG Phase 2, docs/inlining.md section 9): run the program in
+// T0 FIRST (the training run - the same entry inference as b2run;
+// Returned and Threw both keep the accumulated profile), snapshot the
+// per-site dispatch histogram through the shared converter
+// (tools/DispatchProfileSnapshot.h - this tool is an interp-linking
+// integrator, the passes library is not), and feed it to the inliner:
+// monomorphic virtual/interface sites then GUARD-INLINE behind a
+// TypeProfile guard; every other site keeps its v1/v2 decision path.
+// The training run's program output (stdout/stderr side effects) is
+// NOT part of this tool's output surface - the decision log is.
+//
 // Exit codes: 0 = all methods built and verified; 1 = any parse/verify/
 // build/IR-verify failure (diagnostics on stderr).
 
@@ -17,6 +28,8 @@
 #include <string>
 #include <vector>
 
+#include "DispatchProfileSnapshot.h"
+#include "b2/interp/Interp.h"
 #include "b2/ir/Printer.h"
 #include "b2/ir/Verifier.h"
 #include "b2/passes/GraphBuilder.h"
@@ -27,15 +40,8 @@
 
 namespace {
 
-int run(const std::string& text, bool quiet, bool optimize, bool inl) {
-  const auto parsed = b2::rbc::parseRbcText(text);
-  if (!parsed) {
-    std::fprintf(stderr, "b2graph: parse error at offset %u: %s\n",
-                 parsed.error().offset, parsed.error().message.c_str());
-    return 1;
-  }
-  const b2::rbc::Program& prog = *parsed;
-
+int run(const b2::rbc::Program& prog, bool quiet, bool optimize, bool inl,
+        const b2::passes::DispatchProfile* profile) {
   int failures = 0;
   for (std::size_t i = 0; i < prog.methods.size(); ++i) {
     const b2::rbc::Method& m = prog.methods[i];
@@ -80,13 +86,16 @@ int run(const std::string& text, bool quiet, bool optimize, bool inl) {
       continue;
     }
     if (inl) {
-      // The ICDG direct-inline engine (docs/inlining.md): the same
-      // resolver built the graph (the unified id space), the verifier
-      // runs after every site, decisions + telemetry per method.
-      // Fail-closed on any failure - the review surface never shows an
-      // unverified graph.
+      // The ICDG inline engine (docs/inlining.md): the same resolver
+      // built the graph (the unified id space), the verifier runs after
+      // every site, decisions + telemetry per method. With --pgo the
+      // T0 training snapshot rides in the config (guard-inline on
+      // monomorphic virtual/interface sites). Fail-closed on any
+      // failure - the review surface never shows an unverified graph.
+      b2::passes::InlineConfig icfg;
+      icfg.profile = profile;
       const b2::passes::InlineResult ir =
-          b2::passes::runInlining(g, resolver);
+          b2::passes::runInlining(g, resolver, icfg);
       if (!ir.ok) {
         std::fprintf(stderr, "b2graph: inlining failed for %s:\n",
                      m.name.c_str());
@@ -97,21 +106,34 @@ int run(const std::string& text, bool quiet, bool optimize, bool inl) {
         continue;
       }
       if (!quiet) {
-        std::printf("  # inline: sites=%u inlined=%u refused=%u nodes=+%u "
-                    "deopts=+%u merges=%u depth=%u converged=%d\n",
+        std::printf("  # inline: sites=%u inlined=%u guard=%u refused=%u "
+                    "nodes=+%u deopts=+%u merges=%u depth=%u converged=%d\n",
                     ir.telemetry.sitesConsidered, ir.telemetry.sitesInlined,
-                    ir.telemetry.sitesRefused, ir.telemetry.nodesAdded,
-                    ir.telemetry.deoptsEmitted, ir.telemetry.exitMerges,
-                    ir.telemetry.maxDepthReached,
+                    ir.telemetry.sitesGuardInlined, ir.telemetry.sitesRefused,
+                    ir.telemetry.nodesAdded, ir.telemetry.deoptsEmitted,
+                    ir.telemetry.exitMerges, ir.telemetry.maxDepthReached,
                     ir.telemetry.converged ? 1 : 0);
         for (const b2::passes::InlineDecision& d : ir.decisions) {
-          std::printf("  # inline n%u -> m%u d%u: %s (%s; insns=%u slots=%u "
-                      "nodes=%u)\n",
-                      d.call, d.target, d.depth,
-                      d.action == b2::passes::InlineAction::DirectInline
-                          ? "DIRECT-INLINE"
-                          : "KEEP-INDIRECT",
-                      d.reason, d.calleeInsns, d.calleeSlots, d.calleeNodes);
+          const char* act =
+              d.action == b2::passes::InlineAction::DirectInline
+                  ? "DIRECT-INLINE"
+                  : d.action == b2::passes::InlineAction::GuardInline
+                      ? "GUARD-INLINE"
+                      : "KEEP-INDIRECT";
+          if (d.action == b2::passes::InlineAction::GuardInline) {
+            // The profile numbers ride the guard decision (icdg.md 19:
+            // the confidence is part of the explanation).
+            std::printf("  # inline n%u -> m%u d%u: %s (%s; insns=%u "
+                        "slots=%u nodes=%u profile=%u/%u)\n",
+                        d.call, d.target, d.depth, act, d.reason,
+                        d.calleeInsns, d.calleeSlots, d.calleeNodes,
+                        d.recvCount, d.siteCount);
+          } else {
+            std::printf("  # inline n%u -> m%u d%u: %s (%s; insns=%u "
+                        "slots=%u nodes=%u)\n",
+                        d.call, d.target, d.depth, act, d.reason,
+                        d.calleeInsns, d.calleeSlots, d.calleeNodes);
+          }
         }
       }
     }
@@ -156,10 +178,51 @@ int run(const std::string& text, bool quiet, bool optimize, bool inl) {
 
 } // namespace
 
+// The T0 training run (the --pgo half; ICDG Phase 2): execute the
+// program once with b2run-style entry inference (main; ()V, then the
+// String[] form, then any zero-parameter main - corpus programs are all
+// ()V, and hand-written graphs use ()I-style entries), then snapshot
+// the accumulated dispatch profile. Returned AND Threw both keep the
+// data (a partially-run program still profiled every site it
+// dispatched); a program with no runnable entry keeps an empty profile
+// (every site then refuses "no row" - no data, no speculation). The
+// program's stdout/stderr side effects stay in the runtime buffers
+// (the tool's output surface is the decision log, not the training
+// run's output).
+[[nodiscard]] const b2::passes::DispatchProfile*
+trainAndSnapshot(const b2::rbc::Program& prog,
+                 b2::passes::DispatchProfile& storage) {
+  b2::interp::Interpreter interp(prog, b2::interp::InterpConfig{});
+  std::string entryDesc;
+  if (prog.find("main", "()V") != nullptr) {
+    entryDesc = "()V";
+  } else if (prog.find("main", "([Ljava/lang/String;)V") != nullptr) {
+    entryDesc = "([Ljava/lang/String;)V";
+  } else {
+    for (const b2::rbc::Method& m : prog.methods) {
+      if (m.name == "main" && b2::rbc::paramCount(m.descriptor) == 0) {
+        entryDesc = m.descriptor;
+        break;
+      }
+    }
+  }
+  std::vector<b2::interp::Value> args;
+  if (entryDesc == "([Ljava/lang/String;)V") {
+    args.push_back(b2::interp::Value::refVal(
+        interp.runtime().newRefArray(interp.runtime().stringClass(), 0)));
+  }
+  if (!entryDesc.empty()) {
+    (void)interp.run("main", entryDesc, args);
+  }
+  b2::passes::snapshotDispatchProfile(interp, storage);
+  return &storage;
+}
+
 int main(int argc, char** argv) {
   bool quiet = false;
   bool optimize = false;
   bool inl = false;
+  bool pgo = false;
   std::vector<std::string> files;
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
@@ -169,14 +232,25 @@ int main(int argc, char** argv) {
       optimize = true;
     } else if (arg == "--inline" || arg == "-i") {
       inl = true;
+    } else if (arg == "--pgo") {
+      pgo = true;
+      inl = true; // the profile only has a consumer through the engine
     } else if (arg == "--help" || arg == "-h") {
       std::printf(
-          "usage: b2graph [--quiet] [-O] [--inline] file.rbc...\n"
+          "usage: b2graph [--quiet] [-O] [--inline] [--pgo] file.rbc...\n"
           "  parse RBC text, verify, build every method's IR graph,\n"
           "  IR-verify, and print (the builder's debug surface)\n"
-          "  --inline: run the ICDG direct-inline engine before the\n"
-          "      pipeline (verified after every site; decision log +\n"
-          "      telemetry line per method; docs/inlining.md)\n"
+          "  --inline: run the ICDG inline engine before the pipeline\n"
+          "      (verified after every site; decision log + telemetry line\n"
+          "      per method; docs/inlining.md)\n"
+          "  --pgo: run the program in T0 FIRST (training run; the entry\n"
+          "      inference matches b2run), snapshot the per-site dispatch\n"
+          "      profile (icdg.md Phase 1 / interp_contract.md SS8.1), and\n"
+          "      feed it to the inline engine - monomorphic virtual /\n"
+          "      interface sites GUARD-INLINE behind a TypeProfile guard\n"
+          "      (Rule 122 SpecMeta + ClassHierarchy dependency; implies\n"
+          "      --inline; the training run's program output is not part\n"
+          "      of this tool's output)\n"
           "  -O: run the early-cleanup + GVN pipeline after the build\n"
           "      (verified between passes, deterministic; telemetry line\n"
           "      per method)\n");
@@ -202,7 +276,21 @@ int main(int argc, char** argv) {
     if (!quiet) {
       std::printf("# %s\n", f.c_str());
     }
-    failures += run(ss.str(), quiet, optimize, inl) == 0 ? 0 : 1;
+    const auto parsed = b2::rbc::parseRbcText(ss.str());
+    if (!parsed) {
+      std::fprintf(stderr, "b2graph: parse error at offset %u: %s\n",
+                   parsed.error().offset, parsed.error().message.c_str());
+      ++failures;
+      continue;
+    }
+    // One training run + snapshot per FILE (the profile is a property of
+    // the program, shared by all of its method graphs).
+    b2::passes::DispatchProfile storage;
+    const b2::passes::DispatchProfile* profile = nullptr;
+    if (pgo) {
+      profile = trainAndSnapshot(*parsed, storage);
+    }
+    failures += run(*parsed, quiet, optimize, inl, profile) == 0 ? 0 : 1;
   }
   return failures == 0 ? 0 : 1;
 }

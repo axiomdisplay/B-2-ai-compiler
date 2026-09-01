@@ -1108,15 +1108,19 @@ bool Builder::stabilizeTypes() {
       return;
     }
     case rbc::Sig::Call: {
-      const rbc::Const* mr =
-          cpAt(pc, ins.imm, rbc::Const::Kind::MethodRef);
-      if (mr == nullptr) {
-        mr = cpAt(pc, ins.imm, rbc::Const::Kind::InterfaceMethodRef);
-      }
-      if (mr != nullptr) {
-        const rbc::RType ret = rbc::parseReturn(mr->str3);
-        if (ret != rbc::RType::Bottom && ins.dst < m_.numRegs) {
-          S[regIdx(ins.dst)] = ret;
+      // Kind probe WITHOUT diagnostics: an invokeinterface site legally
+      // carries an InterfaceMethodRef, and a cpAt(MethodRef) miss would
+      // record a spurious failure diag (found by the ICDG Phase 2
+      // interface-call tests - no earlier surface exercised the family).
+      // Both kinds have the same (class, name, descriptor) shape.
+      if (ins.imm < m_.cp.size()) {
+        const rbc::Const& c = m_.cp[ins.imm];
+        if (c.kind == rbc::Const::Kind::MethodRef ||
+            c.kind == rbc::Const::Kind::InterfaceMethodRef) {
+          const rbc::RType ret = rbc::parseReturn(c.str3);
+          if (ret != rbc::RType::Bottom && ins.dst < m_.numRegs) {
+            S[regIdx(ins.dst)] = ret;
+          }
         }
       }
       return;

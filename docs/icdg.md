@@ -1155,6 +1155,22 @@ Use it for:
 - T2 devirtualization
 - T2 simple inlining
 
+**LANDED (MSG-20260901-005), the T2 side - the ingestion + GuardInline**:
+the dispatch-state classification + stability scoring over the Phase 1
+histograms (monomorphic/bimorphic/polymorphic/megamorphic + Rule 44
+confidence), action selection for `CallVirtual`/`CallInterface` sites
+(GuardInline on monomorphic sites; the rest KeepIndirect with a
+structured reason), dependency records (the `ClassHierarchy`
+invalidation on the guard, Rule 42), and the snapshot ingestion
+(`passes::DispatchProfile`, site key `(caller MethodId, call pc)`
+recovered from the call's FrameState; runtime class ids bridge to the
+resolver's TypeId space by NAME). Contract: `docs/inlining.md` section
+9; tool surface `b2graph --pgo`; 20 new tests in `tests/passes/`.
+Still future: the full CallSiteNode/MethodNode/DispatchCandidate graph
+model (SS4 - the current engine consumes the snapshot directly), T1
+stencil dispatch selection (baseline_noir's consumption), the
+two-target bimorphic guard, and Phase 3's unlock-aware scoring.
+
 ## Phase 3: Unlock-aware scoring
 
 Add:
