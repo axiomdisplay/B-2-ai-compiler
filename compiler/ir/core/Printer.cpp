@@ -112,31 +112,38 @@ IRType resultTypeOf(const Graph& g, NodeId n) {
   case NodeKind::EqI: case NodeKind::NeI:
   case NodeKind::LtI: case NodeKind::LeI:
   case NodeKind::GtI: case NodeKind::GeI:
+  // MSG-20260831-009: comparisons yield Int (Node.h / ir_spec 4.7:
+  // (a, b) -> int; they were previously grouped with their operand
+  // families and returned Long/Float/Double, so a comparison result
+  // could never feed an Int slot - branches, guards, boolean tests).
+  case NodeKind::CmpL:
+  case NodeKind::CmpFl: case NodeKind::CmpFg:
+  case NodeKind::CmpDl: case NodeKind::CmpDg:
     return IRType::Int;
   case NodeKind::AddL: case NodeKind::SubL: case NodeKind::MulL:
   case NodeKind::DivL: case NodeKind::RemL: case NodeKind::NegL:
   case NodeKind::ShlL: case NodeKind::ShrL: case NodeKind::UShrL:
   case NodeKind::AndL: case NodeKind::OrL: case NodeKind::XorL:
-  case NodeKind::CmpL:
   case NodeKind::SignExtend: case NodeKind::ZeroExtend:
     return IRType::Long;
   case NodeKind::AddF: case NodeKind::SubF: case NodeKind::MulF:
   case NodeKind::DivF: case NodeKind::RemF: case NodeKind::NegF:
-  case NodeKind::CmpFl: case NodeKind::CmpFg:
     return IRType::Float;
   case NodeKind::AddD: case NodeKind::SubD: case NodeKind::MulD:
   case NodeKind::DivD: case NodeKind::RemD: case NodeKind::NegD:
-  case NodeKind::CmpDl: case NodeKind::CmpDg:
     return IRType::Double;
 
-  // Conversions.
-  case NodeKind::I2L: case NodeKind::I2D: case NodeKind::L2D: case NodeKind::F2D:
+  // Conversions. MSG-20260831-009: I2L widens to Long (Node.h /
+  // ir_spec 4.8); it was previously grouped with the FP widenings and
+  // returned Double, so L2I(I2L(x)) - the exact round-trip identity -
+  // failed verification.
+  case NodeKind::I2D: case NodeKind::L2D: case NodeKind::F2D:
     return IRType::Double;
   case NodeKind::I2F: case NodeKind::L2F: case NodeKind::D2F:
     return IRType::Float;
   case NodeKind::L2I: case NodeKind::F2I: case NodeKind::D2I:
     return IRType::Int;
-  case NodeKind::F2L: case NodeKind::D2L:
+  case NodeKind::I2L: case NodeKind::F2L: case NodeKind::D2L:
     return IRType::Long;
   case NodeKind::BitCast: {
     if (nd.numInputs >= 1) {

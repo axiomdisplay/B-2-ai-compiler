@@ -1623,12 +1623,7 @@ B2_TEST(ident_double_negation_int_and_float) {
 }
 
 B2_TEST(ident_narrowing_idempotence) {
-  // I2B(I2B(x)) == I2B(x): narrowing is idempotent. (The L2I(I2L(x))
-  // round trip is BLOCKED at verification time by an IR-core
-  // resultTypeOf defect - I2L is classified as Double-producing in
-  // compiler/ir/core/Printer.cpp - reported to the IR team as MSG-009;
-  // this test exercises the other exact conversion identity until it
-  // lands.)
+  // I2B(I2B(x)) == I2B(x): narrowing is idempotent.
   rbc::RbcBuilder b("main", "(I)I", rbc::method_flags::Static);
   b.setRegs(3);
   b.setLocals(1);
@@ -1645,6 +1640,31 @@ B2_TEST(ident_narrowing_idempotence) {
   CHECK(countKind(g, NodeKind::I2B) == 1); // one narrowing survives
   const ir::NodeId ret = firstOf(g, NodeKind::Return);
   CHECK(g.node(g.input(ret, 1)).kind == NodeKind::I2B);
+}
+
+B2_TEST(ident_widen_narrow_round_trip) {
+  // L2I(I2L(x)) == x (MSG-00831-009's exact blocked identity, unblocked
+  // by the IR fix: I2L now types as Long). The pre-"fix" engine already
+  // HAD the rewrite (Simplify.cpp's conversion identities); the folded
+  // graph then failed the verifier's operand-type check and the test
+  // could not exist. Now the whole chain folds away and verifies.
+  rbc::RbcBuilder b("main", "(I)I", rbc::method_flags::Static);
+  b.setRegs(3);
+  b.setLocals(1);
+  b.emitRegSlot(rbc::Op::Iload, 0, 0);
+  b.emitRegReg(rbc::Op::I2l, 1, 0);
+  b.emitRegReg(rbc::Op::L2i, 2, 1);
+  b.emitReg(rbc::Op::Ireturn, 2);
+  rbc::Method m;
+  CHECK(b.finish(m).ok);
+  ir::Graph g;
+  buildOk(m, g);
+  passOk(g, PK::IdentityRemoval);
+  passOk(g, PK::DeadCodeElimination); // reclaim the orphaned conversions
+  CHECK(countKind(g, NodeKind::I2L) == 0);
+  CHECK(countKind(g, NodeKind::L2I) == 0);
+  const ir::NodeId ret = firstOf(g, NodeKind::Return);
+  CHECK(g.node(g.input(ret, 1)).kind == NodeKind::Parameter);
 }
 
 B2_TEST(ident_div_rem_by_one) {

@@ -313,7 +313,7 @@ decision log at worst, never a wrong inline.
 
 ## 8. Testing (Rule 35) and the growth path
 
-`tests/passes/InlineTests.cpp` - 49 tests: the exit-merge shapes
+`tests/passes/InlineTests.cpp` - 50 tests: the exit-merge shapes
 (direct wiring, Region+phis, memory threading through stores,
 loops), argument flow (constants fold through the post-inline
 pipeline), FrameState chains and their DCE protection, deopt-id
@@ -324,8 +324,11 @@ payload resolution, and the corpus sweep: all 19 interp-corpus
 programs through build -> inline -> verify -> pipeline -> verify with
 double-run determinism and re-run idempotency. v2 adds 20 GuardInline
 tests (section 9.5) and extends the corpus sweep with a
-profile-attached variant (byte-identical graphs, deterministic). The
-suite's binary links `b2::interp` for the end-to-end T0 test - a test
+profile-attached variant (byte-identical graphs, deterministic); the
+MSG-20260901-004 verifier fix adds the canonical call-in-loop
+end-to-end test (a virtual site inside a counted loop: train, snapshot,
+guard-inline, verify). The
+suite's binary links `b2::interp` for the end-to-end T0 tests - a test
 harness may integrate tiers like the tools do; the `b2_passes` library
 never does. ASan/UBSan clean over the suite and the `b2graph
 --pgo --inline -O` corpus sweep; the Law-36 differential sweep (T0/T1)
@@ -339,11 +342,13 @@ unlock-value scoring that prioritizes sites enabling CM-PEA, effect
 reordering, SWLP, and representation elimination (the moment those
 passes exist to consume it); partial inlining and
 exception-edge-aware inlining (in-graph handlers) follow the codegen
-team's compiled-handler work. Known orthogonal gap: the IR verifier's
-memory-chain walk false-positives on any memory producer inside a loop
-(MSG-20260901-004) - GuardInline test programs are deliberately
-straight-line until that lands; a call inside a loop is the most
-common real-world inline shape and unblocks with the verifier fix.
+team's compiled-handler work. The verifier gap that kept GuardInline
+test programs straight-line (the memory-chain walk's loop-backedge
+false positive, MSG-20260901-004) is FIXED and the canonical
+call-in-loop program is in the suite
+(`il_guard_call_in_loop_end_to_end`: the `main { while (i<3)
+sum += obj.bump(5) }` shape trains, snapshots, and guard-inlines
+inside the loop).
 
 ---
 

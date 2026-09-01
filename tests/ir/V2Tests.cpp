@@ -203,9 +203,16 @@ B2_TEST(v2_memory_chain_cycle_through_phi_rejected) {
   const ir::NodeId v = g.constantI(7);
   const ir::NodeId s1 = g.make(NodeKind::StoreField,
                                {g.startNode(), g.startNode(), obj, v}, 1);
+  // A second, well-formed value input keeps the phi's arity honest (two
+  // values for two region preds) so the CYCLE diagnostic below is the
+  // sole discriminator (MSG-20260901-004: the loop-header closure skip
+  // applies only to LoopBegin-backed phis - a forward merge has no
+  // backedge, so a closure at one is a real cycle).
+  const ir::NodeId s2 = g.make(NodeKind::StoreField,
+                               {g.startNode(), g.startNode(), obj, v}, 2);
   const ir::NodeId region = g.make(NodeKind::Region, {g.startNode(),
                                                       g.startNode()});
-  const ir::NodeId memPhi = g.make(NodeKind::Phi, {region, s1});
+  const ir::NodeId memPhi = g.make(NodeKind::Phi, {region, s1, s2});
   // s1's memory now flows through the phi back to s1: a cycle.
   g.setInput(s1, 1, memPhi);
   const ir::NodeId load = g.make(NodeKind::LoadField,

@@ -782,6 +782,27 @@ struct Verifier {
           continue; // proven: terminates at Start
         }
         if (onPath[child] == generation) {
+          const Node& cn = g.node(child);
+          if (cn.kind == NodeKind::Phi && cn.numInputs >= 1) {
+            const NodeId region = g.input(child, 0);
+            if (validId(region) &&
+                g.node(region).kind == NodeKind::LoopBegin) {
+              // MSG-20260901-004: an on-path revisit of a LOOP-HEADER
+              // Phi is a backedge closure. The walk forked over the
+              // header phi's value inputs and followed the BACKEDGE
+              // input through the body's memory producers back to the
+              // header itself; the phi is being proven through its
+              // other inputs (the entry side terminates at Start; the
+              // loop-invariant side is the self-input skip above). In
+              // reducible flow (the builder rejects irreducible input)
+              // every LEGAL memory-chain cycle closes at a LoopBegin
+              // header phi: forward merges (Region phis) have no
+              // backedge, so a closure at one is a real cycle and
+              // still reports below. A non-Phi revisit also stays a
+              // cycle error; the maxSteps bound is the belt.
+              continue;
+            }
+          }
           diag(n, "memory chain cycle detected at n" +
                       std::to_string(child));
           break;
@@ -832,6 +853,21 @@ struct Verifier {
   }
 
   void checkFrameStates() {
+    // MSG-20260901-002: a caller chain must resolve to a LIVE snapshot
+    // node. The chain reference is side-table data (a desc id, not a
+    // use-def edge), so use-def invariants cannot see a killed
+    // chain-target FrameState; without this check a dead target would
+    // pass verification while its input edges - junked by the kill - no
+    // longer carry the caller-frame slot values the deoptimizer needs
+    // (Rule 75: frames reconstructible on demand).
+    std::vector<std::uint8_t> descHasLiveFs(g.frameStateCount(), 0);
+    for (NodeId n = 0; n < g.nodeCount(); ++n) {
+      const Node& nd = g.node(n);
+      if (nd.kind == NodeKind::FrameState && !nd.isDead() &&
+          nd.payload < g.frameStateCount()) {
+        descHasLiveFs[nd.payload] = 1;
+      }
+    }
     for (NodeId n = 0; n < g.nodeCount(); ++n) {
       const Node& nd = g.node(n);
       if (nd.kind != NodeKind::FrameState || nd.isDead()) {
@@ -852,6 +888,12 @@ struct Verifier {
         }
         if (cur >= g.frameStateCount()) {
           diag(n, "FrameState caller id out of range");
+          break;
+        }
+        if (descHasLiveFs[cur] == 0) {
+          diag(n, "FrameState caller chain target " +
+                      std::to_string(cur) +
+                      " has no live snapshot node");
           break;
         }
         cur = g.frameState(cur).caller;

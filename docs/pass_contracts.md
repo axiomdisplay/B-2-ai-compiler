@@ -287,7 +287,7 @@ surface (telemetry line per method).
 | Switch folding on constants | case labels are frontend-side (opaque payload) |
 | Load CSE beyond identical keys | loads chain control (PRE/scheduling territory) |
 | Div/rem DCE | guard-adjacency proof |
-| Tombstone/dead-fork reclamation | IR team: sanctioned removal API or verifier dead-node skip (MSG-009) |
-| CmpL-based long zero-guards | IR core classifies CmpL as Long-producing (MSG-009); the L2I composition is sound (over-deopts only) |
+| Tombstone/dead-fork reclamation | decision recorded in MSG-009's close: deferred to a dedicated RFC (a removal API or dead-node input-check skip changes verifier semantics, serializer stability, and every golden dump; the junk-sink protocol stays the sanctioned sound mechanism) |
+| CmpL-based long zero-guards | the MSG-009 resultTypeOf fix LANDED (CmpL now types Int, verified); the L2I composition stays the shipped v1 shape — sound (over-deopts only), tested, and byte-pinned by goldens; switching to the CmpL form is an optional passes-team cleanup |
 | Inlining registry rows (suite 21-34 speculation family) | profile import (icdg.md Phase 1) + Rule 1's tier-filter mechanism; the direct-inline driver itself is delivered (docs/inlining.md) |
-| Inline verification of caller-chain fs liveness | IR team: the verifier checks chains acyclic but not that chain targets' nodes are alive (the DCE-side protection is the interim soundness fix; MSG-20260901-002) |
+| ~~Inline verification of caller-chain fs liveness~~ | RESOLVED by the MSG-20260901-002 close: the IR verifier now requires every caller chain target to resolve to a live snapshot node (ir_spec 7 check 7); the DCE-side conservatism stays as belt-and-suspenders |

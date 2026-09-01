@@ -86,8 +86,11 @@ The long-division guard narrows through `L2I`: `NeI` takes Int operands
 and there is no `NeL` kind. `L2I(x) == 0` for x = 0 OR x a nonzero
 multiple of 2^32, so the guard deopts on a non-trapping divisor — always
 observably equivalent (deopt-to-T0 re-execution), astronomically rare.
-The clean `CmpL(divisor, 0L)` comparison is blocked until the IR team
-fixes the `resultTypeOf(CmpL)` classification (MSG-009).
+The `resultTypeOf(CmpL)` classification that blocked the clean
+`CmpL(divisor, 0L)` comparison is FIXED (MSG-009 closed: CmpL now types
+Int and feeds Int slots, verified); the L2I shape stays the shipped v1
+form — sound, tested, and byte-pinned — with the CmpL switch listed as
+an optional passes-team cleanup.
 
 Divide-by-zero on floats/doubles needs no guard (IEEE semantics). `checkcast`
 keeps its `ExceptionThrow` effect node (a Java exception, not a deopt);

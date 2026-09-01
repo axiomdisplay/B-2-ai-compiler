@@ -393,13 +393,18 @@ B2_TEST(verifier_rejects_framestate_caller_cycle) {
   ir::Graph g;
   const ir::NodeId a = g.constantI(1);
   // Build a cyclic caller chain through the replay API (the builder API
-  // cannot create cycles - callers must already exist).
+  // cannot create cycles - callers must already exist) and attach LIVE
+  // snapshot nodes to both descriptors so the walk exercises the cycle
+  // itself (the MSG-20260901-002 liveness check would otherwise fire
+  // first and mask the steps-bound diagnostic).
   const ir::FrameStateId f0 = g.replayFrameStateDesc(1, 0, 1, {});
   const ir::FrameStateId f1 = g.replayFrameStateDesc(1, 0, 0, {});
   (void)f0;
   (void)f1;
-  const ir::NodeId fs = g.makeFrameState(1, 0, {a});
-  g.nodeForReplay(fs).payload = 0; // point at the cyclic descriptor
+  const ir::NodeId fs0 = g.makeFrameState(1, 0, {a});
+  const ir::NodeId fs1 = g.makeFrameState(1, 0, {a});
+  g.nodeForReplay(fs0).payload = 0; // live node for the cyclic desc 0
+  g.nodeForReplay(fs1).payload = 1; // live node for the cyclic desc 1
   CHECK(!ir::verify(g).ok);
 }
 
@@ -408,4 +413,229 @@ B2_TEST(verifier_rejects_materialize_of_non_vobj) {
   const ir::NodeId notVobj = g.constantI(1);
   g.make(NodeKind::Materialize, {g.startNode(), g.startNode(), notVobj});
   CHECK(!ir::verify(g).ok);
+}
+
+// --- MSG-20260831-009: resultTypeOf rows match the spec (4.7/4.8) -------------------
+
+B2_TEST(verifier_result_types_comparisons_and_widening_match_spec) {
+  // The five previously mis-grouped rows: comparisons yield Int
+  // ((a, b) -> int, Node.h / ir_spec 4.7) and I2L widens to Long
+  // (ir_spec 4.8); they had been grouped with their operand families
+  // and returned Long/Float/Float/Double/Double.
+  ir::Graph g;
+  const ir::NodeId i = g.constantI(1);
+  const ir::NodeId l = g.constantL(2);
+  const ir::NodeId f = g.constantF(3.0F);
+  const ir::NodeId d = g.constantD(4.0);
+  CHECK(ir::resultTypeOf(g, g.make(NodeKind::CmpL, {l, l})) ==
+        ir::IRType::Int);
+  CHECK(ir::resultTypeOf(g, g.make(NodeKind::CmpFl, {f, f})) ==
+        ir::IRType::Int);
+  CHECK(ir::resultTypeOf(g, g.make(NodeKind::CmpFg, {f, f})) ==
+        ir::IRType::Int);
+  CHECK(ir::resultTypeOf(g, g.make(NodeKind::CmpDl, {d, d})) ==
+        ir::IRType::Int);
+  CHECK(ir::resultTypeOf(g, g.make(NodeKind::CmpDg, {d, d})) ==
+        ir::IRType::Int);
+  CHECK(ir::resultTypeOf(g, g.make(NodeKind::I2L, {i})) == ir::IRType::Long);
+}
+
+B2_TEST(verifier_accepts_i2l_l2i_round_trip_and_cmp_int_slots) {
+  // The exact repro shapes from MSG-20260831-009, previously rejected as
+  // "operand has type double, expected long" (L2I over I2L) and
+  // "operand has type long, expected int" (a comparison feeding an Int
+  // slot): the round trip and every comparison family now flow through
+  // their typed consumer slots.
+  ir::Graph g;
+  const ir::NodeId zero = g.constantI(0);
+  const ir::NodeId one = g.constantI(1);
+  const ir::NodeId l0 = g.constantL(0);
+  const ir::NodeId l1 = g.constantL(1);
+  const ir::NodeId f = g.constantF(1.5F);
+  const ir::NodeId d = g.constantD(2.5);
+  const ir::NodeId wide = g.make(NodeKind::I2L, {one});
+  const ir::NodeId narrow = g.make(NodeKind::L2I, {wide});
+  const ir::NodeId eq =
+      g.make(NodeKind::EqI, {g.make(NodeKind::CmpL, {l0, l1}), zero});
+  const ir::NodeId ne =
+      g.make(NodeKind::NeI, {g.make(NodeKind::CmpFl, {f, f}), zero});
+  const ir::NodeId lt =
+      g.make(NodeKind::LtI, {g.make(NodeKind::CmpDg, {d, d}), zero});
+  const ir::NodeId o0 = g.make(NodeKind::OrI, {eq, ne});
+  const ir::NodeId o1 = g.make(NodeKind::OrI, {o0, lt});
+  const ir::NodeId o2 = g.make(NodeKind::OrI, {o1, narrow});
+  g.make(NodeKind::Return, {g.startNode(), o2});
+  const ir::VerifyResult r = ir::verify(g);
+  CHECK_MSG(r.ok, r.diags.empty() ? "" : r.diags[0].message);
+}
+
+B2_TEST(verifier_rejects_int_operands_for_long_comparison) {
+  ir::Graph g;
+  const ir::NodeId i = g.constantI(1);
+  // The result-side fix must not relax the operand side: CmpL still
+  // takes (Long, Long) (Rule 33 - mismatches are errors, never coercions).
+  g.make(NodeKind::CmpL, {i, i});
+  CHECK(!ir::verify(g).ok);
+}
+
+// --- MSG-20260901-004: memory producers inside loops --------------------------------
+//
+// The walk previously reported "memory chain cycle" for every loop whose
+// body writes memory: the header memory Phi's BACKEDGE input chains
+// through the body producers back to the header itself (a legal loop
+// closure). An on-path Phi revisit is now skipped; a non-Phi revisit
+// stays a cycle. Shapes: (a) putfield in a loop, (b) a call in a loop,
+// (c) an allocation in a loop, (d) the loop-invariant self-input Phi
+// (pin), (e) a real non-Phi cycle behind a loop Phi (still rejected).
+
+namespace {
+
+// The shared loop skeleton: iv counts 0..3; memory threads through
+// mphi (entry = Start); each test appends its own body memory producer
+// as the phi's backedge input.
+void mkLoopSkeleton(ir::Graph& g, ir::NodeId& mphi, ir::NodeId& body,
+                    ir::NodeId& exit, ir::NodeId& iv) {
+  const ir::NodeId zero = g.constantI(0);
+  const ir::NodeId one = g.constantI(1);
+  const ir::NodeId three = g.constantI(3);
+  const ir::NodeId loop = g.make(NodeKind::LoopBegin, {g.startNode()});
+  iv = g.make(NodeKind::Phi, {loop, zero});
+  mphi = g.make(NodeKind::Phi, {loop, g.startNode()});
+  const ir::NodeId inc = g.make(NodeKind::AddI, {iv, one});
+  const ir::NodeId cmp = g.make(NodeKind::CmpI, {inc, three});
+  const ir::NodeId iff = g.make(NodeKind::If, {loop, cmp});
+  body = g.make(NodeKind::IfTrue, {iff});
+  exit = g.make(NodeKind::IfFalse, {iff});
+  g.appendInput(iv, inc);
+  g.appendInput(loop, g.make(NodeKind::LoopEnd, {body}));
+}
+
+} // namespace
+
+B2_TEST(verifier_accepts_putfield_in_loop) {
+  // (a) The MSG-20260901-004 repro: the FIRST body producer reads the
+  // header phi; the phi's backedge input is the store. The post-loop
+  // load's backward walk closes the backedge at the header phi.
+  ir::Graph g;
+  ir::NodeId mphi, body, exit, iv;
+  mkLoopSkeleton(g, mphi, body, exit, iv);
+  const ir::NodeId obj = g.constantNull();
+  const ir::NodeId v = g.constantI(7);
+  const ir::NodeId st =
+      g.make(NodeKind::StoreField, {body, mphi, obj, v}, 1);
+  g.appendInput(mphi, st);
+  const ir::NodeId lfs = g.makeFrameState(1, 5, {iv});
+  const ir::NodeId lx = g.make(NodeKind::LoopExit, {exit, lfs});
+  const ir::NodeId ld = g.make(NodeKind::LoadField, {lx, mphi, obj}, 1,
+                               static_cast<std::uint32_t>(ir::IRType::Int));
+  g.make(NodeKind::Return, {lx, ld});
+  const ir::VerifyResult r = ir::verify(g);
+  CHECK_MSG(r.ok, r.diags.empty() ? "" : r.diags[0].message);
+}
+
+B2_TEST(verifier_accepts_call_in_loop) {
+  // (b) A call is a memory producer: call.mem = the header phi, the
+  // phi's backedge input = the call. The most common real-world inline
+  // candidate shape (the canonical dispatch-profile loop program).
+  ir::Graph g;
+  ir::NodeId mphi, body, exit, iv;
+  mkLoopSkeleton(g, mphi, body, exit, iv);
+  const ir::NodeId obj = g.constantNull();
+  const ir::NodeId cfs = g.makeFrameState(1, 2, {iv});
+  const ir::NodeId call = g.make(
+      NodeKind::CallStatic, {body, mphi, iv, cfs}, 7,
+      static_cast<std::uint32_t>(ir::IRType::Int));
+  g.appendInput(mphi, call);
+  const ir::NodeId lfs = g.makeFrameState(1, 5, {iv});
+  const ir::NodeId lx = g.make(NodeKind::LoopExit, {exit, lfs});
+  const ir::NodeId ld = g.make(NodeKind::LoadField, {lx, mphi, obj}, 1,
+                               static_cast<std::uint32_t>(ir::IRType::Int));
+  g.make(NodeKind::Return, {lx, ld});
+  const ir::VerifyResult r = ir::verify(g);
+  CHECK_MSG(r.ok, r.diags.empty() ? "" : r.diags[0].message);
+}
+
+B2_TEST(verifier_accepts_allocation_in_loop) {
+  // (c) new + putfield on the fresh object: New produces memory state
+  // but READS none, so the store's Mem input chains through the
+  // allocation (not the header phi) and the walk terminates at the New;
+  // the phi's backedge input is the store. Pins the allocation shape.
+  ir::Graph g;
+  ir::NodeId mphi, body, exit, iv;
+  mkLoopSkeleton(g, mphi, body, exit, iv);
+  const ir::NodeId obj = g.constantNull();
+  const ir::NodeId v = g.constantI(7);
+  const ir::NodeId alloc = g.make(NodeKind::New, {body}, 3);
+  const ir::NodeId st =
+      g.make(NodeKind::StoreField, {body, alloc, alloc, v}, 1);
+  g.appendInput(mphi, st);
+  const ir::NodeId lfs = g.makeFrameState(1, 5, {iv});
+  const ir::NodeId lx = g.make(NodeKind::LoopExit, {exit, lfs});
+  const ir::NodeId ld = g.make(NodeKind::LoadField, {lx, mphi, obj}, 1,
+                               static_cast<std::uint32_t>(ir::IRType::Int));
+  g.make(NodeKind::Return, {lx, ld});
+  const ir::VerifyResult r = ir::verify(g);
+  CHECK_MSG(r.ok, r.diags.empty() ? "" : r.diags[0].message);
+}
+
+B2_TEST(verifier_accepts_loop_invariant_memory_self_input_phi) {
+  // (d) The loop-invariant memory marker: the phi's backedge value is
+  // the phi ITSELF (the body produced no memory the header has not
+  // seen). Pins the pre-existing self-input skip.
+  ir::Graph g;
+  ir::NodeId mphi, body, exit, iv;
+  mkLoopSkeleton(g, mphi, body, exit, iv);
+  g.appendInput(mphi, mphi);
+  const ir::NodeId obj = g.constantNull();
+  const ir::NodeId lfs = g.makeFrameState(1, 5, {iv});
+  const ir::NodeId lx = g.make(NodeKind::LoopExit, {exit, lfs});
+  const ir::NodeId ld = g.make(NodeKind::LoadField, {lx, mphi, obj}, 1,
+                               static_cast<std::uint32_t>(ir::IRType::Int));
+  g.make(NodeKind::Return, {lx, ld});
+  const ir::VerifyResult r = ir::verify(g);
+  CHECK_MSG(r.ok, r.diags.empty() ? "" : r.diags[0].message);
+}
+
+B2_TEST(verifier_rejects_non_phi_cycle_behind_loop_phi) {
+  // (e) A genuine two-store cycle reachable through the phi's backedge:
+  // the walk skips ONLY the phi closure itself; a non-Phi on-path
+  // revisit behind it is still a cycle error.
+  ir::Graph g;
+  ir::NodeId mphi, body, exit, iv;
+  mkLoopSkeleton(g, mphi, body, exit, iv);
+  const ir::NodeId obj = g.constantNull();
+  const ir::NodeId v = g.constantI(7);
+  const ir::NodeId s1 =
+      g.make(NodeKind::StoreField, {body, mphi, obj, v}, 1);
+  const ir::NodeId s2 =
+      g.make(NodeKind::StoreField, {body, s1, obj, v}, 2);
+  g.setInput(s1, 1, s2); // s1.mem = s2 while s2.mem = s1: a real cycle
+  g.appendInput(mphi, s2);
+  const ir::NodeId lfs = g.makeFrameState(1, 5, {iv});
+  const ir::NodeId lx = g.make(NodeKind::LoopExit, {exit, lfs});
+  const ir::NodeId ld = g.make(NodeKind::LoadField, {lx, mphi, obj}, 1,
+                               static_cast<std::uint32_t>(ir::IRType::Int));
+  g.make(NodeKind::Return, {lx, ld});
+  CHECK(!ir::verify(g).ok);
+}
+
+// --- MSG-20260901-002: chain targets must be live ----------------------------------
+
+B2_TEST(verifier_rejects_caller_chain_to_dead_snapshot) {
+  ir::Graph g;
+  const ir::NodeId a = g.constantI(1);
+  const ir::NodeId cond = g.constantI(1);
+  // A caller snapshot KILLED while a live callee FrameState still chains
+  // to its descriptor: the desc survives as side-table data, but no live
+  // node carries the caller-frame slot values anymore - the deoptimizer
+  // would read a destroyed snapshot (Rule 75). The single diagnostic
+  // lands on the live callee whose chain no longer resolves.
+  const ir::NodeId callerFs = g.makeFrameState(1, 8, {a});
+  const ir::NodeId calleeFs =
+      g.makeFrameState(2, 3, {a}, g.node(callerFs).payload);
+  g.make(NodeKind::Guard, {g.startNode(), cond, calleeFs},
+         static_cast<std::uint32_t>(ir::GuardKind::NullCheck), 0);
+  g.killNode(callerFs);
+  const ir::VerifyResult r = ir::verify(g);
+  CHECK(onlyDiagAbout(r, calleeFs));
 }

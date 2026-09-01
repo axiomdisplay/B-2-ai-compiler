@@ -383,10 +383,19 @@ diagnostics, never UB. Checks, in order:
 4. operand types per kind (Rule 33: mismatches are errors, never
    coercions);
 5. memory-chain continuity: every Mem input traces back to Start through
-   memory-state producers, cycle-free;
+   memory-state producers, cycle-free — where the one LEGAL cycle shape is
+   the loop backedge closure: an on-path revisit of a **LoopBegin-backed
+   memory Phi** (the header whose backedge value input chains through the
+   body producers back to the header) is skipped and the phi is proven
+   through its other inputs; a revisit of a Region-backed Phi or any
+   non-Phi node is a real cycle (MSG-20260901-004);
 6. guards/speculation: FrameState attached (Rule 5); Speculative nodes
    carry complete Rule 122 metadata incl. a valid dependency (Rule 42);
-7. FrameState caller chains acyclic; vobj entries are live
+7. FrameState caller chains acyclic AND every chain target resolves to a
+   live FrameState node (the chain reference is side-table data — a desc
+   id, not a use-def edge — so a killed target would otherwise pass
+   while its junked input edges no longer carry the caller-frame slots;
+   Rule 75, MSG-20260901-002); vobj entries are live
    VirtualObjectState nodes;
 8. PEA: materialization graphs acyclic; deopt-list closure; no
    still-virtual fields under Materialize;

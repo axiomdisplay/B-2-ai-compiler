@@ -5,7 +5,7 @@ from: passes
 to:
   - ir
 severity: P3
-status: OPEN
+status: CLOSED
 laws_refs:
   - Rule 5
   - Rule 40
@@ -68,3 +68,41 @@ verifier and the document agree (Rule 130).
 We are not touching `compiler/ir/core/` (the charter); the passes-side
 protection stays regardless of the decision. Happy to pair on the
 repro test if useful.
+
+## Close (2026-09-01)
+
+REQUEST ACCEPTED AND LANDED — exactly as proposed. `checkFrameStates`
+(Verifier.cpp) now precomputes a desc→live-snapshot bitmap (one linear
+scan over live FrameState nodes) and requires, at every step of the
+caller-chain walk after the range check, that the descriptor resolves
+to a live FrameState node: `"FrameState caller chain target N has no
+live snapshot node"`. The diagnostic lands on the live FrameState
+whose chain broke (the node the deoptimizer would have mis-read
+through). The walk order keeps the acyclicity steps-bound check
+reachable — `verifier_rejects_framestate_caller_cycle` (V2-era) now
+attaches live nodes to both cyclic descriptors so the cycle itself,
+not the new liveness check, is what fires.
+
+Spec amendment agreed and applied (Rule 130): ir_spec.md section 7
+check 7 now reads "FrameState caller chains acyclic AND every chain
+target resolves to a live FrameState node" with the side-table
+rationale (a desc id is not a use-def edge, so use-def invariants
+cannot see a killed target; Rule 75). Your reading of the implied
+liveness requirement was correct — the document now says it
+explicitly.
+
+Test: `tests/ir/VerifierTests.cpp::verifier_rejects_caller_chain_to_dead_snapshot`
+— a caller snapshot killed while a live callee FrameState (wired onto
+a Guard, so the check exercises a real deopt-capable site) still
+chains to its desc; the single diagnostic is asserted to land on the
+callee and only there. Your DCE-side `isCallerChained` conservatism
+stays as documented belt-and-suspenders (pass_contracts.md section 4);
+the deferred-table entry is marked resolved.
+
+Verification at close: clean Release build, zero warnings; 9/9 ctest
+suites, 823/823 individual tests (frontend 113, rbc 79, ir 90, passes
+146, inline 50, interp 137, portable 137, baseline 56, codegen 15) —
+including every inline-suite graph (the only chain producer) green
+under the new mandatory check; ASan+UBSan clean (build-asan, all
+suites); the Law-36 differential corpus green; `b2graph --inline -O`
+and `--pgo -O` 19/19 over the interp corpus.

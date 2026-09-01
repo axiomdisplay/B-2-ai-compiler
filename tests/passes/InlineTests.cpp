@@ -1323,12 +1323,10 @@ B2_TEST(il_quickened_payload_inline) {
 // Rule 122 SpecMeta + ClassHierarchy dependency, idempotency/
 // determinism, the refusal catalog, and the end-to-end T0 snapshot.
 //
-// NOTE ON PROGRAM SHAPES: the call sites here are STRAIGHT-LINE (no
-// memory producer inside a loop). A call inside a loop trips a
-// PRE-EXISTING IR-verifier false positive (the loop memory-phi backedge
-// reads as a "memory chain cycle"; reported as MSG-20260901-004) - a
-// verifier gap orthogonal to this engine, avoided here rather than
-// cross-team-fixed mid-task.
+// NOTE ON PROGRAM SHAPES: MSG-20260901-004 (the loop memory-phi backedge
+// read as a "memory chain cycle") landed its fix, so call-in-loop shapes
+// are back on the menu - see il_guard_call_in_loop_end_to_end, the
+// canonical dispatch-profile loop program that shape previously blocked.
 
 namespace {
 
@@ -1980,6 +1978,87 @@ B2_TEST(il_guard_end_to_end_t0_snapshot) {
 }
 
 // --- the corpus sweep (the strongest gate) ------------------------------------------
+
+B2_TEST(il_guard_call_in_loop_end_to_end) {
+  // THE MSG-20260901-004 unblock: the canonical dispatch-profile LOOP
+  // program (main { while (i < 3) sum += obj.bump(5); }). A call is a
+  // memory producer, so this shape previously could not build a
+  // VERIFIABLE graph at all - the header memory phi's backedge read as
+  // a "memory chain cycle". Now the full Phase 2 loop runs on it: T0
+  // trains inside the loop, the snapshot carries the (main, pc=6) row,
+  // and the call INSIDE the loop guard-inlines with everything green.
+  rbc::RbcBuilder mm("main", "()I", rbc::method_flags::Static);
+  mm.setRegs(6);
+  mm.setLocals(0);
+  const std::uint32_t cls = mm.constClass("Main");
+  const std::uint32_t bump = mm.constMethodRef("Main", "bump", "(I)I");
+  mm.emitRegCp(rbc::Op::New, 0, cls);
+  mm.emitRegImm(rbc::Op::Iconst, 1, 5);   // the bump argument
+  mm.emitRegImm(rbc::Op::Iconst, 2, 0);   // i
+  mm.emitRegImm(rbc::Op::Iconst, 3, 0);   // sum
+  mm.emitRegImm(rbc::Op::Iconst, 4, 3);   // the bound
+  const rbc::RbcBuilder::Label loop = mm.newLabel();
+  const rbc::RbcBuilder::Label done = mm.newLabel();
+  mm.bind(loop);
+  mm.emitRegRegBranch(rbc::Op::IfIcmpge, 2, 4, done);
+  mm.emitCall(rbc::Op::Invokevirtual, 5, 0, 2, bump); // pc=6, args (r0,r1)
+  mm.emitRegRegReg(rbc::Op::Iadd, 3, 3, 5);
+  mm.emitRegImm(rbc::Op::Iinc, 2, 1);
+  mm.emitBranch(rbc::Op::Goto, loop);
+  mm.bind(done);
+  mm.emitReg(rbc::Op::Ireturn, 3);
+  rbc::Method mainM;
+  CHECK(mm.finish(mainM).ok);
+
+  rbc::Program prog;
+  prog.className = "Main";
+  rbc::Method ms[] = {mainM, mkVirtBump()};
+  prog.methods.assign(ms, ms + 2);
+
+  // The T0 training run: 3 dispatches, each bump(5) = (5+1)/2 = 3, so
+  // the program returns 9 (a real execution, not just a status check).
+  b2::interp::Interpreter interp(prog, b2::interp::InterpConfig{});
+  const b2::interp::RunResult run =
+      interp.run("main", "()I", std::vector<b2::interp::Value>{});
+  CHECK(run.status == b2::interp::RunStatus::Returned);
+  CHECK(run.result.as.i == 9);
+
+  // The snapshot: the site row is (main=0, pc=6), mono Main -> bump (1).
+  passes::DispatchProfile prof;
+  passes::snapshotDispatchProfile(interp, prof);
+  CHECK(prof.sites.size() >= 1);
+  if (prof.sites.size() >= 1 && prof.sites[0].size() > 6) {
+    const passes::ProfileSite& s = prof.sites[0][6];
+    CHECK(s.kind == passes::ProfileSiteKind::Virtual);
+    CHECK(!s.megamorphic);
+    CHECK(s.count == 3);
+    CHECK(s.entries[0].recvClass == "Main");
+    CHECK(s.entries[0].target == 1);
+    CHECK(s.entries[0].count == 3);
+    CHECK(s.entries[1].count == 0);
+  }
+
+  // The graph: the call INSIDE the loop guard-inlines; the loop shape
+  // (LoopBegin + the header memory phi's backedge through the inlined
+  // body's producers) verifies end to end.
+  passes::InlineConfig cfg;
+  cfg.profile = &prof;
+  ir::Graph g;
+  passes::InlineResult r;
+  inlineOk(prog, 0, g, r, cfg);
+  CHECK(r.telemetry.sitesConsidered == 1);
+  CHECK(r.telemetry.sitesGuardInlined == 1);
+  CHECK(countAction(r, IA::GuardInline) == 1);
+  if (!r.decisions.empty()) {
+    CHECK(r.decisions[0].siteCount == 3);
+    CHECK(r.decisions[0].recvCount == 3);
+  }
+  CHECK(countKind(g, NodeKind::CallVirtual) == 0);
+  CHECK(typeProfileGuards(g).size() == 1);
+  CHECK(countKind(g, NodeKind::LoopBegin) == 1);
+  CHECK(chainedFsNodes(g).size() >= 1);
+  CHECK(verifyOk(g));
+}
 
 B2_TEST(il_corpus_sweep_all_programs_verified_deterministic) {
   const std::vector<std::string> files = {
