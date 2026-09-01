@@ -159,6 +159,19 @@ public:
                         FrameStateId caller = kInvalidFrameState,
                         std::initializer_list<VirtualObjectId> vobjs = {});
 
+  // MSG-20260901-006: append a virtual object to an EXISTING FrameState's
+  // deopt-materialization list. makeFrameState accepts a vobj list only at
+  // creation time; a pass that runs AFTER the builder (every optimization
+  // pass) can never use it. This API splices `vobj` into fsVobjs_ at the end
+  // of `fs`'s slice, grows that desc's vobjCount, and shifts the vobjOffset of
+  // every later desc by one (the flat vector insert moves their slices).
+  // Deterministic (Rule 124): pure insert at a computed position; FrameStateId
+  // space is unchanged; no serializer format change (the per-desc vobj list
+  // already round-trips). Out-of-range `fs` is a silent no-op (the structural
+  // verifier would reject a bogus desc id anyway). No new verifier checks:
+  // the existing FrameState closure check (ir_spec 7) validates the result.
+  void appendFrameStateVobj(FrameStateId fs, VirtualObjectId vobj);
+
   // PEA virtual objects (Part XVIII). Returns the VirtualObjectState node id
   // (the VirtualObjectId). Instance fields / array elements are the input
   // edges; the array's length is the FIRST input. Field values are NodeIds

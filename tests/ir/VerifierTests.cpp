@@ -9,6 +9,7 @@
 #include <b2/ir/Graph.h>
 #include <b2/ir/Node.h>
 #include <b2/ir/Printer.h>
+#include <b2/ir/Serialize.h>
 #include <b2/ir/Verifier.h>
 
 using namespace b2;
@@ -673,4 +674,126 @@ B2_TEST(verifier_accepts_long_straight_memory_chain) {
   g.make(NodeKind::Return, {start, ld});
   const ir::VerifyResult r = ir::verify(g);
   CHECK_MSG(r.ok, r.diags.empty() ? "" : r.diags[0].message);
+}
+
+// --- MSG-20260901-006: appendFrameStateVobj post-hoc vobj listing ------------------
+//
+// makeFrameState accepts a vobj list at creation time only; a pass that runs
+// AFTER the builder (every optimization pass) can never use it. The new
+// appendFrameStateVobj API splices a vobj into an existing descriptor's slice,
+// grows its count, and shifts later descriptors' offsets. These tests pin the
+// API contract: slice order, multi-desc offset repair, closure enforcement,
+// bounds safety, and serialize round-trip.
+
+B2_TEST(appendFrameStateVobj_appends_to_slice_and_verifies_clean) {
+  ir::Graph g;
+  const ir::NodeId a = g.constantI(1);
+  const ir::NodeId inner = g.makeVirtualObject(30, {a});
+  // Create a FrameState with NO vobjs, then append one post-hoc.
+  const ir::NodeId fsNode = g.makeFrameState(1, 4, {a});
+  const ir::FrameStateId fsDesc = g.node(fsNode).payload;
+  CHECK(g.frameStateVobjs(fsDesc).size() == 0);
+  g.appendFrameStateVobj(fsDesc, inner);
+  const auto vobjs = g.frameStateVobjs(fsDesc);
+  CHECK(vobjs.size() == 1);
+  CHECK(vobjs[0] == inner);
+  g.make(NodeKind::Return, {g.startNode()});
+  const ir::VerifyResult r = ir::verify(g);
+  CHECK_MSG(r.ok, r.diags.empty() ? "" : r.diags[0].message);
+}
+
+B2_TEST(appendFrameStateVobj_shifts_later_descs_offsets) {
+  ir::Graph g;
+  const ir::NodeId a = g.constantI(1);
+  const ir::NodeId b = g.constantI(2);
+  const ir::NodeId v0 = g.makeVirtualObject(30, {a});
+  const ir::NodeId v1 = g.makeVirtualObject(31, {b});
+  const ir::NodeId v2 = g.makeVirtualObject(32, {a});
+  const ir::NodeId v3 = g.makeVirtualObject(33, {b});
+  // fsA: 2 vobjs [v0, v1]; fsB: 1 vobj [v2].
+  const ir::NodeId fsA = g.makeFrameState(1, 4, {a}, ir::kInvalidFrameState,
+                                         {v0, v1});
+  const ir::NodeId fsB = g.makeFrameState(2, 8, {b}, ir::kInvalidFrameState,
+                                         {v2});
+  const ir::FrameStateId descA = g.node(fsA).payload;
+  const ir::FrameStateId descB = g.node(fsB).payload;
+  CHECK(g.frameStateVobjs(descA).size() == 2);
+  CHECK(g.frameStateVobjs(descB).size() == 1);
+  CHECK(g.frameStateVobjs(descB)[0] == v2);
+  // Append v3 to fsA: insertPos = descA.vobjOffset + 2 (end of A's slice).
+  g.appendFrameStateVobj(descA, v3);
+  // A's slice grew to 3: [v0, v1, v3] in order.
+  const auto aVobjs = g.frameStateVobjs(descA);
+  CHECK(aVobjs.size() == 3);
+  CHECK(aVobjs[0] == v0);
+  CHECK(aVobjs[1] == v1);
+  CHECK(aVobjs[2] == v3);
+  // B's slice content is unchanged ([v2]) — its offset shifted by 1 but
+  // the accessor resolves through the descriptor, so the slice is correct.
+  const auto bVobjs = g.frameStateVobjs(descB);
+  CHECK(bVobjs.size() == 1);
+  CHECK(bVobjs[0] == v2);
+  g.make(NodeKind::Return, {g.startNode()});
+  CHECK(ir::verify(g).ok);
+}
+
+B2_TEST(appendFrameStateVobj_closure_violation_still_rejected) {
+  ir::Graph g;
+  const ir::NodeId a = g.constantI(1);
+  const ir::NodeId b = g.constantI(2);
+  const ir::NodeId inner = g.makeVirtualObject(30, {a});
+  const ir::NodeId outer =
+      g.makeVirtualObject(31, {b, inner}); // outer references inner
+  // Create a FrameState with NO vobjs, then append ONLY outer. The closure
+  // check (ir_spec 7) must reject: inner is referenced by a field of the
+  // listed outer but is not listed itself.
+  const ir::NodeId fsNode = g.makeFrameState(1, 4, {a});
+  const ir::FrameStateId fsDesc = g.node(fsNode).payload;
+  g.appendFrameStateVobj(fsDesc, outer);
+  g.make(NodeKind::Return, {g.startNode()});
+  CHECK(!ir::verify(g).ok);
+}
+
+B2_TEST(appendFrameStateVobj_out_of_range_is_noop) {
+  ir::Graph g;
+  const ir::NodeId a = g.constantI(1);
+  const ir::NodeId v = g.makeVirtualObject(30, {a});
+  const ir::NodeId fsNode = g.makeFrameState(1, 4, {a});
+  const ir::FrameStateId fsDesc = g.node(fsNode).payload;
+  const std::uint32_t fsCountBefore = g.frameStateCount();
+  CHECK(g.frameStateVobjs(fsDesc).size() == 0);
+  // Bogus desc ids: no-op (no crash, no mutation).
+  g.appendFrameStateVobj(999, v);
+  g.appendFrameStateVobj(ir::kInvalidFrameState, v);
+  CHECK(g.frameStateCount() == fsCountBefore);
+  CHECK(g.frameStateVobjs(fsDesc).size() == 0);
+  g.make(NodeKind::Return, {g.startNode()});
+  CHECK(ir::verify(g).ok);
+}
+
+B2_TEST(appendFrameStateVobj_round_trips_through_serialize) {
+  ir::Graph g;
+  const ir::NodeId a = g.constantI(1);
+  const ir::NodeId b = g.constantI(2);
+  const ir::NodeId v0 = g.makeVirtualObject(30, {a});
+  const ir::NodeId v1 = g.makeVirtualObject(31, {b});
+  // Create fs with [v0], append v1 post-hoc -> [v0, v1].
+  const ir::NodeId fsNode =
+      g.makeFrameState(1, 4, {a}, ir::kInvalidFrameState, {v0});
+  const ir::FrameStateId fsDesc = g.node(fsNode).payload;
+  g.appendFrameStateVobj(fsDesc, v1);
+  g.make(NodeKind::Return, {g.startNode()});
+  CHECK(ir::verify(g).ok);
+  const std::vector<std::uint8_t> bytes = ir::serialize(g);
+  ir::Graph h;
+  const ir::DeserializeResult r = ir::deserializeInto(bytes, h);
+  CHECK_MSG(r.ok, r.error.message.c_str());
+  CHECK(ir::verify(h).ok);
+  CHECK(ir::print(h) == ir::print(g));
+  CHECK(ir::serialize(h) == bytes);
+  // The replayed graph's FrameState has the appended vobj in order.
+  const auto hVobjs = h.frameStateVobjs(fsDesc);
+  CHECK(hVobjs.size() == 2);
+  CHECK(hVobjs[0] == v0);
+  CHECK(hVobjs[1] == v1);
 }

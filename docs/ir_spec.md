@@ -334,6 +334,19 @@ The LOCAL VALUES ARE INPUT EDGES of the `FrameState` node. This is the
 soundness-critical choice (pinned by test): replacing a local's producer
 rewires every snapshot that captured it automatically.
 
+The vobj list is stored as a flat `fsVobjs_` vector; each descriptor owns a
+`[vobjOffset, vobjOffset + vobjCount)` slice. `makeFrameState` accepts a vobj
+list at creation time only. `appendFrameStateVobj(fs, vobj)` (MSG-20260901-006)
+splices a vobj into the END of an existing descriptor's slice, grows that
+descriptor's `vobjCount`, and shifts the `vobjOffset` of every later
+descriptor by one (the flat-vector insert moves their slices). Deterministic
+(Rule 124): the insert position is a pure function of the target descriptor's
+current `(vobjOffset, vobjCount)`; no reordering; FrameStateId space is
+unchanged; no serializer format change (the per-descriptor vobj list already
+round-trips). Out-of-range `fs` is a silent no-op. The existing FrameState
+closure check (section 7) validates the post-append result — a bogus append
+(e.g. listing an outer vobj whose inner is not listed) still rejects.
+
 ### 5.2 SpecMeta (Rule 122 — the complete mandatory field set)
 
 `kind` (ClassHierarchyStable, MethodFinal, TypeMonomorphic, TypeBimorphic,

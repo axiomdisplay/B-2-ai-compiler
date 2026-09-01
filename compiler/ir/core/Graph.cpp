@@ -133,6 +133,33 @@ FrameStateId Graph::addFrameStateDesc(MethodId method, std::uint32_t pc,
   return static_cast<FrameStateId>(fsDesc_.size() - 1);
 }
 
+// WHY: fsVobjs_ is a flat vector; each FrameStateDesc owns a [offset, +count)
+// slice. Appending to an existing desc's slice means a mid-vector insert, which
+// shifts every later element by one — so every later desc's vobjOffset must
+// shift by one too, or its slice would point at the wrong ids. fs's own offset
+// is unchanged (the new element lands at the END of its slice); only its count
+// grows. Determinism (Rule 124): the insert position is a pure function of fs's
+// current (offset, count); no reordering; desc ids are stable.
+void Graph::appendFrameStateVobj(FrameStateId fs, VirtualObjectId vobj) {
+  if (fs >= fsDesc_.size()) {
+    return; // out-of-range: no-op (verifier rejects bogus desc ids)
+  }
+  FrameStateDesc& d = fsDesc_[fs];
+  const std::uint32_t insertPos = d.vobjOffset + d.vobjCount;
+  fsVobjs_.insert(fsVobjs_.begin() + insertPos, vobj);
+  ++d.vobjCount;
+  // Shift every desc whose slice starts at or after the insert point. fs
+  // itself is skipped: its offset is unchanged, only its count grew.
+  for (FrameStateId i = 0; i < fsDesc_.size(); ++i) {
+    if (i == fs) {
+      continue;
+    }
+    if (fsDesc_[i].vobjOffset >= insertPos) {
+      ++fsDesc_[i].vobjOffset;
+    }
+  }
+}
+
 NodeId Graph::makeFrameState(MethodId method, std::uint32_t pc,
                              std::span<const NodeId> locals,
                              FrameStateId caller,
