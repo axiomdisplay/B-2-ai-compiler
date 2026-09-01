@@ -639,3 +639,38 @@ B2_TEST(verifier_rejects_caller_chain_to_dead_snapshot) {
   const ir::VerifyResult r = ir::verify(g);
   CHECK(onlyDiagAbout(r, calleeFs));
 }
+
+// --- MSG-20260901-007: memory-chain DFS step belt ----------------------------------
+//
+// checkMemoryChains walks the memory chain with an explicit DFS stack: each
+// visited node costs TWO while-iterations (one push-visit, one pop-visit), so
+// a well-formed acyclic chain of L producers costs ~2L steps. The old belt
+// was `nodeCount + 1`, which falsely tripped whenever `2L > nodeCount + 1`
+// (any chain longer than half the graph). The belt is now `2 * nodeCount + 2`.
+//
+// This test builds the minimal repro from the bug report: a fresh allocation
+// followed by 17 chained StoreFields and a Load that consumes the last
+// store's memory state (22 nodes; longest walk = 18 producers ~ 35 steps).
+// Under the old belt (23) the walk from the Load and the last several stores
+// each reported "memory chain walk exceeded graph size (cycle?)" on this
+// verifier-CLEAN acyclic graph. With the fix, it verifies clean.
+
+B2_TEST(verifier_accepts_long_straight_memory_chain) {
+  ir::Graph g;
+  const ir::NodeId start = g.startNode();
+  const ir::NodeId alloc = g.make(NodeKind::New, {start}, 3);
+  const ir::NodeId v = g.constantI(7);
+  // 17 chained stores: S1.mem = alloc, S2.mem = S1, ..., S17.mem = S16.
+  ir::NodeId prev = alloc;
+  for (int i = 0; i < 17; ++i) {
+    prev = g.make(NodeKind::StoreField, {start, prev, alloc, v},
+                  static_cast<std::uint32_t>(i + 1));
+  }
+  // The Load consumes S17's memory state (keeps the chain live) and walks
+  // back through all 17 stores + the New = 18 memory producers.
+  const ir::NodeId ld = g.make(NodeKind::LoadField, {start, prev, alloc}, 1,
+                               static_cast<std::uint32_t>(ir::IRType::Int));
+  g.make(NodeKind::Return, {start, ld});
+  const ir::VerifyResult r = ir::verify(g);
+  CHECK_MSG(r.ok, r.diags.empty() ? "" : r.diags[0].message);
+}

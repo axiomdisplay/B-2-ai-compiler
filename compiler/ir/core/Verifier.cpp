@@ -716,7 +716,16 @@ struct Verifier {
         onPath[stack.back().n] = generation;
       }
       std::uint32_t steps = 0;
-      const std::uint32_t maxSteps = g.nodeCount() + 1;
+      // MSG-20260901-007: the walk is a DFS with an explicit stack — each
+      // visited node costs TWO while-iterations (one when pushed/visited,
+      // one when popped after its children are proven). A well-formed
+      // acyclic chain of L memory producers therefore costs ~2L steps, so
+      // a belt of `nodeCount + 1` falsely trips whenever `2L > nodeCount + 1`
+      // (i.e. any chain longer than half the graph). Size the belt for the
+      // DFS: `2 * nodeCount + 2` admits any well-formed chain up to the
+      // full node count while still catching genuine cycles (a cycle
+      // exceeds any linear bound).
+      const std::uint32_t maxSteps = 2 * g.nodeCount() + 2;
       while (!stack.empty()) {
         if (steps++ > maxSteps) {
           diag(n, "memory chain walk exceeded graph size (cycle?)");
