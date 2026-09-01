@@ -19,6 +19,19 @@ These are the three designs, re-engineered for scalability without SMT.
 
 # 1. Cross-Method Region-Based Partial Escape Analysis (CM-PEA)
 
+```text
+Implementation status: LANDED (v1, keys 65/66/67/69).
+compiler/passes/src/Escape.cpp + tests/passes/EscapeTests.cpp +
+b2graph --pea. The height-6 lattice, the classification table, the
+escape-point materialization (Materialize wired into ctrl AND mem,
+FrameState locals auto-rebased via Rule 14), scalar replacement with
+mem-chain load forwarding, the Rule 45 cost gates, kill switches, and
+the decision log are live. The v1 scope gates and their growth paths
+(phi-of-stores, fs-vobj listing via the requested ir API, dynamic
+indices, EscapeSummary reuse across inline sites) are documented in
+docs/pass_contracts.md section 12.
+```
+
 ## Core Insight: Escape Is a Graph Property, Not a Solver Problem
 
 Escape analysis doesn't need SMT. It needs **reachability analysis on a finite graph**. The key innovation is making this analysis work *across inlined method boundaries* without global fixed-point iteration.

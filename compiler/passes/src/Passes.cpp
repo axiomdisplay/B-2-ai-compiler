@@ -76,6 +76,27 @@ constexpr PassInfo kRegistry[] = {
      "eligible set; replacement by the lowest id; FrameStates auto-update "
      "(Rule 14)",
      false, kDefaultPassRewriteBudget},
+    {PassKey::EscapeAnalysis, "escape",
+     "requires: verifier-clean post-inline graph (guards folded); "
+     "produces: every allocation classified on the height-6 escape "
+     "lattice with an explainable decision; analysis-only mode "
+     "rewrites nothing",
+     false, kDefaultPassRewriteBudget},
+    {PassKey::PartialEscapeAnalysis, "pea",
+     "requires: verifier-clean graph; produces: every partially-escaping "
+     "allocation materialized at its first escape use (Materialize wired "
+     "into ctrl AND mem; pre-escape loads still forward)",
+     true, kDefaultPassRewriteBudget},
+    {PassKey::ScalarReplacement, "scalar",
+     "requires: verifier-clean graph; produces: no-escape allocations "
+     "replaced by field values (loads forwarded, virtual stores "
+     "spliced out, IsNull folded, allocation killed)",
+     true, kDefaultPassRewriteBudget},
+    {PassKey::MaterializationPlanning, "matplan",
+     "requires: verifier-clean graph; produces: materialized objects "
+     "carry complete vobj snapshots (typed defaults for unread fields, "
+     "inner-first nested references)",
+     true, kDefaultPassRewriteBudget},
 };
 
 constexpr std::size_t kRegistrySize = sizeof(kRegistry) / sizeof(kRegistry[0]);
@@ -135,6 +156,24 @@ void runOne(PassKey key, ir::Graph& g, PassTelemetry& t, detail::Budget& b,
     return;
   case PassKey::GVN:
     detail::runGVN(g, t, b, jk);
+    return;
+  case PassKey::EscapeAnalysis:
+    // Analysis-only mode (key 65 in isolation): the classification and
+    // decision surface without any rewrite.
+    detail::runPEA(g, detail::kPeaAnalyze, t, b, jk, nullptr);
+    return;
+  case PassKey::PartialEscapeAnalysis:
+    detail::runPEA(g, detail::kPeaAnalyze | detail::kPeaPartial, t, b,
+                   jk, nullptr);
+    return;
+  case PassKey::ScalarReplacement:
+    detail::runPEA(g, detail::kPeaAnalyze | detail::kPeaScalar, t, b,
+                   jk, nullptr);
+    return;
+  case PassKey::MaterializationPlanning:
+    detail::runPEA(g, detail::kPeaAnalyze | detail::kPeaPartial |
+                           detail::kPeaPlanning,
+                   t, b, jk, nullptr);
     return;
   default:
     return; // unreachable via the dispatcher's deliverability check
@@ -234,6 +273,49 @@ PassResult runSinglePass(ir::Graph& g, PassKey key, const PassConfig& cfg) {
   }
   if (cfg.verifyAfterEachPass && !verifyInto(r, g, key)) {
     return r; // fail closed: diagnostics already recorded
+  }
+  return r;
+}
+
+PeaResult runPartialEscapeAnalysis(ir::Graph& g, const PassConfig& cfg) {
+  PeaResult r;
+  const std::uint32_t mask =
+      (cfg.isPassEnabled(PassKey::EscapeAnalysis) ? detail::kPeaAnalyze
+                                                 : 0u) |
+      (cfg.isPassEnabled(PassKey::PartialEscapeAnalysis) ? detail::kPeaPartial
+                                                        : 0u) |
+      (cfg.isPassEnabled(PassKey::ScalarReplacement) ? detail::kPeaScalar
+                                                    : 0u) |
+      (cfg.isPassEnabled(PassKey::MaterializationPlanning)
+           ? detail::kPeaPlanning
+           : 0u);
+  if (mask == 0) {
+    return r; // key 65 kill switch: the engine is a no-op
+  }
+  detail::Budget b{kDefaultPassRewriteBudget};
+  detail::Junk jk(g);
+  detail::runPEA(g, mask, r.telemetry, b, jk, &r.decisions);
+  if (b.exceeded) {
+    r.telemetry.budgetOverruns += 1;
+    r.telemetry.converged = false;
+    addDiag(r, PassKey::EscapeAnalysis,
+            "pea: rewrite budget exhausted (" +
+                std::to_string(kDefaultPassRewriteBudget) +
+                "); stopped at a valid point");
+  }
+  if (r.telemetry.peaRejected > 0 || r.telemetry.budgetOverruns > 0) {
+    // Not a failure: rejections are PEA Rule option 4 (sound refusal)
+    // and ride the decision log; the diag is the log-summary surface
+    // for pipeline-style callers that only read PassResult.
+    addDiag(r, PassKey::EscapeAnalysis,
+            "pea: " + std::to_string(r.telemetry.peaScalarized) +
+                " scalarized, " +
+                std::to_string(r.telemetry.peaMaterialized) +
+                " materialized, " + std::to_string(r.telemetry.peaRejected) +
+                " rejected");
+  }
+  if (cfg.verifyAfterEachPass && !verifyInto(r, g, PassKey::EscapeAnalysis)) {
+    return r; // fail closed
   }
   return r;
 }
@@ -339,6 +421,41 @@ PassResult runEarlyCleanup(ir::Graph& g, const PassConfig& cfg) {
     }
     if (!step(PassKey::GVN)) {
       return r;
+    }
+    // CM-PEA (keys 65/66/67/69 - one engine call, stage bits per key):
+    // runs after GVN (redundant loads are already merged) and after the
+    // guards on the allocations' uses were folded (nullfold/DCE), which
+    // is the precondition the engine documents. A disabled stage bit
+    // rejects that disposition (PEA Rule option 4), never half-applies.
+    {
+      const std::uint32_t peaMask =
+          (cfg.isPassEnabled(PassKey::EscapeAnalysis) ? detail::kPeaAnalyze
+                                                     : 0u) |
+          (cfg.isPassEnabled(PassKey::PartialEscapeAnalysis)
+               ? detail::kPeaPartial
+               : 0u) |
+          (cfg.isPassEnabled(PassKey::ScalarReplacement)
+               ? detail::kPeaScalar
+               : 0u) |
+          (cfg.isPassEnabled(PassKey::MaterializationPlanning)
+               ? detail::kPeaPlanning
+               : 0u);
+      if (peaMask != 0) {
+        detail::Budget b{kDefaultPassRewriteBudget};
+        detail::runPEA(g, peaMask, r.telemetry, b, jk, nullptr);
+        if (b.exceeded) {
+          r.telemetry.budgetOverruns += 1;
+          r.telemetry.converged = false;
+          addDiag(r, PassKey::EscapeAnalysis,
+                  "pea: rewrite budget exhausted (" +
+                      std::to_string(kDefaultPassRewriteBudget) +
+                      "); stopped at a valid point");
+        }
+        if (cfg.verifyAfterEachPass &&
+            !verifyInto(r, g, PassKey::EscapeAnalysis)) {
+          return r;
+        }
+      }
     }
     if (!step(PassKey::DeadCodeElimination)) {
       return r;

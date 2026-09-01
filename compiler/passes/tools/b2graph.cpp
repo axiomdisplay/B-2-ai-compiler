@@ -19,6 +19,17 @@
 // The training run's program output (stdout/stderr side effects) is
 // NOT part of this tool's output surface - the decision log is.
 //
+// --pea (CM-PEA, docs/special_passes.md section 1): run the partial
+// escape analysis engine after the build (and after --inline, which is
+// the cross-method half: the post-inline graph is where the merged
+// data flow lives) and print the per-allocation decision log - the
+// classification, the action (SCALARIZED / MATERIALIZED / REJECTED),
+// the refusal reason, and the profile-style numbers. The engine is
+// deterministic and fail-closed: the review surface never shows an
+// unverified graph. With -O the pipeline's own PEA stage (keys
+// 65/66/67/69) runs as usual - it is idempotent, so a --pea-processed
+// graph flows through with zero rewrites.
+//
 // Exit codes: 0 = all methods built and verified; 1 = any parse/verify/
 // build/IR-verify failure (diagnostics on stderr).
 
@@ -41,7 +52,7 @@
 namespace {
 
 int run(const b2::rbc::Program& prog, bool quiet, bool optimize, bool inl,
-        const b2::passes::DispatchProfile* profile) {
+        bool pea, const b2::passes::DispatchProfile* profile) {
   int failures = 0;
   for (std::size_t i = 0; i < prog.methods.size(); ++i) {
     const b2::rbc::Method& m = prog.methods[i];
@@ -137,6 +148,48 @@ int run(const b2::rbc::Program& prog, bool quiet, bool optimize, bool inl,
         }
       }
     }
+    if (pea) {
+      // CM-PEA decision log (docs/special_passes.md section 1): the
+      // per-allocation classification + disposition + reason, with the
+      // field/forwarding counts. Fail-closed like every other surface.
+      const b2::passes::PeaResult pr =
+          b2::passes::runPartialEscapeAnalysis(g);
+      if (!pr.ok) {
+        std::fprintf(stderr, "b2graph: PEA failed for %s:\n",
+                     m.name.c_str());
+        for (const b2::passes::PassDiag& d : pr.diags) {
+          std::fprintf(stderr, "  %s\n", d.message.c_str());
+        }
+        ++failures;
+        continue;
+      }
+      if (!quiet) {
+        std::printf("  # pea: scalarized=%u materialized=%u rejected=%u\n",
+                    pr.telemetry.peaScalarized,
+                    pr.telemetry.peaMaterialized,
+                    pr.telemetry.peaRejected);
+        for (const b2::passes::PeaDecision& d : pr.decisions) {
+          const char* kindName =
+              d.kind == b2::ir::NodeKind::New
+                  ? "New"
+                  : d.kind == b2::ir::NodeKind::NewArray ? "NewArray"
+                                                         : "NewRefArray";
+          if (d.materializeAt != b2::ir::kInvalidNodeId) {
+            std::printf("  # pea n%u (%s): %s (%s; %s; fields=%u loads=%u "
+                        "stores=%u at n%u)\n",
+                        d.alloc, kindName, d.action, d.reason,
+                        b2::passes::escapeStateName(d.state), d.fields,
+                        d.loads, d.stores, d.materializeAt);
+          } else {
+            std::printf("  # pea n%u (%s): %s (%s; %s; fields=%u loads=%u "
+                        "stores=%u)\n",
+                        d.alloc, kindName, d.action, d.reason,
+                        b2::passes::escapeStateName(d.state), d.fields,
+                        d.loads, d.stores);
+          }
+        }
+      }
+    }
     if (optimize) {
       // The early-cleanup + GVN pipeline (Rules 40/124: verified between
       // passes, deterministic). Fail-closed on any verification or
@@ -162,10 +215,12 @@ int run(const b2::rbc::Program& prog, bool quiet, bool optimize, bool inl,
       }
       if (!quiet) {
         std::printf("  # pipeline: rounds=%u rewrites=%u removals=%u "
-                    "folds=%u gvn=%u converged=%d\n",
+                    "folds=%u gvn=%u pea=%u/%u/%u converged=%d\n",
                     pr.telemetry.rounds, pr.telemetry.rewrites,
                     pr.telemetry.removals, pr.telemetry.folds,
-                    pr.telemetry.gvnDedups,
+                    pr.telemetry.gvnDedups, pr.telemetry.peaScalarized,
+                    pr.telemetry.peaMaterialized,
+                    pr.telemetry.peaRejected,
                     pr.telemetry.converged ? 1 : 0);
       }
     }
@@ -223,6 +278,7 @@ int main(int argc, char** argv) {
   bool optimize = false;
   bool inl = false;
   bool pgo = false;
+  bool pea = false;
   std::vector<std::string> files;
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
@@ -235,9 +291,11 @@ int main(int argc, char** argv) {
     } else if (arg == "--pgo") {
       pgo = true;
       inl = true; // the profile only has a consumer through the engine
+    } else if (arg == "--pea") {
+      pea = true;
     } else if (arg == "--help" || arg == "-h") {
       std::printf(
-          "usage: b2graph [--quiet] [-O] [--inline] [--pgo] file.rbc...\n"
+          "usage: b2graph [--quiet] [-O] [--inline] [--pgo] [--pea] file.rbc...\n"
           "  parse RBC text, verify, build every method's IR graph,\n"
           "  IR-verify, and print (the builder's debug surface)\n"
           "  --inline: run the ICDG inline engine before the pipeline\n"
@@ -251,9 +309,14 @@ int main(int argc, char** argv) {
           "      (Rule 122 SpecMeta + ClassHierarchy dependency; implies\n"
           "      --inline; the training run's program output is not part\n"
           "      of this tool's output)\n"
-          "  -O: run the early-cleanup + GVN pipeline after the build\n"
-          "      (verified between passes, deterministic; telemetry line\n"
-          "      per method)\n");
+          "  --pea: run the CM-PEA engine and print the per-allocation\n"
+          "      escape decision log (lattice grade, disposition, refusal\n"
+          "      reason, field/forwarding counts; docs/special_passes.md\n"
+          "      section 1; runs after --inline - the post-inline graph is\n"
+          "      the cross-method data flow)\n"
+          "  -O: run the early-cleanup + GVN + PEA pipeline after the\n"
+          "      build (verified between passes, deterministic; telemetry\n"
+          "      line per method)\n");
       return 0;
     } else {
       files.push_back(arg);
@@ -290,7 +353,7 @@ int main(int argc, char** argv) {
     if (pgo) {
       profile = trainAndSnapshot(*parsed, storage);
     }
-    failures += run(*parsed, quiet, optimize, inl, profile) == 0 ? 0 : 1;
+    failures += run(*parsed, quiet, optimize, inl, pea, profile) == 0 ? 0 : 1;
   }
   return failures == 0 ? 0 : 1;
 }

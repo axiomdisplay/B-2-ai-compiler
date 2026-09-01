@@ -10,9 +10,10 @@ If this document conflicts with docs/laws.md, laws.md wins.
 
 Team: Passes Team. Implementation: `compiler/passes/src/` (Passes.cpp
 registry/driver, PassSupport.cpp shared machinery, Simplify.cpp,
-ControlFlow.cpp, DCE.cpp, GVN.cpp), API `include/b2/passes/Passes.h`,
-tests `tests/passes/PassTests.cpp` (Rule 35: >= 10 tests per delivered
-pass key), tool surface `b2graph -O`.
+ControlFlow.cpp, DCE.cpp, GVN.cpp, Escape.cpp), API
+`include/b2/passes/Passes.h`, tests `tests/passes/PassTests.cpp` and
+`tests/passes/EscapeTests.cpp` (Rule 35: >= 10 tests per delivered
+pass key), tool surface `b2graph -O` / `b2graph --pea`.
 
 This document is the **rule-level review artifact** for the pass suite
 v1: every rewrite the passes may perform, the exact soundness argument,
@@ -36,13 +37,20 @@ lives in code (`passRegistry()`); this file is the prose contract.
 | 19 | branchnorm | control | constant-condition Ifs/Guards fold to the taken edge |
 | 20 | cfs | control | unreachable sweep + region repair |
 | 35 | gvn | scalar | structural global value numbering |
+| 65 | escape | pea | escape classification lattice + decision log (analysis-only) |
+| 66 | pea | pea | escape-point materialization (Materialize wired into both chains) |
+| 67 | scalar | pea | no-escape allocation replacement (loads forward, stores vanish) |
+| 69 | matplan | pea | vobj snapshots + nested materialization planning |
 
 Not delivered in v1: **17 (redundant cast removal)** — needs type proofs
 (CHA/hierarchy); `runSinglePass` refuses the key with a diagnostic. Items
 11-20 minus 17 and item 35 are the early-cleanup core; items 12-16 share
 one sweep engine (`runSimplify`) with a class mask so each key is
 independently kill-switchable while the pipeline runs them as one pass
-for cost.
+for cost. The CM-PEA family (65/66/67/69) is one engine (`Escape.cpp`)
+with four stage bits — each key is independently kill-switchable and a
+disabled stage REJECTS that disposition (PEA Rule option 4), never
+half-applies.
 
 **Rule 1 (one suite, two tiers)**: T2 Profile Mode and T3 Static Mode run
 the same list in the same order. Tier-specific filters arrive with the
@@ -61,11 +69,17 @@ round (max kMaxEarlyCleanupRounds = 3):
   cfs (20)
   dce (11)
   gvn (35)
-  dce (11)                 [post-GVN orphans]
+  pea (65|66|67|69, one engine call; stage bits per key)
+  dce (11)                 [post-PEA orphans + forwarded constants]
 stop when the round changed nothing (converged=true), or at the round
 budget while still changing (converged=false + telemetry diag: the graph
 is valid, the fixpoint is merely unconfirmed).
 ```
+
+PEA runs after GVN (redundant loads are already merged) and after the
+use guards were folded (nullfold + DCE) — that is the engine's documented
+precondition: live guards on the allocation's uses pin FrameStates into
+the locals, which would otherwise force `fs-deopt-ref` rejections.
 
 Every pass is independently kill-switchable (`PassConfig::setPassEnabled`,
 Rules 132/144); a disabled pass is a successful no-op. The graph verifier
@@ -291,3 +305,122 @@ surface (telemetry line per method).
 | CmpL-based long zero-guards | the MSG-009 resultTypeOf fix LANDED (CmpL now types Int, verified); the L2I composition stays the shipped v1 shape — sound (over-deopts only), tested, and byte-pinned by goldens; switching to the CmpL form is an optional passes-team cleanup |
 | Inlining registry rows (suite 21-34 speculation family) | profile import (icdg.md Phase 1) + Rule 1's tier-filter mechanism; the direct-inline driver itself is delivered (docs/inlining.md) |
 | ~~Inline verification of caller-chain fs liveness~~ | RESOLVED by the MSG-20260901-002 close: the IR verifier now requires every caller chain target to resolve to a live snapshot node (ir_spec 7 check 7); the DCE-side conservatism stays as belt-and-suspenders |
+
+---
+
+## 12. CM-PEA (keys 65/66/67/69 — one engine, special_passes.md section 1)
+
+**The disposition table (PEA Rule options 1-4).** Every live use of an
+allocation (`New`/`NewArray`/`NewRefArray`, id-ascending, at most
+`kPeaMaxAllocsPerGraph`) lands in a fixed classification table; the
+lattice value is the monotone join (max) of the use grades:
+
+| Use shape | Grade / disposition |
+|---|---|
+| `LoadField`/`LoadElem` obj slot (const idx) | reader (no escape) |
+| `StoreField`/`StoreElem` obj slot (const idx) | writer (no escape) |
+| `ArrayLength`, `IsNull` | length reader / never-null fold (floating, position-independent) |
+| the allocation as a ctrl/mem-chain predecessor | ChainLink: spliced onto the allocation's ctrl predecessor |
+| `VirtualObjectState` field edge | LocalEscape (`virtual-object-held`): the inner allocation stays real |
+| `Call*` Data slot | ArgEscape (`call-arg`): materialize at the call |
+| `Return` value | ReturnEscape (`return-escape`): materialize at the return |
+| `StoreField`/`StoreStatic`/`StoreElem` value slot | FieldEscape (`foreign-store`): materialize at the store |
+| `Load/StoreElem` non-const idx | dynamic-index: materialize at the access |
+| `RefEq`, `MonitorEnter/Exit` | REJECT `identity-observable` (Rule 73) |
+| `Unwind` exception | REJECT `exception-observable` |
+| live `FrameState` locals edge, fs-only | REJECT `fs-deopt-ref` (needs the ir append API — MSG-20260901-006) |
+| live `FrameState` locals edge + other escape | FOLLOWS the materialization (replaceNode rebases the locals edge onto the Materialize reference) |
+| `Phi` value input | REJECT `phi-merge` |
+| `CheckCast` / `InstanceOf` obj | REJECT `cast-observable` / `instanceof-observable` |
+| anything else | REJECT `unknown-use` (conservative default) |
+
+**SCALARIZED (key 67, NoEscape).** Readers forward BEFORE any writer is
+removed (the chain is then still complete, so every reader resolves to
+the store that defines its Java value — the nearest same-field/
+same-index store on the mem chain, else the typed default constant for
+never-written fields; the forwarded value must carry the load's declared
+type, a hand-built-graph defense). Writers splice out of BOTH chains
+(ctrl users onto the ctrl predecessor, mem users onto the mem
+predecessor). `ArrayLength` forwards the `NewArray` input-1 length;
+`IsNull(alloc)` folds to 0; the ChainLink users rewire onto the
+allocation's ctrl predecessor; the allocation is killed (kill refuses
+if any live referencer remains — reported as `partial-bail`, every
+landed rewrite being individually sound).
+
+**MATERIALIZED (keys 66/69, Arg/Field/ReturnEscape).** At the FIRST
+escape use E (id order == chain order in one straight segment):
+forward the pre-E readers, snapshot the vobj from E's pre-splice mem
+chain (typed defaults for unread fields; array layout `[length,
+elements...]`, unlisted slots materialize to their type default),
+splice the pre-E writers, re-read E's (rewired) ctrl/mem predecessors,
+insert `Materialize [ctrl, mem, vobj]`, rewire E's ctrl AND mem inputs
+onto it (the object state is published to the memory chain before any
+observer runs), splice the allocation out of the ctrl chain (so its
+downstream never rewires onto the escape-point Materialize — cycle
+prevention), then `replaceNode(alloc, Materialize)`: every remaining
+live user — later stores/loads, later escape uses, FrameState locals
+edges — reads the real reference (Rule 14 auto-updates the snapshots,
+so deopt reconstruction sees a live object). Post-escape accesses are
+KEPT as real-object semantics. Nested vobjs never occur in v1: a
+stored inner allocation is a foreign-store escape for the inner
+allocation, which is visited first (id order), so the outer snapshot's
+field value is already a Materialize reference or a rejected raw New —
+the verifier's still-virtual-field rule holds by construction.
+
+**The straight-segment gate (the v1 scope).** All PINNED rewriting uses
+must reach the allocation's ctrl input without crossing a
+Region/LoopBegin and with EQUAL branch-projection sets (the
+If/Switch projections collected on each path). Equal sets = one
+straight segment = "chain order == program order", which is exactly
+the condition under which the nearest-store lookup is the Java value;
+a merge between a store and its reader (or uses in sibling branches)
+rejects with `merge-crossed`. Floating readers (ArrayLength, IsNull) skip
+the gate — their rewrites cannot observe chain order. Cost gates
+(Rule 45): `kPeaMaxFields` (16) instance fields, `kPeaMaxArrayElems`
+(16) constant indices, `kPeaMaxAllocsPerGraph` (64) allocations —
+overruns REJECT (`too-many-fields`/`too-many-elems`), leaving the
+graph untouched.
+
+**Determinism / idempotency.** Allocations in id order, fields in
+FieldId order, escape uses by id, node creation in visit order
+(Rule 124); the hash-free engine is a fixed sequence of table lookups.
+A second run finds no live candidate (scalarized allocations are gone,
+materialized ones are Materialize nodes, rejected ones re-derive the
+same rejection without rewriting) — zero rewrites, byte-identical.
+
+**Kill switches.** 65 off: the whole engine is a no-op. 67 off:
+no-escape allocations REJECT `scalarize-disabled`. 66 or 69 off:
+escape-grade allocations REJECT `materialize-disabled`. Key 65 in
+isolation (runSinglePass) is the analysis-only mode: decisions carry
+the theoretical disposition, the graph and the telemetry counters
+stay untouched.
+
+**Tool surface.** `b2graph --pea` prints the per-allocation decision
+log (grade, disposition, refusal reason, field/load/store counts, the
+materialization node); `-O` runs the engine inside the pipeline with
+the telemetry line extended to `pea=<scalarized>/<materialized>/<
+rejected>`.
+
+**Testing (Rule 35).** 40 tests in `tests/passes/EscapeTests.cpp`:
+the classification table (12), the materialization shape and chain
+wiring (8, including the fs-edge auto-rebase and the nested inner-first
+end state), the scalar replacement (10, including typed defaults,
+chain splicing, branch-local lifetimes), kill switches (4),
+idempotency/determinism/no-op (4), and the integration gates (the
+19-program corpus through the full pipeline — verified, idempotent,
+byte-stable; the fields.rbc e2e pair: call-arg materialization without
+inlining, and the pinned `fs-deopt-ref` conservatism after inlining
+until MSG-20260901-006 lands).
+
+**Known v1 conservatisms (the growth paths).** (a) `fs-deopt-ref`:
+chained inlined snapshots reject the allocation — the ir append API
+(MSG-20260901-006) unlocks listing the vobj instead. (b) `phi-merge` /
+`merge-crossed`: field state SSA (phi-of-stores) arrives with the
+loop/merge growth path. (c) dynamic array indices materialize rather
+than speculate. (d) CheckCast/InstanceOf reject rather than fold.
+(e) Cross-inline-site EscapeSummary reuse (special_passes.md 1.2)
+arrives with the multi-caller path; v1 analyzes the merged post-inline
+directly, which is the same information. (f) The instance-field
+cost-gate test uses the array shape because the ir verifier's
+memory-chain DFS step belt false-positives on chains longer than half
+the graph (MSG-20260901-007).

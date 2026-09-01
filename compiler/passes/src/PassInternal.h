@@ -249,4 +249,24 @@ void runNullCheckFolding(ir::Graph& g, PassTelemetry& t, Budget& b,
 void runDCE(ir::Graph& g, PassTelemetry& t, Budget& b, const Junk& jk);
 void runGVN(ir::Graph& g, PassTelemetry& t, Budget& b, const Junk& jk);
 
+// --- CM-PEA engine (Escape.cpp; keys 65/66/67/69 share it) ------------------
+//
+// One engine, four registry stages (like the simplify class mask): the
+// mask bits are the four PassKeys so each stage is independently
+// kill-switchable. `decisions` collects the explainable per-allocation
+// record when non-null (the public runPartialEscapeAnalysis passes one;
+// the pipeline runs with nullptr and reads the telemetry counters).
+// PRECONDITION: verifier-clean graph (the null guards on the allocation's
+// uses must already be folded - the pipeline runs PEA after nullfold/DCE).
+enum PeaStage : std::uint32_t {
+  kPeaAnalyze = 1u << 0,   // key 65: classification + decision
+  kPeaPartial = 1u << 1,   // key 66: escape-point materialization
+  kPeaScalar = 1u << 2,    // key 67: virtual objects + load forwarding
+  kPeaPlanning = 1u << 3,  // key 69: vobj snapshots + nested cascades
+  kPeaAll = kPeaAnalyze | kPeaPartial | kPeaScalar | kPeaPlanning,
+};
+void runPEA(ir::Graph& g, std::uint32_t stageMask, PassTelemetry& t,
+            Budget& b, const Junk& jk,
+            std::vector<PeaDecision>* decisions);
+
 } // namespace b2::passes::detail

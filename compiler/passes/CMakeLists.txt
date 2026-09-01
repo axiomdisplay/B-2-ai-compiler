@@ -13,6 +13,7 @@ set(B2_PASSES_SOURCES
   src/DCE.cpp
   src/GVN.cpp
   src/Inline.cpp
+  src/Escape.cpp
 )
 
 add_library(b2_passes STATIC ${B2_PASSES_SOURCES})

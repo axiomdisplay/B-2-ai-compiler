@@ -36,9 +36,11 @@ namespace b2::passes {
 
 // Registry keys: the passes-team charter appendix numbering (stable and
 // normative for pass registry keys). v1 delivers the early-cleanup group
-// (11-20, minus 17: redundant-cast removal needs type proofs) and GVN.
-// Keys not delivered yet resolve to the bad registry row (passInfo().key
-// != key) and runSinglePass refuses them with a diagnostic.
+// (11-20, minus 17: redundant-cast removal needs type proofs), GVN, and
+// the CM-PEA family (65/66/67/69 - one engine, four stage keys; docs/
+// pass_contracts.md section 12 is the normative contract). Keys not
+// delivered yet resolve to the bad registry row (passInfo().key != key)
+// and runSinglePass refuses them with a diagnostic.
 enum class PassKey : std::uint16_t {
   DeadCodeElimination = 11,       // remove pure values with no live users
   TrivialBlockFusion = 12,        // single-pred regions + trivial phis
@@ -51,6 +53,10 @@ enum class PassKey : std::uint16_t {
   BranchNormalization = 19,       // constant If/Guard conditions
   ControlFlowSimplification = 20, // unreachable sweep + region repair
   GVN = 35,                       // structural global value numbering
+  EscapeAnalysis = 65,            // CM-PEA: escape classification lattice
+  PartialEscapeAnalysis = 66,     // CM-PEA: materialization placement
+  ScalarReplacement = 67,         // CM-PEA: virtual objects + forwarding
+  MaterializationPlanning = 69,   // CM-PEA: vobj snapshots + cascades
 };
 
 // Fixpoint budget (Rule 23): the early-cleanup group reruns while rewrites
@@ -63,6 +69,31 @@ inline constexpr std::uint32_t kMaxEarlyCleanupRounds = 3;
 // point and is reported through telemetry (Rule 26) - never UB, never a
 // half-applied rewrite.
 inline constexpr std::uint32_t kDefaultPassRewriteBudget = 200000;
+
+// --- CM-PEA cost model and analysis budgets (Rule 45 + special_passes.md
+// section 1.5: linear in IR size; every knob is a named constant, Law 23).
+// The cost gates exist so materialization never costs more than the
+// allocation it replaces (Rule 45: PEA materialization needs a cost model).
+
+// Instance fields per virtual object above which the allocation is
+// rejected: the materialization would copy more state than the
+// allocation it replaces.
+inline constexpr std::uint32_t kPeaMaxFields = 16;
+
+// Array elements (constant indices only) per virtual array object.
+inline constexpr std::uint32_t kPeaMaxArrayElems = 16;
+
+// Allocations analyzed per graph per run (the analysis budget; overrun
+// leaves the remaining allocations untouched - sound, reported).
+inline constexpr std::uint32_t kPeaMaxAllocsPerGraph = 64;
+
+// Nesting depth of the materialization cascade (vobj field holding
+// another vobj materializes inner-first; deeper nests are rejected).
+inline constexpr std::uint32_t kPeaMaxMaterializeDepth = 4;
+
+// Memory/ctrl chain walk step cap per lookup (belt: chains are verified
+// acyclic; this bounds pathological hand-built shapes).
+inline constexpr std::uint32_t kPeaMaxChainSteps = 10000;
 
 // Rule 123 contract row. `contract` is the one-line summary; the full
 // requires/produces/invalidates/budget/determinism text is the doc.
@@ -121,6 +152,9 @@ struct PassTelemetry {
   std::uint32_t gvnDedups = 0; // GVN replacements
   std::uint32_t rounds = 0;    // fixpoint rounds executed
   std::uint32_t budgetOverruns = 0;
+  std::uint32_t peaScalarized = 0;   // CM-PEA: allocations fully replaced
+  std::uint32_t peaMaterialized = 0; // CM-PEA: escape-point materializations
+  std::uint32_t peaRejected = 0;     // CM-PEA: refused allocations
   bool converged = true;       // false: stopped at the round budget while
                                // the graph was still changing
 };
@@ -153,5 +187,64 @@ struct PassResult {
 // refuse with a diagnostic; disabled keys are successful no-ops.
 [[nodiscard]] PassResult runSinglePass(ir::Graph& g, PassKey key,
                                        const PassConfig& cfg = {});
+
+// --- CM-PEA (docs/special_passes.md section 1; Part XVIII PEA Rule) ---------
+
+// The height-6 escape lattice (special_passes.md 1.1, verbatim semantics;
+// the numeric order IS the lattice order, so join == max). v1 computes it
+// by one monotone classification pass over the allocation's live uses -
+// conservative in the exact direction the lattice demands (any unknown
+// use publishes to Top). The intermediate grades feed the decision log;
+// v1 action selection treats every non-Bottom grade as materializable and
+// every Top-observable grade as rejected (the growth path applies
+// per-grade summaries across inline sites).
+enum class EscapeState : std::uint8_t {
+  NoEscape = 0,   // Bottom: never observable outside the virtual lifetime
+  LocalEscape = 1, // escapes to the caller's local scope only
+  ArgEscape = 2,  // escapes only through a callee argument
+  FieldEscape = 3, // escapes only through a receiver/other-object field
+  ReturnEscape = 4, // escapes only through the return value
+  GlobalEscape = 5,  // Top: heap/GC/native/reflection/identity observable
+};
+
+[[nodiscard]] constexpr const char* escapeStateName(EscapeState s) noexcept {
+  switch (s) {
+  case EscapeState::NoEscape: return "no-escape";
+  case EscapeState::LocalEscape: return "local-escape";
+  case EscapeState::ArgEscape: return "arg-escape";
+  case EscapeState::FieldEscape: return "field-escape";
+  case EscapeState::ReturnEscape: return "return-escape";
+  case EscapeState::GlobalEscape: return "global-escape";
+  default: return "?";
+  }
+}
+
+// One CM-PEA decision (the explainable surface: PEA Rule option 1-4 and
+// the refusal reason are part of the record, like InlineDecision).
+struct PeaDecision {
+  ir::NodeId alloc = ir::kInvalidNodeId; // the New/NewArray/NewRefArray
+  ir::NodeKind kind = ir::NodeKind::New;
+  EscapeState state = EscapeState::GlobalEscape;
+  const char* action = "rejected";  // scalarized | materialized | rejected
+  const char* reason = "";           // the refusal-catalog key
+  ir::NodeId materializeAt = ir::kInvalidNodeId; // the escape-point node
+  std::uint32_t fields = 0;    // instance fields / array slots involved
+  std::uint32_t loads = 0;     // loads forwarded to field values
+  std::uint32_t stores = 0;    // virtual stores removed
+};
+
+struct PeaResult : PassResult {
+  std::vector<PeaDecision> decisions; // in allocation-id order (Rule 124)
+};
+
+// Runs the CM-PEA engine over one graph (the four registry stages obey
+// the PassConfig kill switches: EscapeAnalysis off disables everything,
+// ScalarReplacement off downgrades no-escape allocations to rejected,
+// PartialEscapeAnalysis/MaterializationPlanning off downgrade material-
+// ization to rejected). PRECONDITION: verifier-clean graph. Returns the
+// per-allocation decisions plus pass-style telemetry; verification after
+// the run is the caller's (the pipeline does it per pass).
+[[nodiscard]] PeaResult runPartialEscapeAnalysis(ir::Graph& g,
+                                                  const PassConfig& cfg = {});
 
 } // namespace b2::passes
