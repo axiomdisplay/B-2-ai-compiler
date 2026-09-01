@@ -7,7 +7,7 @@ Normative reference: docs/laws.md
 If this document conflicts with `docs/laws.md`, `docs/laws.md` wins.
 ```
 
-Version: 1.1.0
+Version: 1.2.0
 Status: normative for all compiled tiers — `baseline_noir`, `ir`, `passes`, `regalloc`,
 `codegen`, and `aot` consume this contract; `docs/deopt_backend.md` Part A (canonical T0 state model) and
 `docs/stencils.md` §8 (T0-compatible T1 frames) are built on it.
@@ -17,7 +17,8 @@ deliverable 8): the prose twin of the frozen headers
 `include/b2/interp/{Value,Heap,Runtime,Frame,Interp}.h` (whose block comments pin the dispatch loop, call
 protocol, exception algorithm, quickened-opcode pins, and safepoint/profiling model) and of the landed
 `compiler/interp/src/{Heap,Runtime,Frame,Interp}.cpp`. Headers and document change together, never
-separately (§13); every behavioral claim is pinned by `tests/interp/` (125 tests plus a 14-program golden
+separately (§13); every behavioral claim is pinned by `tests/interp/` (137 tests including the
+§8.1 dispatch-profile suite, plus a 19-program golden
 corpus with exact-stdout fixtures). T0 is the baseline engine, the universal correctness fallback (Rule
 96), the reference implementation against the Java SE/JVM oracle (Rules 67, 133), and the deopt target of
 every compiled tier (Rules 4, 75; Amendment B.1); a defect here corrupts every tier above it, so the state
@@ -389,6 +390,42 @@ site key is **(caller MethodId, call pc)**.
   correlation) attaches to profile EXPORT (charter deliverable 9), which does not exist yet; raw v0
   counters carry counts only.
 
+### 8.1 The dispatch profile (ICDG Phase 1; v1.2.0)
+
+Per-call-site dispatch histograms — the raw data `docs/icdg.md` §7 names T0 the source of and §24
+Phase 1 requests (call-site profiling, receiver type profile, target stability). The interpreter team
+produces the data; the classification policy (dispatch-state scoring, GuardInline) belongs to the ICDG
+consumers (charter boundary: "the team produces the data, not the policy").
+
+- **Structures** (`include/b2/interp/Interp.h`, the code twin of this section): `DispatchSiteKind`
+  (Virtual/Interface/Special/Static), `DispatchSiteProfile {kind, megamorphic, count, entries[3]}`,
+  `DispatchEntry {recvClass, target, count}`. `kMaxDispatchProfileEntries = 3` (Rule 23): 1 observed
+  class = monomorphic, 2 = bimomorphic, 3 = polymorphic; the 4th distinct class sets the **sticky**
+  `megamorphic` flag and the entries freeze (the site total keeps counting) — the 1/2/3/∞ IC shape.
+- **Site key** = (caller MethodId, call pc) — the same key as the site ICs. Virtual/interface (both
+  forms) profile at the IC site id (quickened: `imm`); special/static profile at the pc (their `imm`
+  is a target id; no IC exists for them).
+- **What is counted**: every SUCCESSFUL dispatch — IC hit and miss paths alike. The hit path reads the
+  receiver's TRUE class (`heap().classOf`, one header read before the frame push; the IC's y slot is
+  last-miss data and may have drifted). Builtin-executed sites bump the site total only (sentinel
+  target: the callee is external, no RBC MethodId exists). Trapped calls (receiver NPE, missing method,
+  StackOverflow at the push) and `<clinit>` re-execution never dispatched and are not counted.
+  Static-resolution families (special/static) record one entry keyed by the resolved target with the
+  sentinel receiver class.
+- **Storage/laws**: `[MethodId][site]` vectors, lazily sized on first record (Rule 7 — the record path
+  is the only allocation site); saturating adds (Rule 114); always-on (tiering data, like
+  `Runtime`'s method profiles — NOT gated on `collectStats`); accumulates across `run()`/`resume()`
+  calls on one `Interpreter` instance (like `siteICs_`); deterministic by construction (Rule 124:
+  first-seen entry order, fixed update rules). v0 single-threaded; the future concurrent form is the
+  sanctioned racy-but-bounded one.
+- **Exposure**: `Interpreter::dispatchProfiles()` (read-only). Consumed by tests today; the Passes
+  team's ICDG ingestion (dispatch-state classification → GuardInline) is the documented consumer.
+  Observability only: no tier behavior reads it in v0, so Law-36 differentials stay byte-identical
+  (pinned: the 19-program corpus sweep and the full interp suite are unchanged by the profiling).
+- **invokedynamic/MethodHandle linkage tracking** (icdg.md Phase 1's remaining bullets) is vacuous in
+  v0 — `invokedynamic` traps at dispatch (rbc_spec.md §10.1) — and lands with the real bootstrap
+  machinery.
+
 ## 9. Safepoints
 
 - **Poll sites (Rule 88):** the `safepoint_poll` opcode (placed on loop backedges by lowering convention),
@@ -576,19 +613,23 @@ Consolidated honest list (each is tracked; none is a silent gap):
   where the dump pins "bot".
 - **Not yet built (charter, later deliverables):** superinstructions (deliverable 6, T1-side; the
   T0-side quickening seam is already executed — §7), profile export with
-  Rule 44 confidence metadata (deliverable 9). Computed-goto dispatch (§4) LANDED in v1.1.0.
+  Rule 44 confidence metadata (deliverable 9). Computed-goto dispatch (§4) LANDED in v1.1.0; the
+  per-site dispatch profile (§8.1, ICDG Phase 1) LANDED in v1.2.0.
 
 ## 13. Change control
 
-- This contract is versioned (this document is 1.1.0; v1.0.0 was the initial publication, v1.1.0 lands
-  the §4 computed-goto dispatch milestone — MSG-20260830-005). **Any change to §1 (the T0 frame), §2
+- This contract is versioned (this document is 1.2.0; v1.0.0 was the initial publication, v1.1.0 lands
+  the §4 computed-goto dispatch milestone — MSG-20260830-005; v1.2.0 lands the §8.1 dispatch profile —
+  ICDG Phase 1, additive observability, MSG-20260901-003). **Any change to §1 (the T0 frame), §2
   (the value model), §3 (the deopt entry contract), or §10 (the state-dump fixture format) requires a
   version bump and an ADVISORY to all consuming teams** (`baseline_noir`, `ir`, `passes`, `regalloc`,
   `codegen`, `aot`) under the message system (`docs/teams/messaging.md`, team key `all`): those
   sections define the state every tier must reconstruct and the fixture format every tier's deopt
   tests pin against. §4 (dispatch model) changes additionally require the portable differential test
   to pass unchanged (the two dispatchers must stay observationally identical — the §4 upgrade itself
-  is exactly such a change).
+  is exactly such a change). §8.1 (dispatch-profile) changes to the site key, the histogram capacity,
+  or the counting rules are ICDG-contract inputs and additionally RFC the passes team
+  (`docs/icdg.md` §23: no team unilaterally changes the ICDG contract).
 - **Quickened-id changes (§7) — global field offsets, MethodIds, or IC site ids from the real quickener —
   go through an RFC to this team** and bump the contract: the interim v0 encodings are not permanent.
 - `include/b2/interp/Interp.h` (and `Frame.h`'s dump-format block) are the code twins of this document;

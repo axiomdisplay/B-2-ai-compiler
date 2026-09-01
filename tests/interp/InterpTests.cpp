@@ -4103,4 +4103,617 @@ ireturn r0
   CHECK(fresh.result.as.i == 5);  // not 10: no cross-Runtime leakage
 }
 
+// ===========================================================================
+// ICDG Phase 1: the dispatch profile (Interp.h normative block; icdg.md
+// SS7/SS24). T0 produces the data - per-call-site receiver-class/target
+// histograms keyed (caller MethodId, call pc) - and these tests pin the
+// data contract: what is counted, the histogram order/capacity, the sticky
+// megamorphic flag, the quick/un-quickened site-key sharing, and the
+// never-counted paths (traps, SOE, builtins-as-entries).
+// ===========================================================================
+
+[[nodiscard]] const b2::interp::DispatchSiteProfile*
+dispatchProfileAt(const RunCtx& c, std::uint32_t mIdx, std::uint32_t site) {
+  if (!c.ok()) {
+    return nullptr; // parse failure already reported by the checks
+  }
+  const auto& dp = c.interp->dispatchProfiles();
+  if (mIdx >= dp.size() || site >= dp[mIdx].size()) {
+    return nullptr;
+  }
+  return dp[mIdx][site].count == 0 ? nullptr : &dp[mIdx][site];
+}
+
+[[nodiscard]] std::uint32_t methodIndexOf(const RunCtx& c,
+                                          std::string_view name) {
+  if (!c.ok()) {
+    return 0xFFFF'FFFFu; // parse failure already reported by the checks
+  }
+  for (std::uint32_t i = 0; i < c.program->methods.size(); ++i) {
+    if (c.program->methods[i].name == name) {
+      return i;
+    }
+  }
+  return 0xFFFF'FFFFu;
+}
+
+[[nodiscard]] std::uint32_t firstPcOf(const RunCtx& c, std::string_view method,
+                                      rbc::Op op) {
+  if (!c.ok()) {
+    return 0xFFFF'FFFFu; // parse failure already reported by the checks
+  }
+  for (const rbc::Method& m : c.program->methods) {
+    if (m.name == method) {
+      for (std::uint32_t pc = 0; pc < m.code.size(); ++pc) {
+        if (m.code[pc].opcode() == op) {
+          return pc;
+        }
+      }
+    }
+  }
+  return 0xFFFF'FFFFu;
+}
+
+B2_TEST(interp_dispatch_profile_virtual_miss_then_hit) {
+  // One virtual site executed exactly twice (IC miss, then hit): the profile
+  // counts BOTH dispatches, keyed by the receiver's TRUE class, with the
+  // resolved target - the monomorphic shape GuardInline will consume.
+  const RunCtx c = runProgram(R"RBC(.class Main
+.method static main ()I
+.regs 8
+.locals 3
+.const c0 = class "Main"
+.const c1 = method Main bump (I)I
+new r0 c0
+astore r0 l0
+iconst r1 0
+istore r1 l1
+iconst r1 0
+istore r1 l2
+Lloop:
+iload r1 l2
+iconst r2 2
+if_icmpge r1 r2 Ldone
+aload r3 l0
+iconst r4 5
+invokevirtual r5 r3 r2 c1
+istore r5 l1
+iload r6 l2
+iinc r6 1
+istore r6 l2
+goto Lloop
+Ldone:
+iload r0 l1
+ireturn r0
+.end
+.method bump (I)I
+.regs 3
+.locals 2
+iload r0 l1
+iconst r1 1
+iadd r2 r0 r1
+ireturn r2
+.end
+)RBC");
+  checkResultInt(c, 6, "profiled virtual site computes bump(5)+1 twice");
+  CHECK(c.ok() && c.result.stats.calls == 2);
+  const auto* p = dispatchProfileAt(
+      c, 0, firstPcOf(c, "main", rbc::Op::Invokevirtual));
+  CHECK(c.ok() && p != nullptr);
+  if (c.ok() && p != nullptr) {
+    CHECK(p->kind == b2::interp::DispatchSiteKind::Virtual);
+    CHECK(p->count == 2);
+    CHECK(!p->megamorphic);
+    CHECK(p->entries[0].count == 2);
+    CHECK(p->entries[0].recvClass == c.rt().findClass("Main").v);
+    CHECK(p->entries[0].target == methodIndexOf(c, "bump"));
+    CHECK(p->entries[1].count == 0);
+    CHECK(p->entries[2].count == 0);
+  }
+}
+
+B2_TEST(interp_dispatch_profile_virtual_null_receiver_not_counted) {
+  // A trapped call never dispatched: the receiver NPE precedes the cache and
+  // the profile alike (A2), so the site records NOTHING.
+  const RunCtx c = runProgram(R"RBC(.class Main
+.method static main ()I
+.regs 3
+.locals 0
+.const c0 = method Main bump (I)I
+aconst_null r0 0
+iconst r1 5
+invokevirtual r2 r0 r2 c0
+ireturn r2
+.end
+.method bump (I)I
+.regs 3
+.locals 2
+iload r0 l1
+iconst r1 1
+iadd r2 r0 r1
+ireturn r2
+.end
+)RBC");
+  checkThrew(c, "java/lang/NullPointerException", "",
+             "null receiver traps before the profile");
+  CHECK(c.ok() &&
+        dispatchProfileAt(c, 0, firstPcOf(c, "main", rbc::Op::Invokevirtual)) ==
+            nullptr);
+}
+
+B2_TEST(interp_dispatch_profile_missing_method_not_counted) {
+  // Resolution failure (NoSuchMethodError) is not a dispatch: no record.
+  const RunCtx c = runProgram(R"RBC(.class Main
+.method static main ()I
+.regs 3
+.locals 0
+.const c0 = class "Main"
+.const c1 = method Main nosuch (I)I
+new r0 c0
+iconst r1 5
+invokevirtual r2 r0 r2 c1
+ireturn r2
+.end
+)RBC");
+  checkThrew(c, "java/lang/NoSuchMethodError", "Main.nosuch(I)I",
+             "missing method traps before the profile");
+  CHECK(c.ok() &&
+        dispatchProfileAt(c, 0, firstPcOf(c, "main", rbc::Op::Invokevirtual)) ==
+            nullptr);
+}
+
+B2_TEST(interp_dispatch_profile_stack_overflow_not_counted) {
+  // The push failed (StackOverflowError), so no dispatch happened: the
+  // profile records nothing for the site.
+  b2::interp::InterpConfig cfg;
+  cfg.maxFrames = 1;
+  const RunCtx c = runProgram(R"RBC(.class Main
+.method static main ()I
+.regs 3
+.locals 0
+.const c0 = class "Main"
+.const c1 = method Main bump (I)I
+new r0 c0
+iconst r1 5
+invokevirtual r2 r0 r2 c1
+ireturn r2
+.end
+.method bump (I)I
+.regs 3
+.locals 2
+iload r0 l1
+iconst r1 1
+iadd r2 r0 r1
+ireturn r2
+.end
+)RBC", cfg);
+  checkThrew(c, "java/lang/StackOverflowError", "",
+             "frame-depth trap before the profile");
+  CHECK(c.ok() &&
+        dispatchProfileAt(c, 0, firstPcOf(c, "main", rbc::Op::Invokevirtual)) ==
+            nullptr);
+}
+
+B2_TEST(interp_dispatch_profile_bimorphic_two_receiver_classes) {
+  // v0 dispatch resolves by (name, descriptor), so one virtual site can be
+  // driven with receivers of DIFFERENT dynamic classes (a Main instance,
+  // then an int[]): two histogram entries in deterministic first-seen order
+  // (the bimorphic shape). The dispatch helper concentrates the site.
+  const RunCtx c = runProgram(R"RBC(.class Main
+.method static main ()I
+.regs 8
+.locals 2
+.const c0 = class "Main"
+.const c1 = method Main dispatch (Ljava/lang/Object;)I
+new r0 c0
+astore r0 l0
+iconst r1 0
+istore r1 l1
+iconst r2 3
+newarray r3 r2 10
+aload r4 l0
+invokestatic r5 r4 r1 c1
+istore r5 l1
+invokestatic r6 r3 r1 c1
+iload r7 l1
+iadd r7 r6 r7
+ireturn r7
+.end
+.method static dispatch (Ljava/lang/Object;)I
+.regs 4
+.locals 1
+.const c1 = method Main bump (I)I
+aload r2 l0
+iconst r3 5
+invokevirtual r0 r2 r2 c1
+ireturn r0
+.end
+.method bump (I)I
+.regs 3
+.locals 2
+iload r0 l1
+iconst r1 1
+iadd r2 r0 r1
+ireturn r2
+.end
+)RBC");
+  checkResultInt(c, 12, "dispatch(Main) + dispatch(int[]) both bump(5)+1");
+  const std::uint32_t dispatchIdx = methodIndexOf(c, "dispatch");
+  const auto* p = dispatchProfileAt(
+      c, dispatchIdx, firstPcOf(c, "dispatch", rbc::Op::Invokevirtual));
+  CHECK(c.ok() && p != nullptr);
+  if (c.ok() && p != nullptr) {
+    CHECK(p->kind == b2::interp::DispatchSiteKind::Virtual);
+    CHECK(p->count == 2);
+    CHECK(!p->megamorphic);
+    // First-seen order: Main (call 1), then the int-array class (call 2).
+    CHECK(p->entries[0].count == 1);
+    CHECK(p->entries[0].recvClass == c.rt().findClass("Main").v);
+    CHECK(p->entries[0].target == methodIndexOf(c, "bump"));
+    CHECK(p->entries[1].count == 1);
+    CHECK(p->entries[1].recvClass == c.rt().findClass("[I").v);
+    CHECK(p->entries[1].target == methodIndexOf(c, "bump"));
+    CHECK(p->entries[2].count == 0);
+  }
+}
+
+B2_TEST(interp_dispatch_profile_megamorphic_sticky_frozen) {
+  // Four DISTINCT receiver classes at one site: the 4th flips the sticky
+  // megamorphic flag WITHOUT writing an entry; a 5th dispatch (a repeat of
+  // the first class) still bumps the site total but leaves the histogram
+  // frozen - exactly the 1/2/3/inf IC shape the ICDG ingestion reads.
+  const RunCtx c = runProgram(R"RBC(.class Main
+.method static main ()I
+.regs 10
+.locals 3
+.const c0 = class "Main"
+.const c1 = method Main dispatch (Ljava/lang/Object;)I
+.const c2 = string "s"
+new r0 c0
+astore r0 l0
+iconst r1 0
+istore r1 l1
+iconst r2 2
+newarray r3 r2 10
+newarray r4 r2 11
+ldc r5 c2
+aload r6 l0
+invokestatic r7 r6 r1 c1
+iload r8 l1
+iadd r9 r7 r8
+istore r9 l1
+invokestatic r7 r3 r1 c1
+iload r8 l1
+iadd r9 r7 r8
+istore r9 l1
+invokestatic r7 r4 r1 c1
+iload r8 l1
+iadd r9 r7 r8
+istore r9 l1
+invokestatic r7 r5 r1 c1
+iload r8 l1
+iadd r9 r7 r8
+istore r9 l1
+aload r6 l0
+invokestatic r7 r6 r1 c1
+iload r8 l1
+iadd r9 r7 r8
+istore r9 l1
+iload r0 l1
+ireturn r0
+.end
+.method static dispatch (Ljava/lang/Object;)I
+.regs 4
+.locals 1
+.const c1 = method Main bump (I)I
+aload r2 l0
+iconst r3 5
+invokevirtual r0 r2 r2 c1
+ireturn r0
+.end
+.method bump (I)I
+.regs 3
+.locals 2
+iload r0 l1
+iconst r1 1
+iadd r2 r0 r1
+ireturn r2
+.end
+)RBC");
+  checkResultInt(c, 30, "five dispatches, each bump(5)+1");
+  const std::uint32_t dispatchIdx = methodIndexOf(c, "dispatch");
+  const auto* p = dispatchProfileAt(
+      c, dispatchIdx, firstPcOf(c, "dispatch", rbc::Op::Invokevirtual));
+  CHECK(c.ok() && p != nullptr);
+  if (c.ok() && p != nullptr) {
+    CHECK(p->count == 5);
+    CHECK(p->megamorphic);
+    // Frozen at the first three classes (Main, int[], long[]); the String
+    // receiver (4th) and the Main repeat (5th) wrote no entry.
+    CHECK(p->entries[0].recvClass == c.rt().findClass("Main").v);
+    CHECK(p->entries[0].count == 1);
+    CHECK(p->entries[1].recvClass == c.rt().findClass("[I").v);
+    CHECK(p->entries[1].count == 1);
+    CHECK(p->entries[2].recvClass == c.rt().findClass("[J").v);
+    CHECK(p->entries[2].count == 1);
+  }
+}
+
+B2_TEST(interp_dispatch_profile_quick_shares_site_key) {
+  // The quickened form profiles at imm (the IC site id, == the call pc on
+  // well-formed streams): a cold miss resolves through cp[imm] and a second
+  // execution hits - both counted at the SAME profile slot.
+  const RunCtx c = runProgram(R"RBC(.class Main
+.method static main ()I
+.regs 8
+.locals 3
+.const c0 = class "Main"
+.const c1 = int 0
+.const c2 = int 0
+.const c3 = int 0
+.const c4 = int 0
+.const c5 = int 0
+.const c6 = method Main bump (I)I
+iconst r0 2
+istore r0 l0
+new r1 c0
+astore r1 l1
+iconst r5 0
+istore r5 l2
+Lcall:
+aload r3 l1
+iconst r4 5
+invokevirtual_quick r5 r3 r2 6
+istore r5 l2
+iload r6 l0
+iinc r6 -1
+istore r6 l0
+ifne r6 Lcall
+iload r0 l2
+ireturn r0
+.end
+.method bump (I)I
+.regs 3
+.locals 2
+iload r0 l1
+iconst r1 1
+iadd r2 r0 r1
+ireturn r2
+.end
+)RBC");
+  checkResultInt(c, 6, "quickened virtual site via the IC");
+  CHECK(c.ok() && c.result.stats.calls == 2);
+  const auto* p = dispatchProfileAt(c, 0, 6);
+  CHECK(c.ok() && p != nullptr);
+  if (c.ok() && p != nullptr) {
+    CHECK(p->kind == b2::interp::DispatchSiteKind::Virtual);
+    CHECK(p->count == 2); // cold miss + hit, one site key (imm == pc)
+    CHECK(!p->megamorphic);
+    CHECK(p->entries[0].count == 2);
+    CHECK(p->entries[0].recvClass == c.rt().findClass("Main").v);
+    CHECK(p->entries[0].target == methodIndexOf(c, "bump"));
+  }
+}
+
+B2_TEST(interp_dispatch_profile_builtin_site_counts_total_only) {
+  // A builtin-executed site (println) dispatches to an EXTERNAL target:
+  // the site total counts, the receiver histogram stays empty (no RBC
+  // MethodId exists to name - the sentinel contract).
+  RunCtx c = runProgram(R"RBC(.class Main
+.method static main ()I
+.regs 5
+.locals 0
+.const c0 = field java/lang/System out Ljava/io/PrintStream;
+.const c1 = method java/io/PrintStream println (Ljava/lang/String;)V
+.const c2 = string "hi"
+getstatic r0 c0
+ldc r1 c2
+invokevirtual r2 r0 r2 c1
+iconst r3 0
+ireturn r3
+.end
+)RBC");
+  checkReturned(c, "println program returns");
+  CHECK(c.ok() && c.rt().stdout() == "hi\n");
+  const auto* p = dispatchProfileAt(
+      c, 0, firstPcOf(c, "main", rbc::Op::Invokevirtual));
+  CHECK(c.ok() && p != nullptr);
+  if (c.ok() && p != nullptr) {
+    CHECK(p->count == 1);
+    CHECK(p->entries[0].count == 0);
+    CHECK(p->entries[1].count == 0);
+    CHECK(p->entries[2].count == 0);
+    CHECK(!p->megamorphic);
+  }
+}
+
+B2_TEST(interp_dispatch_profile_static_site) {
+  // Two invokestatic instructions = two sites, each with ONE static-
+  // resolution entry (sentinel receiver class, resolved target).
+  const RunCtx c = runProgram(R"RBC(.class Main
+.method static main ()I
+.regs 6
+.locals 0
+.const c0 = method Main bump (I)I
+iconst r1 5
+invokestatic r2 r1 r1 c0
+iconst r3 5
+invokestatic r4 r3 r1 c0
+iadd r5 r2 r4
+ireturn r5
+.end
+.method static bump (I)I
+.regs 3
+.locals 1
+iload r0 l0
+iconst r1 1
+iadd r2 r0 r1
+ireturn r2
+.end
+)RBC");
+  checkResultInt(c, 12, "two static calls, each bump(5)+1");
+  const std::uint32_t bumpIdx = methodIndexOf(c, "bump");
+  const auto* p0 = dispatchProfileAt(
+      c, 0, firstPcOf(c, "main", rbc::Op::Invokestatic));
+  CHECK(c.ok() && p0 != nullptr);
+  if (c.ok() && p0 != nullptr) {
+    CHECK(p0->kind == b2::interp::DispatchSiteKind::Static);
+    CHECK(p0->count == 1);
+    CHECK(p0->entries[0].recvClass == b2::interp::kDispatchNoRecvClass);
+    CHECK(p0->entries[0].target == bumpIdx);
+    CHECK(p0->entries[0].count == 1);
+    CHECK(p0->entries[1].count == 0);
+  }
+  // The second invokestatic sits two pcs later (an iconst between them).
+  const auto* p1 = dispatchProfileAt(
+      c, 0, firstPcOf(c, "main", rbc::Op::Invokestatic) + 2);
+  CHECK(c.ok() && p1 != nullptr);
+  if (c.ok() && p1 != nullptr) {
+    CHECK(p1->kind == b2::interp::DispatchSiteKind::Static);
+    CHECK(p1->count == 1);
+    CHECK(p1->entries[0].target == bumpIdx);
+  }
+}
+
+B2_TEST(interp_dispatch_profile_special_site) {
+  // invokespecial is a static-resolution family too: one entry, sentinel
+  // receiver class, the resolved target.
+  const RunCtx c = runProgram(R"RBC(.class Main
+.method static main ()I
+.regs 3
+.locals 0
+.const c0 = class "Main"
+.const c1 = method Main get5 ()I
+new r0 c0
+invokespecial r1 r0 r1 c1
+ireturn r1
+.end
+.method get5 ()I
+.regs 2
+.locals 1
+iconst r1 5
+ireturn r1
+.end
+)RBC");
+  checkResultInt(c, 5, "invokespecial get5() on a fresh instance");
+  const auto* p = dispatchProfileAt(
+      c, 0, firstPcOf(c, "main", rbc::Op::Invokespecial));
+  CHECK(c.ok() && p != nullptr);
+  if (c.ok() && p != nullptr) {
+    CHECK(p->kind == b2::interp::DispatchSiteKind::Special);
+    CHECK(p->count == 1);
+    CHECK(p->entries[0].recvClass == b2::interp::kDispatchNoRecvClass);
+    CHECK(p->entries[0].target == methodIndexOf(c, "get5"));
+    CHECK(p->entries[0].count == 1);
+  }
+}
+
+B2_TEST(interp_dispatch_profile_interface_kind) {
+  // invokeinterface (InterfaceMethodRef) profiles with kind=Interface; in
+  // the v0 world it dispatches through the same merged handler.
+  const RunCtx c = runProgram(R"RBC(.class Main
+.method static main ()I
+.regs 8
+.locals 3
+.const c0 = class "Main"
+.const c1 = imethod Main bump (I)I
+new r0 c0
+astore r0 l0
+iconst r1 0
+istore r1 l1
+iconst r1 0
+istore r1 l2
+Lloop:
+iload r1 l2
+iconst r2 2
+if_icmpge r1 r2 Ldone
+aload r3 l0
+iconst r4 5
+invokeinterface r5 r3 r2 c1
+istore r5 l1
+iload r6 l2
+iinc r6 1
+istore r6 l2
+goto Lloop
+Ldone:
+iload r0 l1
+ireturn r0
+.end
+.method bump (I)I
+.regs 3
+.locals 2
+iload r0 l1
+iconst r1 1
+iadd r2 r0 r1
+ireturn r2
+.end
+)RBC");
+  checkResultInt(c, 6, "interface call site computes bump(5)+1 twice");
+  const auto* p = dispatchProfileAt(
+      c, 0, firstPcOf(c, "main", rbc::Op::Invokeinterface));
+  CHECK(c.ok() && p != nullptr);
+  if (c.ok() && p != nullptr) {
+    CHECK(p->kind == b2::interp::DispatchSiteKind::Interface);
+    CHECK(p->count == 2);
+    CHECK(p->entries[0].count == 2);
+    CHECK(p->entries[0].recvClass == c.rt().findClass("Main").v);
+    CHECK(p->entries[0].target == methodIndexOf(c, "bump"));
+  }
+}
+
+B2_TEST(interp_dispatch_profile_accumulates_across_runs) {
+  // The profile is Interpreter-instance state (like siteICs_): a second
+  // run() on the same interpreter doubles the site counts - the
+  // cross-invocation accumulation shape T2's future ingestion relies on.
+  const RunCtx c = runProgram(R"RBC(.class Main
+.method static main ()I
+.regs 8
+.locals 3
+.const c0 = class "Main"
+.const c1 = method Main bump (I)I
+new r0 c0
+astore r0 l0
+iconst r1 0
+istore r1 l1
+iconst r1 0
+istore r1 l2
+Lloop:
+iload r1 l2
+iconst r2 2
+if_icmpge r1 r2 Ldone
+aload r3 l0
+iconst r4 5
+invokevirtual r5 r3 r2 c1
+istore r5 l1
+iload r6 l2
+iinc r6 1
+istore r6 l2
+goto Lloop
+Ldone:
+iload r0 l1
+ireturn r0
+.end
+.method bump (I)I
+.regs 3
+.locals 2
+iload r0 l1
+iconst r1 1
+iadd r2 r0 r1
+ireturn r2
+.end
+)RBC");
+  checkResultInt(c, 6, "first run: bump(5)+1 twice");
+  const RunResult again = c.interp->run("main", "()I", {});
+  CHECK(again.status == RunStatus::Returned);
+  CHECK(again.result.as.i == 6);
+  const auto* p = dispatchProfileAt(
+      c, 0, firstPcOf(c, "main", rbc::Op::Invokevirtual));
+  CHECK(c.ok() && p != nullptr);
+  if (c.ok() && p != nullptr) {
+    CHECK(p->count == 4); // 2 dispatches per run, 2 runs, one interpreter
+    CHECK(p->entries[0].count == 4);
+    CHECK(!p->megamorphic);
+  }
+}
+
 }  // namespace

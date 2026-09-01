@@ -1128,6 +1128,16 @@ Build:
 
 This alone improves T1 stencil selection.
 
+**LANDED (MSG-20260901-003)**: the T0 side — per-call-site receiver-class/target
+histograms keyed (caller MethodId, call pc), bounded 3-entry + sticky
+megamorphic (the 1/2/3/inf shape), saturating, always-on, exposed read-only
+via `Interpreter::dispatchProfiles()` (contract:
+`docs/interp_contract.md` §8.1, v1.2.0; 12 tests in `tests/interp/`).
+invokedynamic/MethodHandle tracking is vacuous in v0 (traps at dispatch) and
+lands with the bootstrap machinery. The consumption side — dispatch-state
+classification, stability scoring, and the T1 stencil / T2 GuardInline
+decisions — is Phase 2's ingestion work over this data.
+
 ## Phase 2: ICDG core
 
 Build:

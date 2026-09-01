@@ -306,11 +306,13 @@ enum class StoreNarrow : std::uint8_t { None, Byte, Char, Short };
 // out.stats; frames_ is empty on every exit path (Returned pops the entry
 // frame; Threw unwinds it in THE EXCEPTION ALGORITHM).
 // ============================================================================
-template <typename SiteTable>
+template <typename SiteTable, typename DispatchTable>
 [[nodiscard]] RunStatus dispatchLoop(const rbc::Program& program,
                                      const InterpConfig& cfg, Runtime& rt,
                                      std::vector<Frame>& frames,
-                                     SiteTable& siteICs, RunResult& out) {
+                                     SiteTable& siteICs,
+                                     DispatchTable& dispatchProfiles,
+                                     RunResult& out) {
 
   // The program class, interned once: the only class that can own RBC
   // methods in the v0 one-class world, hence the only class whose <clinit>
@@ -502,6 +504,68 @@ template <typename SiteTable>
     entry.x = x;
     entry.y = y;
     entry.valid = true;
+  };
+
+  // --- ICDG Phase 1: the per-site dispatch profile (Interp.h block) --------
+  // Bumped on EVERY successful dispatch (hit and miss paths; the hit path
+  // reads the receiver's TRUE class - the IC y slot is last-miss data and
+  // may have drifted). Trapped calls (NPE/SOE/missing method) never
+  // dispatched and are not counted. Saturating (Rule 114), lazily sized
+  // (Rule 7), always-on tiering data. The sentinel recvClass marks the
+  // static-resolution families (one entry keyed by the target) and the
+  // sentinel target marks count-only records (builtin sites).
+  const auto recordDispatch = [&](std::uint32_t mIdx, std::uint32_t site,
+                                  DispatchSiteKind kind,
+                                  std::uint32_t recvClass,
+                                  std::uint32_t target) {
+    constexpr std::uint32_t kSat =
+        std::numeric_limits<std::uint32_t>::max();
+    if (dispatchProfiles.size() <= mIdx) {
+      dispatchProfiles.resize(mIdx + 1);
+    }
+    auto& perMethod = dispatchProfiles[mIdx];
+    if (perMethod.size() <= site) {
+      perMethod.resize(site + 1);
+    }
+    DispatchSiteProfile& p = perMethod[site];
+    p.kind = kind;
+    if (p.count != kSat) {
+      ++p.count; // saturating (Rule 114)
+    }
+    if (recvClass == kDispatchNoRecvClass) {
+      if (target == kDispatchNoTarget) {
+        return; // count-only: builtin-executed site (external target)
+      }
+      // Static-resolution family: one entry, keyed by the static target.
+      p.entries[0].recvClass = kDispatchNoRecvClass;
+      p.entries[0].target = target;
+      if (p.entries[0].count != kSat) {
+        ++p.entries[0].count; // saturating (Rule 114)
+      }
+      return;
+    }
+    if (!p.megamorphic) {
+      for (DispatchEntry& e : p.entries) {
+        if (e.count != 0 && e.recvClass == recvClass) {
+          e.target = target; // refresh (v0 resolution is stable; honest data)
+          if (e.count != kSat) {
+            ++e.count; // saturating (Rule 114)
+          }
+          return;
+        }
+      }
+      for (DispatchEntry& e : p.entries) {
+        if (e.count == 0) { // first observation of this receiver class
+          e.recvClass = recvClass;
+          e.target = target;
+          e.count = 1;
+          return;
+        }
+      }
+      // (kMaxDispatchProfileEntries + 1)-th distinct class: sticky flag,
+      // entries frozen (the total above keeps counting).
+      p.megamorphic = true;
+    }
   };
 
   // --- array element families (rbc_spec.md SS3.13) ----------------------------
@@ -2120,20 +2184,29 @@ b2_redispatch:
       }
       const rbc::Const& ref = fr.method->cp[ins.imm];
       const std::uint32_t mIdx = methodIndex(fr);
+      const std::uint32_t site = fr.pc; // profile/IC site key (Interp.h)
+      const DispatchSiteKind kind =
+          ins.opcode() == rbc::Op::Invokevirtual ? DispatchSiteKind::Virtual
+                                                 : DispatchSiteKind::Interface;
       bool hit = false;
       std::uint32_t cached = 0;
-      if (mIdx < siteICs.size() && fr.pc < siteICs[mIdx].size() &&
-          siteICs[mIdx][fr.pc].valid) {
+      if (mIdx < siteICs.size() && site < siteICs[mIdx].size() &&
+          siteICs[mIdx][site].valid) {
         hit = true;
-        cached = siteICs[mIdx][fr.pc].x;
+        cached = siteICs[mIdx][site].x;
       }
       if (hit) {
         if (cfg.collectStats) {
           ++out.stats.icHits;
         }
+        // The dispatch profile needs the receiver's TRUE class (the IC's y
+        // slot is last-miss data and may have drifted): one header read,
+        // BEFORE pushCall (fr/recv dangle after the push).
+        const std::uint32_t recvCls = rt.heap().classOf(recv.ref()).v;
         if (!pushCall(ins, MethodId{cached})) {
           return RunStatus::Threw;
         }
+        recordDispatch(mIdx, site, kind, recvCls, cached);
         B2_NEXT; // frames_ mutated: re-fetch, do not touch fr
       }
       if (cfg.collectStats) {
@@ -2156,7 +2229,10 @@ b2_redispatch:
         }
         // Builtin sites deliberately never fill the IC: the cache stores RBC
         // MethodIds and execBuiltin has none to store, so builtin call sites
-        // are permanent (cheap) misses - the profile still counts them.
+        // are permanent (cheap) misses - the profile still counts them
+        // (site total only: the target is external, Interp.h).
+        recordDispatch(mIdx, site, kind, kDispatchNoRecvClass,
+                       kDispatchNoTarget);
         ++fr.pc;
         B2_NEXT;
       }
@@ -2169,10 +2245,12 @@ b2_redispatch:
         }
         B2_NEXT;
       }
-      fillSiteIC(mIdx, fr.pc, target->v, rt.heap().classOf(recv.ref()).v);
+      const std::uint32_t recvCls = rt.heap().classOf(recv.ref()).v;
+      fillSiteIC(mIdx, site, target->v, recvCls);
       if (!pushCall(ins, *target)) {
         return RunStatus::Threw;
       }
+      recordDispatch(mIdx, site, kind, recvCls, target->v);
       B2_NEXT;
     }
 
@@ -2196,9 +2274,13 @@ b2_redispatch:
         }
         B2_NEXT;
       }
+      const std::uint32_t mIdx = methodIndex(fr);
+      const std::uint32_t site = fr.pc; // profile site key (Interp.h)
       if (!pushCall(ins, *target)) {
         return RunStatus::Threw;
       }
+      recordDispatch(mIdx, site, DispatchSiteKind::Special,
+                     kDispatchNoRecvClass, target->v);
       B2_NEXT;
     }
 
@@ -2222,9 +2304,13 @@ b2_redispatch:
       if (inited == InitFlow::PushedClinit) {
         B2_NEXT; // re-execute this invokestatic after <clinit>
       }
+      const std::uint32_t mIdx = methodIndex(fr);
+      const std::uint32_t site = fr.pc; // profile site key (Interp.h)
       if (!pushCall(ins, *target)) {
         return RunStatus::Threw;
       }
+      recordDispatch(mIdx, site, DispatchSiteKind::Static,
+                     kDispatchNoRecvClass, target->v);
       B2_NEXT;
     }
 
@@ -2257,6 +2343,10 @@ b2_redispatch:
         B2_NEXT;
       }
       const std::uint32_t mIdx = methodIndex(fr);
+      const DispatchSiteKind kind =
+          ins.opcode() == rbc::Op::InvokevirtualQuick
+              ? DispatchSiteKind::Virtual
+              : DispatchSiteKind::Interface;
       bool hit = false;
       std::uint32_t cached = 0;
       if (mIdx < siteICs.size() && ins.imm < siteICs[mIdx].size() &&
@@ -2268,9 +2358,13 @@ b2_redispatch:
         if (cfg.collectStats) {
           ++out.stats.icHits;
         }
+        // Same hit-path discipline as the un-quickened form: the TRUE
+        // receiver class, read before pushCall (fr/recv dangle after).
+        const std::uint32_t recvCls = rt.heap().classOf(recv.ref()).v;
         if (!pushCall(ins, MethodId{cached})) {
           return RunStatus::Threw;
         }
+        recordDispatch(mIdx, ins.imm, kind, recvCls, cached);
         B2_NEXT;
       }
       if (cfg.collectStats) {
@@ -2315,6 +2409,10 @@ b2_redispatch:
           }
           B2_NEXT;
         }
+        // Builtin sites never fill the IC (same pin as the un-quickened
+        // form); the profile counts the site total only.
+        recordDispatch(mIdx, ins.imm, kind, kDispatchNoRecvClass,
+                       kDispatchNoTarget);
         ++fr.pc;
         B2_NEXT;
       }
@@ -2325,10 +2423,12 @@ b2_redispatch:
         }
         B2_NEXT;
       }
-      fillSiteIC(mIdx, ins.imm, target->v, rt.heap().classOf(recv.ref()).v);
+      const std::uint32_t recvCls = rt.heap().classOf(recv.ref()).v;
+      fillSiteIC(mIdx, ins.imm, target->v, recvCls);
       if (!pushCall(ins, *target)) {
         return RunStatus::Threw;
       }
+      recordDispatch(mIdx, ins.imm, kind, recvCls, target->v);
       B2_NEXT;
     }
 
@@ -2350,9 +2450,13 @@ b2_redispatch:
         }
         B2_NEXT;
       }
+      const std::uint32_t mIdx = methodIndex(fr);
+      const std::uint32_t site = fr.pc; // profile site key (Interp.h)
       if (!pushCall(ins, MethodId{ins.imm})) {
         return RunStatus::Threw;
       }
+      recordDispatch(mIdx, site, DispatchSiteKind::Special,
+                     kDispatchNoRecvClass, ins.imm);
       B2_NEXT;
     }
 
@@ -2373,9 +2477,13 @@ b2_redispatch:
       if (inited == InitFlow::PushedClinit) {
         B2_NEXT; // re-execute after <clinit>
       }
+      const std::uint32_t mIdx = methodIndex(fr);
+      const std::uint32_t site = fr.pc; // profile site key (Interp.h)
       if (!pushCall(ins, MethodId{ins.imm})) {
         return RunStatus::Threw;
       }
+      recordDispatch(mIdx, site, DispatchSiteKind::Static,
+                     kDispatchNoRecvClass, ins.imm);
       B2_NEXT;
     }
 
@@ -2633,7 +2741,8 @@ RunResult Interpreter::run(std::string_view name,
       static_cast<std::uint32_t>(entry - program_.methods.data())});
 
   result.status =
-      dispatchLoop(program_, cfg_, rt_, frames_, siteICs_, result);
+      dispatchLoop(program_, cfg_, rt_, frames_, siteICs_, dispatchProfiles_,
+                   result);
   return finish(std::move(result));
 }
 
@@ -2701,7 +2810,8 @@ RunResult Interpreter::resume(Frame frame) {
   // dispatchLoop consumes a pendingException (exception deopt, Part A SS2.3)
   // by starting INSIDE the exception algorithm at the given pc.
   result.status =
-      dispatchLoop(program_, cfg_, rt_, frames_, siteICs_, result);
+      dispatchLoop(program_, cfg_, rt_, frames_, siteICs_, dispatchProfiles_,
+                   result);
   return finish(std::move(result));
 }
 

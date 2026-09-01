@@ -152,6 +152,44 @@
 // (Runtime::profiles). Stats are exposed per run for tier management and
 // Rule 133 differential harnesses; nothing in v0 acts on heat yet
 // (tiering arrives with T1).
+//
+// ===========================================================================
+// THE DISPATCH PROFILE (ICDG Phase 1, normative v1.2.0)
+// ===========================================================================
+// Per-call-site dispatch histograms (docs/icdg.md SS7 "T0 is the profile
+// source" and SS24 Phase 1: call-site profiling + receiver type profile +
+// target stability). T0 produces the DATA; the policy (dispatch-state
+// classification, stability scoring, GuardInline) belongs to the ICDG
+// consumers (charter: "the team produces the data, not the policy").
+//
+//   Site key: (caller MethodId, call pc) - the SAME key as the site ICs.
+//     invokevirtual/interface: the IC site id (the pc; quickened forms use
+//       imm, which equals the pc on well-formed streams, so quick and
+//       un-quickened forms of one site share profile state).
+//     invokespecial/invokestatic (and their quick forms): the pc (their
+//       imm is the target id, not a site id; there is no IC for them).
+//   What is counted: every SUCCESSFUL dispatch - IC hit and miss paths
+//     alike (the hit path reads the receiver's true class; the IC's y slot
+//     is last-miss data and may have drifted). Builtin-executed sites bump
+//     the site total only (the target is external: no RBC MethodId).
+//     Trapped calls (receiver NPE, missing method, StackOverflow) and
+//     <clinit> re-execution pushes never dispatched and are not counted.
+//   Receiver histogram: up to kMaxDispatchProfileEntries entries keyed by
+//     receiver ClassId, each carrying the resolved target and a saturating
+//     count. The (kMax+1)-th distinct receiver class sets the sticky
+//     megamorphic flag; entries freeze at that point (the total keeps
+//     counting). Static-resolution families (special/static) carry one
+//     entry keyed by the target with recvClass = kDispatchNoRecvClass.
+//   Storage: [MethodId][site] vectors, lazily sized on first record (Rule
+//     7); saturating adds (Rule 114); always-on (tiering data, like
+//     Runtime's MethodProfile bumps); accumulates across run()/resume()
+//     calls on one Interpreter instance (like siteICs_); deterministic by
+//     construction (Rule 124). v0 is single-threaded; the future
+//     concurrent form is the sanctioned racy-but-bounded one.
+//   Exposure: dispatchProfiles() is read-only observability for the ICDG
+//     ingestion (Passes), tier management, and tests; nothing in T0
+//     consumes it (Rule 119 observability, no behavior change - Law 36
+//     differentials stay byte-identical).
 
 #include <cstdint>
 #include <span>
@@ -165,6 +203,48 @@
 #include "b2/rbc/Verifier.h"
 
 namespace b2::interp {
+
+// --- dispatch profile (ICDG Phase 1; docs/icdg.md SS7/SS24) ------------------
+
+// The invoke family a profiled site belongs to (icdg.md CallKind reduced to
+// the v0 world: MethodHandle/InvokeDynamic/Native do not dispatch yet).
+enum class DispatchSiteKind : std::uint8_t {
+  Virtual,    // invokevirtual / invokevirtual_quick
+  Interface,  // invokeinterface / invokeinterface_quick
+  Special,    // invokespecial / invokespecial_quick (static resolution)
+  Static,     // invokestatic / invokestatic_quick (static resolution)
+};
+
+// Receiver-histogram capacity per site (Rule 23 named constant). 1 observed
+// class = monomorphic, 2 = bimorphic, 3 = polymorphic, the 4th distinct
+// class flips the sticky megamorphic flag (the 1/2/3/inf IC shape).
+inline constexpr std::size_t kMaxDispatchProfileEntries = 3;
+
+// Sentinel receiver class for static-resolution families (special/static:
+// the target does not depend on the receiver) and for count-only records
+// (builtin targets - no RBC MethodId exists to name).
+inline constexpr std::uint32_t kDispatchNoRecvClass = 0xFFFF'FFFFu;
+// Sentinel target id: the site total was counted but no RBC target was
+// resolved (builtin execution). Entries never carry it.
+inline constexpr std::uint32_t kDispatchNoTarget = 0xFFFF'FFFFu;
+
+// One receiver-class observation at one site (icdg.md SS4.3
+// DispatchCandidate's raw-data form: target, receiver class, counts).
+struct DispatchEntry {
+  std::uint32_t recvClass = kDispatchNoRecvClass; // ClassId.v (sentinel for
+                                                  // static-resolution entries)
+  std::uint32_t target = kDispatchNoTarget;       // MethodId.v
+  std::uint32_t count = 0;                        // saturating observations
+};
+
+// The per-site profile. `count` is the site heat; `entries` is the receiver
+// histogram (first-seen order, deterministic); `megamorphic` freezes it.
+struct DispatchSiteProfile {
+  DispatchSiteKind kind = DispatchSiteKind::Virtual;
+  bool megamorphic = false; // sticky: > kMaxDispatchProfileEntries classes
+  std::uint32_t count = 0;  // saturating successful dispatches at the site
+  DispatchEntry entries[kMaxDispatchProfileEntries];
+};
 
 struct InterpConfig {
   // Frame depth cap; pushing past this traps StackOverflowError (Java
@@ -238,6 +318,15 @@ public:
   } // empty outside run(); during trace hooks it is the live stack
   [[nodiscard]] const InterpConfig& config() const noexcept { return cfg_; }
 
+  // --- ICDG Phase 1: the dispatch profile (the header's normative block) ---
+  // [MethodId][site]; lazily sized per method on first record; accumulates
+  // across run()/resume() on this instance. Read-only observability: the
+  // classification policy lives with the ICDG consumers (Passes team).
+  [[nodiscard]] const std::vector<std::vector<DispatchSiteProfile>>&
+  dispatchProfiles() const noexcept {
+    return dispatchProfiles_;
+  }
+
   // Global safepoint request flag (Rule 111 bounded-latency handshake).
   // v0: nothing sets it except tests; a set flag makes every poll site
   // "park" - which in v0 means finishing the current instruction and
@@ -266,6 +355,7 @@ private:
   Runtime rt_;
   std::vector<Frame> frames_;
   std::vector<std::vector<SiteIC>> siteICs_; // [MethodId][pc]
+  std::vector<std::vector<DispatchSiteProfile>> dispatchProfiles_; // ICDG Ph1
   RunResult* result_ = nullptr; // active run's result (stats/trace sink)
 };
 
