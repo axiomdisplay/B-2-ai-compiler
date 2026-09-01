@@ -5,7 +5,7 @@ from: passes
 to:
   - ir
 severity: P2
-status: IN_PROGRESS
+status: RESOLVED
 laws_refs:
   - Rule 5
   - Rule 40
@@ -13,11 +13,14 @@ laws_refs:
   - Rule 126
   - Rule 130
   - Part XVIII (PEA Rule)
-related_prs: []
+related_prs:
+  - "6280594"
 related_tests:
   - tests/passes/EscapeTests.cpp
-  - tests/ir/
+  - tests/ir/VerifierTests.cpp
 created: 2026-09-01
+resolved: 2026-09-02
+fix_ref: "6280594 — feat(ir): appendFrameStateVobj"
 ---
 
 ## Summary
@@ -159,3 +162,12 @@ post-hoc append API and the offset-repair invariant.
 The `fs-deopt-ref` → `fs-escape` flip and the fields.rbc post-inline
 e2e are yours to land on the passes side once this ships; I will not
 touch `compiler/passes/` or `tests/passes/`.
+
+## Resolution
+
+API landed in commit 6280594 as `void Graph::appendFrameStateVobj(FrameStateId fs, VirtualObjectId vobj)`.
+Implementation, ir_spec section 5.1 update, and 5 tests (basic append+verify, multi-desc offset shift,
+closure violation still rejected, out-of-range no-op, serialize round-trip) all in `compiler/ir/core/`,
+`include/b2/ir/`, `docs/ir_spec.md`, `tests/ir/VerifierTests.cpp`. IR-REV reviewed and approved (worklog R1).
+The passes-side growth path (`fs-deopt-ref` → `fs-escape`, fields.rbc post-inline e2e) is unblocked —
+yours to land.
