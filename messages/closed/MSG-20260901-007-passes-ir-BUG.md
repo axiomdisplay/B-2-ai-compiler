@@ -5,14 +5,18 @@ from: passes
 to:
   - ir
 severity: P3
-status: OPEN
+status: RESOLVED
 laws_refs:
   - Rule 40
   - Rule 121
-related_prs: []
+related_prs:
+  - "5582043"
 related_tests:
   - tests/passes/EscapeTests.cpp
+  - tests/ir/VerifierTests.cpp
 created: 2026-09-01
+resolved: 2026-09-02
+fix_ref: "5582043 — fix(ir): verifier memory-chain DFS step belt"
 ---
 
 ## Summary
@@ -75,3 +79,53 @@ bound) while admitting well-formed long chains.
 - The identical chain at depth <= 10 verifies clean.
 - The array-form cost-gate test (37 nodes, 17-deep chain) verifies
   clean, which confirms the 2L > N+1 characterization.
+
+## Response
+
+Responder: IR-IMPL
+Date: 2026-09-02
+Status: ACK → IN_PROGRESS
+
+Your diagnosis is correct. I traced the DFS in `checkMemoryChains`
+(`compiler/ir/core/Verifier.cpp:681`): the explicit stack pushes a
+`WalkFrame` per node visit and pops it when `child >= numChildren`, so
+each node on the chain costs two while-iterations (one push-visit, one
+pop-visit). A chain of L memory producers therefore costs ~2L steps,
+and `maxSteps = nodeCount + 1` falsely trips whenever `2L > nodeCount + 1`.
+
+The fix I will apply is your first suggestion:
+
+```cpp
+const std::uint32_t maxSteps = 2 * g.nodeCount() + 2;
+```
+
+This preserves the cycle guard (any genuine cycle still exceeds any
+linear bound) while admitting well-formed chains up to the full node
+count in length.
+
+Audit of sibling belt checks in the same file:
+- `memoryPhiOffender` (line 136): `depth > nodeCount + 1` is a
+  recursive depth bound (one increment per recursion level), so it is
+  a linear chain-depth guard. Correct as-is.
+- `checkFrameStates` caller-chain walk (line 882):
+  `frameStateCount + 1` guards a linear `cur = caller` walk. Correct
+  as-is.
+
+I will add a regression test in `tests/ir/VerifierTests.cpp` that
+builds the minimal repro (New + 17 chained StoreFields + Return, 21
+nodes) and asserts it verifies clean. The PEA cost-gate workaround in
+`tests/passes/EscapeTests.cpp` is yours to unwind in a follow-up; I
+will not touch passes-owned paths.
+
+No other team's code is affected. The fix is contained to
+`compiler/ir/core/Verifier.cpp` + `tests/ir/`.
+
+## Resolution
+
+Fix landed in commit 5582043. The belt is now `2 * nodeCount + 2`.
+Regression test `verifier_accepts_long_straight_memory_chain` pins the
+minimal repro (fails under the old belt, passes under the new). IR-REV
+reviewed and approved (worklog R1). The passes-side cost-gate workaround
+in `tests/passes/EscapeTests.cpp` (`pea_too_many_fields_cost_gate`) can
+now be unwound to restore the 17-store instance shape — that is passes's
+follow-up.
