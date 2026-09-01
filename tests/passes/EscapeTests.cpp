@@ -285,11 +285,13 @@ B2_TEST(pea_phi_merge_rejected) {
   CHECK(verifyOk(g));
 }
 
-B2_TEST(pea_fs_only_reference_rejected) {
+B2_TEST(pea_fs_only_reference_scalarizes_with_listing) {
   StraightObject so;
   ir::Graph& g = so.g;
   // The allocation's ONLY escape-relevant use is a live FrameState
-  // consumed by a deopt point (an unconditional Deopt).
+  // consumed by a deopt point (an unconditional Deopt). The fs-escape
+  // listing (MSG-20260901-006): the allocation scalarizes, the fs's
+  // slot edges rebase onto a per-instant vobj, and the desc lists it.
   const ir::NodeId fs = g.makeFrameState(ir::MethodId{0}, 3,
                                          std::initializer_list<ir::NodeId>{
                                              so.alloc, so.alloc});
@@ -300,10 +302,311 @@ B2_TEST(pea_fs_only_reference_rejected) {
   CHECK(pr.ok);
   const passes::PeaDecision* d = findDecision(pr, so.alloc);
   CHECK(d != nullptr);
+  CHECK(std::strcmp(d->action, "scalarized") == 0);
+  CHECK(std::strcmp(d->reason, "fs-escape") == 0);
+  CHECK(pr.telemetry.peaScalarized == 1);
+  CHECK(countKind(g, NodeKind::New) == 0);
+  // One vobj, listed on the fs, carrying the store-visible field state
+  // (the deopt's instant is the load's mem chain: the store's 42).
+  const auto vobjs = nodesOfKind(g, NodeKind::VirtualObjectState);
+  CHECK(vobjs.size() == 1);
+  const ir::NodeId vo = vobjs[0];
+  CHECK(g.numInputs(vo) == 1);
+  CHECK(g.input(vo, 0) == so.c42);
+  // BOTH slot edges referencing the allocation rebased onto the vobj.
+  CHECK(g.input(fs, 0) == vo);
+  CHECK(g.input(fs, 1) == vo);
+  // The desc lists the vobj (the deopt-materialization channel).
+  const auto list = g.frameStateVobjs(g.node(fs).payload);
+  CHECK(list.size() == 1);
+  CHECK(list[0] == vo);
+  // The reader still forwarded (the load is gone); the deopt survives.
+  CHECK(countKind(g, NodeKind::LoadField) == 0);
+  CHECK(countKind(g, NodeKind::StoreField) == 0);
+  CHECK(countKind(g, NodeKind::Deopt) == 1);
+  CHECK(g.input(dpt, 1) == fs);
+  CHECK(verifyOk(g));
+}
+
+B2_TEST(pea_fs_escape_per_instant_values) {
+  StraightObject so;
+  ir::Graph& g = so.g;
+  // Two LIVE snapshots at different program points with a store
+  // between them: each is its own deopt point (its own call), so each
+  // gets its OWN vobj carrying the field state visible at that
+  // instant - fs1 sees 42, fs2 sees 9.
+  const ir::NodeId fs1 = g.makeFrameState(ir::MethodId{0}, 3,
+                                         std::initializer_list<ir::NodeId>{
+                                             so.alloc});
+  const ir::NodeId c0 = g.constantI(0);
+  const ir::NodeId call1 = g.make(NodeKind::CallStatic,
+                                  {so.load, so.store, c0, fs1},
+                                  ir::MethodId{1},
+                                  static_cast<std::uint32_t>(ir::IRType::Int));
+  const ir::NodeId c9 = g.constantI(9);
+  const ir::NodeId store2 = g.make(NodeKind::StoreField,
+                                   {call1, call1, so.alloc, c9},
+                                   ir::FieldId{3});
+  const ir::NodeId load2 = g.make(NodeKind::LoadField,
+                                  {store2, store2, so.alloc}, ir::FieldId{3},
+                                  static_cast<std::uint32_t>(ir::IRType::Int));
+  const ir::NodeId fs2 = g.makeFrameState(ir::MethodId{0}, 8,
+                                         std::initializer_list<ir::NodeId>{
+                                             so.alloc});
+  const ir::NodeId call2 = g.make(NodeKind::CallStatic,
+                                  {load2, store2, c0, fs2},
+                                  ir::MethodId{1},
+                                  static_cast<std::uint32_t>(ir::IRType::Int));
+  so.ret = g.make(NodeKind::Return, {call2, load2});
+  CHECK(verifyOk(g));
+  const passes::PeaResult pr = passes::runPartialEscapeAnalysis(g);
+  CHECK(pr.ok);
+  const passes::PeaDecision* d = findDecision(pr, so.alloc);
+  CHECK(d != nullptr);
+  CHECK(std::strcmp(d->action, "scalarized") == 0);
+  CHECK(std::strcmp(d->reason, "fs-escape") == 0);
+  CHECK(countKind(g, NodeKind::New) == 0);
+  const auto vobjs = nodesOfKind(g, NodeKind::VirtualObjectState);
+  CHECK(vobjs.size() == 2);
+  // fs1's instant (call1's mem = the first store) sees 42; fs2's
+  // (call2's mem = store2) sees 9.
+  CHECK(g.input(fs1, 0) == vobjs[0]);
+  CHECK(g.input(vobjs[0], 0) == so.c42);
+  CHECK(g.input(fs2, 0) == vobjs[1]);
+  CHECK(g.input(vobjs[1], 0) == c9);
+  // Each desc lists its own vobj.
+  CHECK(g.frameStateVobjs(g.node(fs1).payload).size() == 1);
+  CHECK(g.frameStateVobjs(g.node(fs1).payload)[0] == vobjs[0]);
+  CHECK(g.frameStateVobjs(g.node(fs2).payload)[0] == vobjs[1]);
+  // The readers forwarded: load -> 42, load2 -> 9; the spliced chain
+  // collapses (call2's ctrl rebases through the removed store2/load2
+  // onto call1).
+  CHECK(g.input(call2, 0) == call1);
+  CHECK(g.input(so.ret, 1) == c9);
+  CHECK(g.input(so.ret, 0) == call2);
+  CHECK(verifyOk(g));
+}
+
+B2_TEST(pea_fs_escape_instant_disagreement_rejected) {
+  StraightObject so;
+  ir::Graph& g = so.g;
+  // ONE snapshot consumed by both a guard (before the second store)
+  // and a call (after it): the two deopt points observe different
+  // field states, and one vobj cannot carry two states - refuse.
+  const ir::NodeId fs = g.makeFrameState(ir::MethodId{0}, 3,
+                                         std::initializer_list<ir::NodeId>{
+                                             so.alloc});
+  const ir::NodeId cond = g.make(NodeKind::IsNull, {so.alloc});
+  const ir::NodeId guard = g.make(
+      NodeKind::Guard, {so.load, cond, fs},
+      static_cast<std::uint32_t>(ir::GuardKind::NullCheck), 9u);
+  const ir::NodeId c0 = g.constantI(0);
+  const ir::NodeId c9 = g.constantI(9);
+  const ir::NodeId store2 = g.make(NodeKind::StoreField,
+                                   {guard, so.store, so.alloc, c9},
+                                   ir::FieldId{3});
+  const ir::NodeId call = g.make(NodeKind::CallStatic,
+                                 {store2, store2, c0, fs},
+                                 ir::MethodId{1},
+                                 static_cast<std::uint32_t>(ir::IRType::Int));
+  so.ret = g.make(NodeKind::Return, {call, c0});
+  CHECK(verifyOk(g));
+  const passes::PeaResult pr = passes::runPartialEscapeAnalysis(g);
+  CHECK(pr.ok);
+  const passes::PeaDecision* d = findDecision(pr, so.alloc);
+  CHECK(d != nullptr);
   CHECK(std::strcmp(d->action, "rejected") == 0);
-  CHECK(std::strcmp(d->reason, "fs-deopt-ref") == 0);
+  CHECK(std::strcmp(d->reason, "fs-multi-deopt") == 0);
+  CHECK(countKind(g, NodeKind::New) == 1);
+  CHECK(nodesOfKind(g, NodeKind::VirtualObjectState).empty());
+  CHECK(verifyOk(g));
+}
+
+B2_TEST(pea_fs_escape_chained_identity_shares_vobj) {
+  StraightObject so;
+  ir::Graph& g = so.g;
+  // The inlined shape: a LIVE callee snapshot (guard-consumed) chained
+  // to a userless caller snapshot, BOTH referencing the allocation.
+  // The frames reconstruct together at one instant - the same object
+  // in two frames - so they share ONE vobj (identity preserved).
+  const ir::NodeId callerFs = g.makeFrameState(
+      ir::MethodId{0}, 3, std::initializer_list<ir::NodeId>{so.alloc});
+  const ir::NodeId calleeFs = g.makeFrameState(
+      ir::MethodId{1}, 1, std::initializer_list<ir::NodeId>{so.alloc},
+      g.node(callerFs).payload);
+  const ir::NodeId cond = g.make(NodeKind::IsNull, {so.alloc});
+  const ir::NodeId guard = g.make(
+      NodeKind::Guard, {so.load, cond, calleeFs},
+      static_cast<std::uint32_t>(ir::GuardKind::NullCheck), 9u);
+  so.ret = g.make(NodeKind::Return, {guard, so.c42});
+  CHECK(verifyOk(g));
+  const passes::PeaResult pr = passes::runPartialEscapeAnalysis(g);
+  CHECK(pr.ok);
+  const passes::PeaDecision* d = findDecision(pr, so.alloc);
+  CHECK(d != nullptr);
+  CHECK(std::strcmp(d->action, "scalarized") == 0);
+  CHECK(std::strcmp(d->reason, "fs-escape") == 0);
+  CHECK(countKind(g, NodeKind::New) == 0);
+  // ONE vobj for both frames; the state is the guard's instant (the
+  // store's 42).
+  const auto vobjs = nodesOfKind(g, NodeKind::VirtualObjectState);
+  CHECK(vobjs.size() == 1);
+  const ir::NodeId vo = vobjs[0];
+  CHECK(g.numInputs(vo) == 1);
+  CHECK(g.input(vo, 0) == so.c42);
+  CHECK(g.input(calleeFs, 0) == vo);
+  CHECK(g.input(callerFs, 0) == vo);
+  CHECK(g.frameStateVobjs(g.node(calleeFs).payload).size() == 1);
+  CHECK(g.frameStateVobjs(g.node(callerFs).payload).size() == 1);
+  CHECK(g.frameStateVobjs(g.node(calleeFs).payload)[0] == vo);
+  CHECK(g.frameStateVobjs(g.node(callerFs).payload)[0] == vo);
+  CHECK(verifyOk(g));
+}
+
+B2_TEST(pea_fs_escape_array_snapshot) {
+  ir::Graph g;
+  const ir::NodeId start = g.startNode();
+  const ir::NodeId len = g.constantI(3);
+  const ir::NodeId alloc = g.make(NodeKind::NewArray, {start, len},
+                                  static_cast<std::uint32_t>(ir::IRType::Int));
+  const ir::NodeId c7 = g.constantI(7);
+  const ir::NodeId i1 = g.constantI(1);
+  const ir::NodeId store = g.make(NodeKind::StoreElem,
+                                  {alloc, start, alloc, i1, c7},
+                                  static_cast<std::uint32_t>(ir::IRType::Int));
+  const ir::NodeId load = g.make(NodeKind::LoadElem,
+                                 {store, store, alloc, i1},
+                                 static_cast<std::uint32_t>(ir::IRType::Int));
+  const ir::NodeId fs = g.makeFrameState(ir::MethodId{0}, 4,
+                                         std::initializer_list<ir::NodeId>{
+                                             alloc});
+  const ir::NodeId call = g.make(NodeKind::CallStatic,
+                                 {load, store, load, fs}, ir::MethodId{1},
+                                 static_cast<std::uint32_t>(ir::IRType::Int));
+  const ir::NodeId ret = g.make(NodeKind::Return, {call, load});
+  (void)ret;
+  CHECK(verifyOk(g));
+  const passes::PeaResult pr = passes::runPartialEscapeAnalysis(g);
+  CHECK(pr.ok);
+  const passes::PeaDecision* d = findDecision(pr, alloc);
+  CHECK(d != nullptr);
+  CHECK(std::strcmp(d->action, "scalarized") == 0);
+  CHECK(std::strcmp(d->reason, "fs-escape") == 0);
+  CHECK(countKind(g, NodeKind::NewArray) == 0);
+  // The array vobj: [length, elem0(default), elem1(7)]. The default
+  // is the plan's cached zero constant (constants are not interned -
+  // compare structurally).
+  const auto vobjs = nodesOfKind(g, NodeKind::VirtualObjectState);
+  CHECK(vobjs.size() == 1);
+  const ir::NodeId vo = vobjs[0];
+  CHECK(g.numInputs(vo) == 3);
+  CHECK(g.input(vo, 0) == len);
+  CHECK(g.node(g.input(vo, 1)).kind == NodeKind::ConstantI);
+  CHECK(g.node(g.input(vo, 1)).constValue == 0);
+  CHECK(g.input(vo, 2) == c7);
+  CHECK(g.input(fs, 0) == vo);
+  CHECK(g.frameStateVobjs(g.node(fs).payload).size() == 1);
+  CHECK(verifyOk(g));
+}
+
+B2_TEST(pea_fs_escape_unknown_consumer_rejected) {
+  StraightObject so;
+  ir::Graph& g = so.g;
+  // A snapshot consumed by a Phi (a legal Data input, but not a deopt
+  // point): the fs is not reconstructible there - refuse.
+  const ir::NodeId fs = g.makeFrameState(ir::MethodId{0}, 3,
+                                         std::initializer_list<ir::NodeId>{
+                                             so.alloc});
+  const ir::NodeId iff = g.make(NodeKind::If, {so.load, g.constantI(0)});
+  const ir::NodeId t = g.make(NodeKind::IfTrue, {iff});
+  const ir::NodeId f = g.make(NodeKind::IfFalse, {iff});
+  const ir::NodeId reg = g.make(NodeKind::Region, {t, f});
+  const ir::NodeId phi = g.make(NodeKind::Phi, {reg, fs, so.c42});
+  so.ret = g.make(NodeKind::Return, {reg, phi});
+  CHECK(verifyOk(g));
+  const passes::PeaResult pr = passes::runPartialEscapeAnalysis(g);
+  CHECK(pr.ok);
+  const passes::PeaDecision* d = findDecision(pr, so.alloc);
+  CHECK(d != nullptr);
+  CHECK(std::strcmp(d->action, "rejected") == 0);
+  CHECK(std::strcmp(d->reason, "fs-unknown-consumer") == 0);
   CHECK(countKind(g, NodeKind::New) == 1);
   CHECK(verifyOk(g));
+}
+
+B2_TEST(pea_fs_escape_kill_switch_refuses) {
+  StraightObject so;
+  ir::Graph& g = so.g;
+  const ir::NodeId fs = g.makeFrameState(ir::MethodId{0}, 3,
+                                         std::initializer_list<ir::NodeId>{
+                                             so.alloc});
+  const ir::NodeId dpt = g.make(NodeKind::Deopt, {so.load, fs}, 7u);
+  so.ret = dpt;
+  CHECK(verifyOk(g));
+  const auto before = ir::print(g);
+  passes::PassConfig cfg;
+  cfg.setPassEnabled(PK::ScalarReplacement, false);
+  const passes::PeaResult pr = passes::runPartialEscapeAnalysis(g, cfg);
+  CHECK(pr.ok);
+  const passes::PeaDecision* d = findDecision(pr, so.alloc);
+  CHECK(d != nullptr);
+  CHECK(std::strcmp(d->action, "rejected") == 0);
+  CHECK(std::strcmp(d->reason, "scalarize-disabled") == 0);
+  CHECK(countKind(g, NodeKind::New) == 1);
+  CHECK(ir::print(g) == before);
+  CHECK(verifyOk(g));
+}
+
+B2_TEST(pea_fs_escape_analysis_only_decides) {
+  StraightObject so;
+  ir::Graph& g = so.g;
+  const ir::NodeId fs = g.makeFrameState(ir::MethodId{0}, 3,
+                                         std::initializer_list<ir::NodeId>{
+                                             so.alloc});
+  const ir::NodeId dpt = g.make(NodeKind::Deopt, {so.load, fs}, 7u);
+  so.ret = dpt;
+  CHECK(verifyOk(g));
+  const auto before = ir::print(g);
+  const passes::PassResult r = passes::runSinglePass(g, PK::EscapeAnalysis);
+  CHECK(r.ok);
+  CHECK(r.telemetry.rewrites == 0);
+  CHECK(r.telemetry.removals == 0);
+  CHECK(r.telemetry.peaScalarized == 0);
+  CHECK(ir::print(g) == before);
+  CHECK(verifyOk(g));
+}
+
+B2_TEST(pea_fs_escape_idempotent_and_deterministic) {
+  // Build the same graph twice; both runs scalarize with the SAME
+  // listing (byte-identical dumps); a second engine run on the
+  // rewritten graph performs zero rewrites.
+  const auto build = [](StraightObject& so) {
+    ir::Graph& g = so.g;
+    const ir::NodeId fs = g.makeFrameState(
+        ir::MethodId{0}, 3, std::initializer_list<ir::NodeId>{so.alloc});
+    const ir::NodeId dpt = g.make(NodeKind::Deopt, {so.load, fs}, 7u);
+    so.ret = dpt;
+  };
+  StraightObject a;
+  build(a);
+  CHECK(verifyOk(a.g));
+  const passes::PeaResult pr1 = passes::runPartialEscapeAnalysis(a.g);
+  CHECK(pr1.ok);
+  CHECK(pr1.telemetry.peaScalarized == 1);
+  const std::string dump1 = ir::print(a.g);
+  StraightObject b;
+  build(b);
+  const passes::PeaResult pr2 = passes::runPartialEscapeAnalysis(b.g);
+  CHECK(pr2.ok);
+  CHECK(pr2.telemetry.peaScalarized == 1);
+  CHECK(ir::print(b.g) == dump1); // determinism (Rule 124)
+  const passes::PeaResult pr3 = passes::runPartialEscapeAnalysis(a.g);
+  CHECK(pr3.ok);
+  CHECK(pr3.telemetry.peaScalarized == 0); // idempotent: no candidates
+  CHECK(pr3.telemetry.rewrites == 0);
+  CHECK(ir::print(a.g) == dump1);
+  CHECK(verifyOk(a.g));
+  CHECK(verifyOk(b.g));
 }
 
 B2_TEST(pea_unknown_use_rejected) {
@@ -556,11 +859,41 @@ B2_TEST(pea_scalar_merge_crossed_rejected) {
 }
 
 B2_TEST(pea_too_many_fields_cost_gate) {
-  // kPeaMaxArrayElems + 1 distinct constant indices: the cost gate
-  // (Rule 45) rejects rather than plan a fat array snapshot. (The
-  // instance-field shape - 17 chained stores - also trips the ir
-  // verifier's memory-chain DFS step belt on small graphs, which is
-  // reported to the ir team; the array shape pins the same gate.)
+  // kPeaMaxFields + 1 distinct fields (17 chained stores): the cost
+  // gate (Rule 45) rejects rather than plan a fat snapshot. The
+  // instance-field shape is the gate's real target - it was pinned via
+  // the array shape in v1 because the ir verifier's memory-chain DFS
+  // step belt false-positived on chains longer than half the graph
+  // (MSG-20260901-007, fixed by the ir team); the belt now admits
+  // well-formed long chains, so the instance shape is restored as the
+  // primary gate and the array shape stays as its companion below.
+  ir::Graph g;
+  const ir::NodeId start = g.startNode();
+  const ir::NodeId alloc = g.make(NodeKind::New, {start}, ir::TypeId{5});
+  ir::NodeId ctrl = alloc;
+  ir::NodeId mem = start;
+  const ir::NodeId c1 = g.constantI(1);
+  for (std::uint32_t f = 0; f <= passes::kPeaMaxFields; ++f) {
+    ctrl = g.make(NodeKind::StoreField,
+                  {ctrl, mem, alloc, c1}, ir::FieldId{f});
+    mem = ctrl;
+  }
+  const ir::NodeId ret = g.make(NodeKind::Return, {ctrl, c1});
+  (void)ret;
+  CHECK(verifyOk(g));
+  const passes::PeaResult pr = passes::runPartialEscapeAnalysis(g);
+  CHECK(pr.ok);
+  const passes::PeaDecision* d = findDecision(pr, alloc);
+  CHECK(d != nullptr);
+  CHECK(std::strcmp(d->action, "rejected") == 0);
+  CHECK(std::strcmp(d->reason, "too-many-fields") == 0);
+  CHECK(countKind(g, NodeKind::New) == 1);
+  CHECK(verifyOk(g));
+}
+
+B2_TEST(pea_too_many_elems_cost_gate) {
+  // kPeaMaxArrayElems + 1 distinct constant indices: the array twin
+  // of the field cost gate (Rule 45).
   ir::Graph g;
   const ir::NodeId start = g.startNode();
   const ir::NodeId len = g.constantI(static_cast<std::int32_t>(
@@ -1067,13 +1400,16 @@ B2_TEST(pea_fields_rbc_materializes_call_arg_e2e) {
   CHECK(verifyOk(g));
 }
 
-B2_TEST(pea_fields_rbc_inline_keeps_chained_fs_conservative) {
+B2_TEST(pea_fields_rbc_inline_fs_escape_zero_allocations) {
   // After inlining, the call-site FrameStates become chained snapshots
   // (side-table caller references, no live edge consumers): the
-  // allocation's only escape-relevant use has no materialization point
-  // to rewire, so v1 rejects with fs-deopt-ref. This pins the CONSERVATIVE
-  // v1 behavior - the fs-vobj append API requested from the ir team
-  // (messages/) is the unlock for full post-inline scalarization.
+  // allocation's deopt-relevant uses are those snapshots plus the
+  // reader/writer pairs of the inlined bodies. The fs-escape listing
+  // (MSG-20260901-006): the deopt-unreachable chained snapshots share
+  // one final-state vobj, main's own live println snapshot gets its
+  // per-instant vobj, and the allocation SCALARIZES TO ZERO - the
+  // post-inline end state the ICDG inline engine + CM-PEA were built
+  // to reach.
   const std::string path = "tests/interp/corpus/fields.rbc";
   std::ifstream in(path);
   CHECK(static_cast<bool>(in));
@@ -1109,8 +1445,43 @@ B2_TEST(pea_fields_rbc_inline_keeps_chained_fs_conservative) {
     }
   }
   CHECK(d != nullptr);
-  CHECK(std::strcmp(d->action, "rejected") == 0);
-  CHECK(std::strcmp(d->reason, "fs-deopt-ref") == 0);
-  CHECK(countKind(g, NodeKind::New) == 1);
+  CHECK(std::strcmp(d->action, "scalarized") == 0);
+  CHECK(std::strcmp(d->reason, "fs-escape") == 0);
+  CHECK(pr.telemetry.peaScalarized == 1);
+  // Zero allocations: the New is gone, no Materialize was needed.
+  CHECK(countKind(g, NodeKind::New) == 0);
+  CHECK(countKind(g, NodeKind::Materialize) == 0);
+  // Every field access forwarded away: the inlined bodies' loads AND
+  // main's own count read all forward (the printstream fetch is a
+  // LoadStatic, a different kind).
+  CHECK(countKind(g, NodeKind::LoadField) == 0);
+  CHECK(countKind(g, NodeKind::StoreField) == 0);
+  // Two vobjs: main's live println snapshot carries the final count
+  // state (the getstatic guard folded away - its receiver is the
+  // never-null allocation - and DCE reclaimed that fs), and the
+  // deopt-unreachable chained call-site snapshots share one
+  // final-state vobj. Every referencing desc lists its vobj.
+  const auto vobjs = nodesOfKind(g, NodeKind::VirtualObjectState);
+  CHECK(vobjs.size() == 2);
+  std::uint32_t listed = 0;
+  for (ir::NodeId v : vobjs) {
+    for (ir::FrameStateId i = 0; i < g.frameStateCount(); ++i) {
+      for (ir::VirtualObjectId e : g.frameStateVobjs(i)) {
+        if (e == v) {
+          ++listed;
+        }
+      }
+    }
+  }
+  CHECK(listed == 4); // 3 chained snapshots share one + 1 live snapshot
+  // Every fs slot that referenced the New now references a vobj.
+  for (ir::NodeId n = 0; n < g.nodeCount(); ++n) {
+    if (g.node(n).kind != NodeKind::FrameState || g.node(n).isDead()) {
+      continue;
+    }
+    for (std::uint16_t s = 0; s < g.numInputs(n); ++s) {
+      CHECK(g.node(g.input(n, s)).kind != NodeKind::New);
+    }
+  }
   CHECK(verifyOk(g));
 }

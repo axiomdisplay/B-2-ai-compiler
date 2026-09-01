@@ -20,15 +20,19 @@ These are the three designs, re-engineered for scalability without SMT.
 # 1. Cross-Method Region-Based Partial Escape Analysis (CM-PEA)
 
 ```text
-Implementation status: LANDED (v1, keys 65/66/67/69).
+Implementation status: LANDED (v1.1, keys 65/66/67/69).
 compiler/passes/src/Escape.cpp + tests/passes/EscapeTests.cpp +
 b2graph --pea. The height-6 lattice, the classification table, the
 escape-point materialization (Materialize wired into ctrl AND mem,
 FrameState locals auto-rebased via Rule 14), scalar replacement with
-mem-chain load forwarding, the Rule 45 cost gates, kill switches, and
-the decision log are live. The v1 scope gates and their growth paths
-(phi-of-stores, fs-vobj listing via the requested ir API, dynamic
-indices, EscapeSummary reuse across inline sites) are documented in
+mem-chain load forwarding, the fs-escape listing (MSG-20260901-006's
+appendFrameStateVobj consumed: NoEscape + deopt-snapshot references
+scalarize with per-instant vobjs listed on the descs - the
+fields.rbc post-inline e2e reaches ZERO allocations), the Rule 45
+cost gates, kill switches, and the decision log are live. The
+remaining scope gates and their growth paths (phi-of-stores,
+dynamic indices, EscapeSummary reuse across inline sites,
+per-deopt caller-frame copies) are documented in
 docs/pass_contracts.md section 12.
 ```
 

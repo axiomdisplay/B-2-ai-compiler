@@ -328,7 +328,7 @@ lattice value is the monotone join (max) of the use grades:
 | `Load/StoreElem` non-const idx | dynamic-index: materialize at the access |
 | `RefEq`, `MonitorEnter/Exit` | REJECT `identity-observable` (Rule 73) |
 | `Unwind` exception | REJECT `exception-observable` |
-| live `FrameState` locals edge, fs-only | REJECT `fs-deopt-ref` (needs the ir append API — MSG-20260901-006) |
+| live `FrameState` locals edge, fs-only | **fs-escape listing** (MSG-20260901-006): SCALARIZE + per-instant vobj |
 | live `FrameState` locals edge + other escape | FOLLOWS the materialization (replaceNode rebases the locals edge onto the Materialize reference) |
 | `Phi` value input | REJECT `phi-merge` |
 | `CheckCast` / `InstanceOf` obj | REJECT `cast-observable` / `instanceof-observable` |
@@ -381,6 +381,46 @@ the gate — their rewrites cannot observe chain order. Cost gates
 overruns REJECT (`too-many-fields`/`too-many-elems`), leaving the
 graph untouched.
 
+**The fs-escape listing (key 67, NoEscape + FrameState references).**
+A no-escape allocation referenced by deopt snapshots still scalarizes —
+readers forward, writers splice — but every referencing FrameState must
+be able to materialize the object at deopt. The plan resolves ONE
+observation instant per referencing fs and builds a `VirtualObjectState`
+with the field state visible there (a backward chain lookup, NOT id
+order: inlined-body stores carry higher ids than the call-site fss
+that precede them in program order). The fs's slot edges rebase onto
+the vobj (the deoptimizer's slot-to-object mapping) and the desc lists
+it via `appendFrameStateVobj` (the deopt-materialization channel —
+MSG-20260901-006). The instant rules:
+
+- a LIVE fs (consumed by a guard/call/Deopt) resolves its own
+  instant: the call's mem input, or the state at the guard's ctrl
+  predecessor; every consumer must observe the same field state;
+- IDENTITY: every fs of the allocation inside ONE live caller chain
+  is reconstructed at the same instant — the same object in (possibly)
+  several frames — so they share ONE vobj (union-find over the fss
+  co-occurring in a chain), and every deopt point serving the cluster
+  must observe the SAME field state (one vobj cannot carry two
+  states; disagreement rejects `fs-multi-deopt`);
+- a deopt-UNREACHABLE userless fs (the chain below it was folded
+  away — the post-inline call-site snapshots after nullfold+DCE) is
+  dead metadata: it shares one final-state vobj (never reconstructed,
+  any deterministic sound state);
+- a snapshot consumed by a non-deopt node rejects
+  (`fs-unknown-consumer`); unresolvable states reject
+  (`snapshot-merge`).
+
+The plan phase is pure (a refusal leaves the graph untouched); the
+apply creates the vobjs in cluster order (min fs id, dead-metadata
+last — Rule 124), rebases the edges, and appends the descs before the
+reader/writer splicing (the chain lookups need the writers in place).
+Default constants are cached per plan (constants are not interned;
+node-stable defaults keep the agreement check exact and the graph
+minimal). The fields.rbc post-inline e2e scalarizes to ZERO
+allocations: the chained call-site snapshots share one final-state
+vobj, main's live println snapshot lists its own, and every field
+access forwards away.
+
 **Determinism / idempotency.** Allocations in id order, fields in
 FieldId order, escape uses by id, node creation in visit order
 (Rule 124); the hash-free engine is a fixed sequence of table lookups.
@@ -401,26 +441,35 @@ materialization node); `-O` runs the engine inside the pipeline with
 the telemetry line extended to `pea=<scalarized>/<materialized>/<
 rejected>`.
 
-**Testing (Rule 35).** 40 tests in `tests/passes/EscapeTests.cpp`:
+**Testing (Rule 35).** 49 tests in `tests/passes/EscapeTests.cpp`:
 the classification table (12), the materialization shape and chain
 wiring (8, including the fs-edge auto-rebase and the nested inner-first
 end state), the scalar replacement (10, including typed defaults,
-chain splicing, branch-local lifetimes), kill switches (4),
-idempotency/determinism/no-op (4), and the integration gates (the
-19-program corpus through the full pipeline — verified, idempotent,
-byte-stable; the fields.rbc e2e pair: call-arg materialization without
-inlining, and the pinned `fs-deopt-ref` conservatism after inlining
-until MSG-20260901-006 lands).
+chain splicing, branch-local lifetimes), the fs-escape listing (9:
+per-instant values, instant-disagreement refusal, the chained
+identity-sharing vobj, the array snapshot, unknown-consumer refusal,
+the kill switch, analysis-only, idempotency+determinism, and the
+elems cost-gate companion), the cost gates (2: the instance-field
+shape restored after the MSG-20260901-007 fix + the array shape),
+kill switches (4), idempotency/determinism/no-op (4), and the
+integration gates (the 19-program corpus through the full pipeline —
+verified, idempotent, byte-stable; the fields.rbc e2e pair: call-arg
+materialization without inlining, and the post-inline ZERO-allocation
+fs-escape scalarization).
 
-**Known v1 conservatisms (the growth paths).** (a) `fs-deopt-ref`:
-chained inlined snapshots reject the allocation — the ir append API
-(MSG-20260901-006) unlocks listing the vobj instead. (b) `phi-merge` /
+**Known v1 conservatisms (the growth paths).** (a) ~~`fs-deopt-ref`~~
+RESOLVED by the fs-escape listing above (MSG-20260901-006's
+appendFrameStateVobj landed and is consumed). (b) `phi-merge` /
 `merge-crossed`: field state SSA (phi-of-stores) arrives with the
 loop/merge growth path. (c) dynamic array indices materialize rather
 than speculate. (d) CheckCast/InstanceOf reject rather than fold.
 (e) Cross-inline-site EscapeSummary reuse (special_passes.md 1.2)
 arrives with the multi-caller path; v1 analyzes the merged post-inline
-directly, which is the same information. (f) The instance-field
-cost-gate test uses the array shape because the ir verifier's
-memory-chain DFS step belt false-positives on chains longer than half
-the graph (MSG-20260901-007).
+directly, which is the same information. (f) ~~The instance-field
+cost-gate test uses the array shape~~ RESOLVED: the ir verifier's
+memory-chain DFS step belt now admits well-formed long chains
+(MSG-20260901-007 fixed); the instance-field shape is the primary
+cost gate again. (g) An fs serving two deopt points that observe
+different field states rejects (`fs-multi-deopt`); per-deopt-point
+caller-frame copies (the Graal shape) would lift it — that is an
+inlining-engine IR change, not a PEA one.

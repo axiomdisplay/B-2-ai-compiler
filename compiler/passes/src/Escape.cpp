@@ -42,8 +42,9 @@
 //     stores) rejects the allocation;
 //   - array element access needs constant indices (dynamic indices
 //     materialize);
-//   - a live FrameState referencing the allocation rejects it (deopt
-//     reconstruction needs the ir team's fs-vobj append API - requested);
+//   - a live FrameState referencing the allocation lists a per-instant
+//     vobj on the snapshot instead of rejecting (the fs-escape listing,
+//     MSG-20260901-006's appendFrameStateVobj - see the fs-escape block);
 //   - cross-inline-site summary APPLICATION (the EscapeSummary reuse)
 //     arrives with the multi-caller growth path; v1 analyzes the merged
 //     post-inline graph directly, which is the same information.
@@ -65,6 +66,7 @@ namespace b2::passes::detail {
 
 // The ir::* vocabulary this file speaks (qualified once, at the top).
 using ir::EffectKind;
+using ir::FrameStateId;
 using ir::InputRole;
 using ir::IRType;
 using ir::Node;
@@ -136,6 +138,15 @@ namespace {
          k == NodeKind::NewRefArray;
 }
 
+// The element IRType of an array allocation (NewArray carries it in
+// payload; NewRefArray is a reference array).
+[[nodiscard]] IRType elemTyOf(const ir::Graph& g, NodeId alloc,
+                              NodeKind kind) {
+  return kind == NodeKind::NewArray
+             ? static_cast<IRType>(g.node(alloc).payload)
+             : IRType::Ref;
+}
+
 [[nodiscard]] bool isMemStateProducer(NodeKind k) {
   // Produces the memory state for its successors (the chain advances
   // through these; loads pass their mem input through instead).
@@ -162,6 +173,9 @@ namespace {
 // The memory state in effect just BEFORE control point `ctrl`: walks
 // the ctrl chain to the first mem-state producer (itself), or a load
 // (its mem input), and otherwise continues through pass-through nodes.
+// Branch projections backtrack through the PARENT slot (their slot 0 is
+// the Parent role, not Ctrl): a guard inside a branch observes the
+// pre-branch state until the branch's own producers advance it.
 [[nodiscard]] NodeId memStateBefore(const ir::Graph& g, NodeId ctrl) {
   NodeId cur = ctrl;
   for (std::uint32_t steps = 0; steps < kPeaMaxChainSteps; ++steps) {
@@ -177,9 +191,69 @@ namespace {
       const NodeId m = memInputOf(g, cur);
       return m != ir::kInvalidNodeId ? m : g.startNode();
     }
+    if (k == NodeKind::IfTrue || k == NodeKind::IfFalse ||
+        k == NodeKind::SwitchCase || k == NodeKind::SwitchDefault) {
+      cur = g.input(cur, 0); // the PARENT slot: the If/Switch itself
+      continue;
+    }
     cur = ctrlInputOf(g, cur);
   }
   return g.startNode();
+}
+
+// A node kind that can carry a deopt FrameState and reconstruct frames
+// when it deopts: guards (deopt on failure), Deopt nodes, and every
+// call family (the exceptional continuation deopts through the call's
+// own FrameState - graph_builder classes 2.1/2.2/2.3).
+[[nodiscard]] bool isDeoptPoint(NodeKind k) {
+  switch (k) {
+  case NodeKind::Guard:
+  case NodeKind::Deopt:
+  case NodeKind::CallStatic:
+  case NodeKind::CallVirtual:
+  case NodeKind::CallInterface:
+  case NodeKind::CallDynamic:
+    return true;
+  default:
+    return false;
+  }
+}
+
+// The trailing FrameState input of a deopt point (the registry's
+// hasFrameState slot), or invalid when it has none / is not a live
+// FrameState node.
+[[nodiscard]] NodeId fsInputOf(const ir::Graph& g, NodeId d) {
+  const std::uint16_t n = g.numInputs(d);
+  if (n == 0) {
+    return ir::kInvalidNodeId;
+  }
+  const NodeId fs = g.input(d, n - 1);
+  if (fs >= g.nodeCount() || g.node(fs).kind != NodeKind::FrameState ||
+      g.node(fs).isDead()) {
+    return ir::kInvalidNodeId;
+  }
+  return fs;
+}
+
+// The memory state observable at deopt point d: a call reads its own
+// mem input (the state at the call); guards and Deopts sit in front of
+// their protected op, so the state at their ctrl predecessor is the
+// state they observe.
+[[nodiscard]] NodeId deoptInstantMem(const ir::Graph& g, NodeId d) {
+  const NodeKind k = g.node(d).kind;
+  if (k == NodeKind::CallStatic || k == NodeKind::CallVirtual ||
+      k == NodeKind::CallInterface || k == NodeKind::CallDynamic) {
+    const NodeId m = memInputOf(g, d);
+    return (m != ir::kInvalidNodeId && m < g.nodeCount() &&
+            !g.node(m).isDead())
+               ? m
+               : g.startNode();
+  }
+  const NodeId c = ctrlInputOf(g, d);
+  return (c != ir::kInvalidNodeId && c < g.nodeCount() &&
+          !g.node(c).isDead())
+             ? memStateBefore(g, c)
+             : g.startNode();
 }
 
 // --- the use classification table (the whole soundness surface) -------------
@@ -641,8 +715,9 @@ void runPEA(ir::Graph& g, std::uint32_t stageMask, PassTelemetry& t,
         // materialization path replaceNode(alloc, Materialize) rewires
         // the FrameState locals edge onto the real reference (deopt
         // reconstruction then sees a live object). fs-only references
-        // (no other escape) downgrade below - the chained-snapshot case
-        // needs the ir team's fs-vobj append API.
+        // (no other escape) keep the allocation virtual and LIST a
+        // per-instant vobj on the snapshot instead (the fs-escape
+        // block; MSG-20260901-006's appendFrameStateVobj).
         hasFsUse = true;
         break;
       case UseClass::PhiReject:
@@ -671,12 +746,12 @@ void runPEA(ir::Graph& g, std::uint32_t stageMask, PassTelemetry& t,
       }
     }
     if (hasFsUse && st == EscapeState::NoEscape) {
-      // The allocation's ONLY escape-relevant use is a deopt snapshot.
-      // Without another escape use there is no materialization point to
-      // rewire (a chained/userless snapshot has no edge consumers), so
-      // v1 rejects and requests the fs-vobj append API from the ir team.
-      st = EscapeState::GlobalEscape;
-      reason = "fs-deopt-ref";
+      // The escape-relevant uses are readers/writers plus deopt
+      // snapshots: the fs-escape listing (the execution block) keeps
+      // the allocation virtual and lists a per-instant vobj on every
+      // referencing snapshot. Multi-instant refusals land in the plan
+      // below; the reason carries the disposition for the log.
+      reason = "fs-escape";
     }
     rec.state = st;
     rec.reason = reason;
@@ -897,26 +972,474 @@ void runPEA(ir::Graph& g, std::uint32_t stageMask, PassTelemetry& t,
       }
     };
 
+    // --- the fs-escape listing (MSG-20260901-006 growth path) ---------------
+    //
+    // NoEscape + FrameState references: the allocation still scalarizes
+    // (readers forward, writers splice), but the deoptimizer must be
+    // able to materialize the object at every deopt point that
+    // reconstructs a frame holding it. Every referencing fs resolves
+    // ONE observation instant; a VirtualObjectState carries the field
+    // state visible there (a backward chain lookup - NOT id order:
+    // inlined-body stores carry higher ids than the call-site fss that
+    // precede them in program order). The fs's slot edges rebase onto
+    // the vobj and the desc lists it (the deopt-materialization
+    // channel).
+    //
+    // IDENTITY: every fs of this allocation that lies inside ONE
+    // deopt point's caller chain is reconstructed at the same instant
+    // - the same Java object in (possibly) several frames. They must
+    // share ONE vobj (union-find over the fss co-occurring in a live
+    // chain), and every deopt point serving the cluster must observe
+    // the SAME field state (the agreement check) - one vobj cannot
+    // carry two states. Deopt-UNREACHABLE userless fss (the chain
+    // below them was folded away) share one final-state vobj: dead
+    // metadata, never reconstructed, any deterministic sound state.
+    struct FsVobjVals {
+      std::vector<NodeId> fields; // instance: parallel to the included
+                                  // (sorted) field ids
+      std::vector<NodeId> elems;  // array: dense [0..maxIncluded]
+      NodeId len = ir::kInvalidNodeId;
+    };
+    struct FsPlan {
+      NodeId fs = ir::kInvalidNodeId;
+      std::size_t cluster = static_cast<std::size_t>(-1);
+      std::vector<std::uint16_t> slots;
+    };
+    // The read-field / read-element sets (the inclusion rule: a field
+    // resolved at the instant, or read somewhere, is listed).
+    std::vector<std::uint32_t> readFields;
+    std::vector<std::int32_t> readElems;
+    for (const ClassifiedUse& u : rec.uses) {
+      if (u.cls != UseClass::Reader) {
+        continue;
+      }
+      const Node& un = g.node(u.user);
+      if (un.kind == NodeKind::LoadField ||
+          un.kind == NodeKind::StoreField) {
+        if (std::find(readFields.begin(), readFields.end(), un.payload) ==
+            readFields.end()) {
+          readFields.push_back(un.payload);
+        }
+      } else {
+        std::int32_t idx = 0;
+        if (intConstant(g, g.input(u.user, 3), idx) &&
+            std::find(readElems.begin(), readElems.end(), idx) ==
+                readElems.end()) {
+          readElems.push_back(idx);
+        }
+      }
+    }
+    // The per-plan default-constant cache: constantI/constantL/etc. do
+    // not intern, so every fresh resolution of "the field default"
+    // would create a NEW node - the agreement comparison (node
+    // identity) would false-positive, and the graph would carry one
+    // zero constant per vobj field. One node per IRType per plan.
+    std::vector<NodeId> defCache;
+    auto defOf = [&](IRType ty) -> NodeId {
+      const auto idx = static_cast<std::uint32_t>(ty);
+      if (defCache.size() <= idx) {
+        defCache.resize(idx + 1, ir::kInvalidNodeId);
+      }
+      if (defCache[idx] == ir::kInvalidNodeId) {
+        defCache[idx] = defaultConstant(g, ty);
+      }
+      return defCache[idx];
+    };
+    // Resolves the vobj field values visible at `mem` (pure). Returns
+    // false on a merged chain (snapshot-merge) or an unresolvable
+    // value; the caller refuses the allocation then.
+    auto resolveFsVals = [&](NodeId mem, FsVobjVals& out) -> bool {
+      if (!rec.isArray) {
+        for (std::uint32_t fid : fieldIds) {
+          const FieldLookup fl =
+              chainLookup(g, mem, alloc, false, fid, 0);
+          if (fl.merged) {
+            return false;
+          }
+          NodeId v = ir::kInvalidNodeId;
+          if (fl.value != ir::kInvalidNodeId) {
+            v = fl.value;
+          } else if (std::find(readFields.begin(), readFields.end(),
+                               fid) != readFields.end()) {
+            const IRType ty = fieldDefaultType(fid);
+            v = ty == IRType::Bottom ? ir::kInvalidNodeId : defOf(ty);
+          }
+          if (v == ir::kInvalidNodeId || v >= g.nodeCount() ||
+              g.node(v).isDead()) {
+            return false;
+          }
+          out.fields.push_back(v);
+        }
+        return true;
+      }
+      const NodeId len = g.input(alloc, 1);
+      if (len >= g.nodeCount() || g.node(len).isDead()) {
+        return false;
+      }
+      out.len = len;
+      std::int32_t maxIdx = -1;
+      for (std::int32_t idx : elemIndices) {
+        const FieldLookup fl =
+            chainLookup(g, mem, alloc, true, 0, idx);
+        if (fl.merged) {
+          return false;
+        }
+        if (fl.value != ir::kInvalidNodeId ||
+            std::find(readElems.begin(), readElems.end(), idx) !=
+                readElems.end()) {
+          maxIdx = std::max(maxIdx, idx);
+        }
+      }
+      out.elems.resize(static_cast<std::size_t>(maxIdx) + 1,
+                       ir::kInvalidNodeId);
+      for (std::int32_t idx : elemIndices) {
+        if (static_cast<std::size_t>(idx) >= out.elems.size()) {
+          continue; // not included at this instant
+        }
+        const FieldLookup fl =
+            chainLookup(g, mem, alloc, true, 0, idx);
+        NodeId v = ir::kInvalidNodeId;
+        if (fl.value != ir::kInvalidNodeId) {
+          v = fl.value;
+        } else if (std::find(readElems.begin(), readElems.end(), idx) !=
+                   readElems.end()) {
+          v = defOf(elemTyOf(g, alloc, rec.kind));
+        }
+        if (v == ir::kInvalidNodeId || v >= g.nodeCount() ||
+            g.node(v).isDead()) {
+          return false;
+        }
+        out.elems[static_cast<std::size_t>(idx)] = v;
+      }
+      // Unlisted element slots materialize to their type default.
+      const NodeId dflt = defOf(elemTyOf(g, alloc, rec.kind));
+      if (dflt == ir::kInvalidNodeId) {
+        return false;
+      }
+      for (std::size_t i = 0; i < out.elems.size(); ++i) {
+        if (out.elems[i] == ir::kInvalidNodeId) {
+          out.elems[i] = dflt;
+        }
+      }
+      return true;
+    };
+    // The observation-instant plan (pure). Returns the refusal reason
+    // or nullptr. The plan phase leaves the graph untouched; a refusal
+    // means the allocation stays real (PEA Rule option 4).
+    std::vector<FsPlan> fsPlans;
+    struct FsCluster {
+      NodeId key = ir::kInvalidNodeId; // the min member fs id (Rule 124)
+      NodeId instantMem = ir::kInvalidNodeId;
+      bool deadMeta = false;
+    };
+    std::vector<FsCluster> fsClusters;
+    std::vector<FsVobjVals> fsVals; // parallel to fsClusters
+    auto planFsEscape = [&]() -> const char* {
+      // 1. The referencing fss in id order (Rule 124), grouped with
+      //    their slots.
+      for (const ClassifiedUse& u : rec.uses) {
+        if (u.cls != UseClass::FsEscape || u.user >= g.nodeCount() ||
+            g.node(u.user).isDead()) {
+          continue;
+        }
+        FsPlan p;
+        p.fs = u.user;
+        auto it = std::find_if(fsPlans.begin(), fsPlans.end(),
+                               [&](const FsPlan& q) { return q.fs == p.fs; });
+        if (it != fsPlans.end()) {
+          it->slots.push_back(u.slot);
+          continue;
+        }
+        p.slots.push_back(u.slot);
+        fsPlans.push_back(p);
+      }
+      if (fsPlans.empty()) {
+        return nullptr; // unreachable: hasFsUse guards the call
+      }
+      const std::size_t n = fsPlans.size();
+      // 2. The live deopt points (the chain heads that can reconstruct
+      //    frames holding this allocation).
+      struct DeoptPoint {
+        NodeId node;
+        NodeId head;
+      };
+      std::vector<DeoptPoint> dpoints;
+      for (NodeId d = 0; d < g.nodeCount(); ++d) {
+        if (g.node(d).isDead() || !isDeoptPoint(g.node(d).kind)) {
+          continue;
+        }
+        const NodeId h = fsInputOf(g, d);
+        if (h != ir::kInvalidNodeId) {
+          dpoints.push_back(DeoptPoint{d, h});
+        }
+      }
+      // 3. Per-fs: the live deopt consumers (a foreign consumer kind
+      //    refuses - the fs is not a deopt snapshot then).
+      std::vector<std::vector<NodeId>> own(n);
+      for (std::size_t i = 0; i < n; ++i) {
+        for (const Use& u : g.usesOf(fsPlans[i].fs)) {
+          if (u.user >= g.nodeCount() || g.node(u.user).isDead()) {
+            continue;
+          }
+          if (isDeoptPoint(g.node(u.user).kind)) {
+            own[i].push_back(u.user);
+          } else {
+            return "fs-unknown-consumer";
+          }
+        }
+        std::sort(own[i].begin(), own[i].end());
+      }
+      // 4. The identity union: fss of this allocation co-occurring in
+      //    one live caller chain share one vobj. sources[i] collects
+      //    the deopt points whose chain REACHES fs i (as an ancestor);
+      //    a chain's head is reached through its own consumers.
+      std::vector<std::uint32_t> parent(n);
+      for (std::size_t i = 0; i < n; ++i) {
+        parent[i] = static_cast<std::uint32_t>(i);
+      }
+      auto find = [&](std::uint32_t x) {
+        while (parent[x] != x) {
+          parent[x] = parent[parent[x]];
+          x = parent[x];
+        }
+        return x;
+      };
+      auto unite = [&](std::uint32_t x, std::uint32_t y) {
+        const std::uint32_t rx = find(x);
+        const std::uint32_t ry = find(y);
+        if (rx == ry) {
+          return;
+        }
+        if (rx < ry) {
+          parent[ry] = rx; // union by min id: deterministic roots
+        } else {
+          parent[rx] = ry;
+        }
+      };
+      std::vector<std::vector<NodeId>> sources(n);
+      for (const DeoptPoint& dp : dpoints) {
+        // The members of THIS allocation referenced inside dp's chain.
+        std::vector<std::uint32_t> hits;
+        const FrameStateId headDesc = g.node(dp.head).payload;
+        for (std::size_t i = 0; i < n; ++i) {
+          const FrameStateId d = g.node(fsPlans[i].fs).payload;
+          if (d >= g.frameStateCount()) {
+            continue;
+          }
+          if (d == headDesc) {
+            hits.push_back(static_cast<std::uint32_t>(i)); // position 0
+            continue;
+          }
+          FrameStateId cur = headDesc;
+          std::uint32_t steps = 0;
+          while (cur != ir::kInvalidFrameState &&
+                 cur < g.frameStateCount() &&
+                 steps++ <= g.frameStateCount()) {
+            cur = g.frameState(cur).caller;
+            if (cur == d) {
+              hits.push_back(static_cast<std::uint32_t>(i));
+              sources[i].push_back(dp.node);
+              break;
+            }
+          }
+        }
+        for (std::size_t k = 1; k < hits.size(); ++k) {
+          unite(hits[0], hits[k]);
+        }
+      }
+      // 5. One instant per cluster: every serving deopt point must
+      //    observe the same field state.
+      for (std::size_t i = 0; i < n; ++i) {
+        for (NodeId d : own[i]) {
+          sources[i].push_back(d);
+        }
+        std::sort(sources[i].begin(), sources[i].end());
+        sources[i].erase(std::unique(sources[i].begin(), sources[i].end()),
+                         sources[i].end());
+      }
+      // The final-state anchor for dead metadata: the last writer.
+      NodeId lastWriter = ir::kInvalidNodeId;
+      for (const ClassifiedUse& u : rec.uses) {
+        if (u.cls == UseClass::Writer && u.user > lastWriter &&
+            u.user < g.nodeCount() && !g.node(u.user).isDead()) {
+          lastWriter = u.user;
+        }
+      }
+      // 6. Assemble the clusters: one per root (min fs id as the key),
+      //    all deopt-unreachable roots merged into ONE dead-meta
+      //    cluster (the shared final-state vobj). Real clusters first
+      //    (key ascending), the dead-meta cluster last.
+      std::vector<std::vector<std::size_t>> members(n);
+      for (std::size_t i = 0; i < n; ++i) {
+        members[find(static_cast<std::uint32_t>(i))].push_back(i);
+      }
+      for (std::size_t root = 0; root < n; ++root) {
+        if (members[root].empty()) {
+          continue;
+        }
+        bool dead = true;
+        for (std::size_t i : members[root]) {
+          if (!sources[i].empty()) {
+            dead = false;
+            break;
+          }
+        }
+        FsCluster c;
+        c.deadMeta = dead;
+        c.key = fsPlans[members[root][0]].fs; // id order: the min
+        c.instantMem = dead ? lastWriter : ir::kInvalidNodeId;
+        if (!dead) {
+          const std::vector<NodeId>& src = sources[members[root][0]];
+          c.instantMem = deoptInstantMem(g, src[0]);
+        }
+        // Attach every member plan.
+        for (std::size_t i : members[root]) {
+          fsPlans[i].cluster = fsClusters.size();
+        }
+        fsClusters.push_back(c);
+      }
+      // Merge the dead-meta clusters into one (all share the vobj).
+      std::size_t deadIdx = static_cast<std::size_t>(-1);
+      for (std::size_t ci = 0; ci < fsClusters.size(); ++ci) {
+        if (!fsClusters[ci].deadMeta) {
+          continue;
+        }
+        if (deadIdx == static_cast<std::size_t>(-1)) {
+          deadIdx = ci;
+          continue;
+        }
+        for (FsPlan& p : fsPlans) {
+          if (p.cluster == ci) {
+            p.cluster = deadIdx;
+          }
+        }
+      }
+      if (deadIdx != static_cast<std::size_t>(-1)) {
+        // Drop the merged dead-meta duplicates.
+        std::vector<FsCluster> keep;
+        for (std::size_t ci = 0; ci < fsClusters.size(); ++ci) {
+          if (fsClusters[ci].deadMeta && ci != deadIdx) {
+            continue;
+          }
+          keep.push_back(fsClusters[ci]);
+        }
+        // Reindex the plans (offsets shift by the dropped count).
+        std::vector<std::size_t> map(fsClusters.size(), 0);
+        std::size_t w = 0;
+        for (std::size_t ci = 0; ci < fsClusters.size(); ++ci) {
+          if (fsClusters[ci].deadMeta && ci != deadIdx) {
+            map[ci] = deadIdx < ci ? deadIdx : deadIdx - 1;
+            continue;
+          }
+          map[ci] = w++;
+        }
+        for (FsPlan& p : fsPlans) {
+          p.cluster = map[p.cluster];
+        }
+        fsClusters = std::move(keep);
+      }
+      // 7. Resolve the agreed field state per cluster (and enforce the
+      //    agreement: one vobj, one state).
+      for (std::size_t ci = 0; ci < fsClusters.size(); ++ci) {
+        FsCluster& c = fsClusters[ci];
+        FsVobjVals vals;
+        if (!resolveFsVals(c.instantMem, vals)) {
+          return "snapshot-merge";
+        }
+        if (!c.deadMeta) {
+          for (std::size_t i = 0; i < n; ++i) {
+            if (fsPlans[i].cluster != ci || sources[i].empty()) {
+              continue;
+            }
+            for (std::size_t k = c.key == fsPlans[i].fs ? 1 : 0;
+                 k < sources[i].size(); ++k) {
+              FsVobjVals other;
+              if (!resolveFsVals(deoptInstantMem(g, sources[i][k]),
+                                 other)) {
+                return "snapshot-merge";
+              }
+              if (other.fields != vals.fields ||
+                  other.elems != vals.elems || other.len != vals.len) {
+                return "fs-multi-deopt";
+              }
+            }
+          }
+        }
+        fsVals.push_back(std::move(vals));
+      }
+      return nullptr;
+    };
+    // Executes a successful plan: create the vobjs (cluster order),
+    // rebase the slot edges, list the vobjs on the descs. No failure
+    // paths (the plan validated everything; the defensive
+    // kill-refusal below is the partial-bail belt).
+    auto applyFsEscape = [&]() {
+      std::vector<NodeId> vobjs; // parallel to fsClusters
+      for (std::size_t i = 0; i < fsClusters.size(); ++i) {
+        const FsVobjVals& v = fsVals[i];
+        NodeId vo = ir::kInvalidNodeId;
+        if (!rec.isArray) {
+          vo = g.makeVirtualObject(
+              ir::TypeId{g.node(alloc).payload},
+              std::span<const NodeId>(v.fields.data(), v.fields.size()));
+        } else {
+          vo = g.makeArrayVirtualObject(
+              elemTyOf(g, alloc, rec.kind), v.len,
+              std::span<const NodeId>(v.elems.data(), v.elems.size()));
+        }
+        vobjs.push_back(vo);
+      }
+      for (const FsPlan& p : fsPlans) {
+        if (p.cluster >= vobjs.size()) {
+          continue; // unreachable: the plan assigned every fs
+        }
+        const NodeId vo = vobjs[p.cluster];
+        for (std::uint16_t slot : p.slots) {
+          g.setInput(p.fs, slot, vo);
+        }
+        const FrameStateId desc = g.node(p.fs).payload;
+        if (desc < g.frameStateCount()) {
+          g.appendFrameStateVobj(desc, vo);
+        }
+      }
+      ++t.rewrites;
+    };
+
     if (rec.state == EscapeState::NoEscape) {
       // --- scalar replacement (key 67) --------------------------------------
       bool ok = true;
-      forwardReaders(ir::kInvalidNodeId, dec, ok);
-      spliceWritersAndFold(ir::kInvalidNodeId, dec);
-      if (ok) {
-        spliceAllocFromChain(g, alloc);
+      const char* fsRefusal = nullptr;
+      if (hasFsUse) {
+        fsRefusal = planFsEscape();
+        if (fsRefusal == nullptr) {
+          applyFsEscape();
+        }
       }
-      if (ok && kill(g, alloc, t, b, jk)) {
-        dec.action = "scalarized";
-        dec.reason = "no-escape";
-        ++t.peaScalarized;
+      if (fsRefusal == nullptr) {
+        forwardReaders(ir::kInvalidNodeId, dec, ok);
+        spliceWritersAndFold(ir::kInvalidNodeId, dec);
+        if (ok) {
+          spliceAllocFromChain(g, alloc);
+        }
+        if (ok && kill(g, alloc, t, b, jk)) {
+          dec.action = "scalarized";
+          dec.reason = hasFsUse ? "fs-escape" : "no-escape";
+          ++t.peaScalarized;
+        } else {
+          // Defensive bail (kill refused or a lookup failed): every landed
+          // rewrite is individually sound
+          // (a forwarded load / removed virtual store / folded IsNull /
+          // listed vobj never publishes the object); the allocation
+          // stays real for the remaining uses.
+          dec.action = "rejected";
+          dec.reason = "partial-bail";
+          ++t.peaRejected;
+        }
       } else {
-        // Defensive bail (kill refused or a lookup failed): every landed
-        // rewrite is individually sound
-        // (a forwarded load / removed virtual store / folded IsNull
-        // never publishes the object); the allocation stays real for
-        // the remaining uses.
+        // The plan refused: the graph is untouched (the plan phase is
+        // pure), the allocation stays real (PEA Rule option 4).
         dec.action = "rejected";
-        dec.reason = "partial-bail";
+        dec.reason = fsRefusal;
         ++t.peaRejected;
       }
     } else if (rec.state == EscapeState::ArgEscape ||
