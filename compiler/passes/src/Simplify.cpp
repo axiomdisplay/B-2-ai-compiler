@@ -24,26 +24,9 @@
 
 namespace b2::passes::detail {
 
-namespace {
-
-// Named sweep budget (Rule 23): re-sweeps cover cascades where a rewrite
-// at a high id enables one at a lower id (replacement rewiring can move
-// defs above uses in id order). Monotone: each sweep strictly shrinks the
-// live-node set or stops.
-constexpr std::uint32_t kMaxSimplifySweeps = 8;
-
-// --- constant extraction ---------------------------------------------------
-
-enum class CV : std::uint8_t { None, I, L, F, D, Null };
-struct ConstVal {
-  CV flavor = CV::None;
-  std::int32_t i = 0;
-  std::int64_t l = 0;
-  std::uint32_t fb = 0; // float bits
-  std::uint64_t db = 0; // double bits
-};
-
-[[nodiscard]] ConstVal constOf(const ir::Graph& g, ir::NodeId n) {
+// constOf/isConst DEFINITIONS (declared in PassInternal.h; the flavor
+// constructors and the evaluators live there / below).
+ConstVal constOf(const ir::Graph& g, ir::NodeId n) {
   ConstVal c;
   const ir::Node& node = g.node(n);
   if (node.isDead()) {
@@ -74,9 +57,17 @@ struct ConstVal {
   }
 }
 
-[[nodiscard]] bool isConst(const ConstVal& c) {
+bool isConst(const ConstVal& c) {
   return c.flavor != CV::None;
 }
+
+namespace {
+
+// Named sweep budget (Rule 23): re-sweeps cover cascades where a rewrite
+// at a high id enables one at a lower id (replacement rewiring can move
+// defs above uses in id order). Monotone: each sweep strictly shrinks the
+// live-node set or stops.
+constexpr std::uint32_t kMaxSimplifySweeps = 8;
 
 [[nodiscard]] float bitsToF(std::uint32_t b) {
   float f = 0.0f;
@@ -330,130 +321,20 @@ struct ConstVal {
   return dToBits(r);
 }
 
-// One-input folds (conversions, negation, Not, self-describing kinds).
+// One-input folds delegate the SEMANTICS to detail::evalUnaryOp (below)
+// and only create the replacement node: one Java-semantics source of truth
+// shared with SCCP's lattice evaluator.
 [[nodiscard]] std::optional<ir::NodeId> foldUnary(ir::Graph& g,
                                                   ir::NodeKind k,
                                                   const ConstVal& a) {
-  using K = ir::NodeKind;
   if (!isConst(a)) {
     return std::nullopt;
   }
-  switch (k) {
-  case K::NegI:
-    if (a.flavor == CV::I) {
-      return g.constantI(
-          static_cast<std::int32_t>(0u - static_cast<std::uint32_t>(a.i)));
-    }
-    return std::nullopt;
-  case K::Not:
-    if (a.flavor == CV::I) {
-      return g.constantI(a.i == 0 ? 1 : 0);
-    }
-    return std::nullopt;
-  case K::NegL:
-    if (a.flavor == CV::L) {
-      return g.constantL(
-          static_cast<std::int64_t>(0u - static_cast<std::uint64_t>(a.l)));
-    }
-    return std::nullopt;
-  case K::NegF:
-    // Exact bit flip: sign XOR 0x80000000, NaN payload preserved.
-    if (a.flavor == CV::F) {
-      return g.constantF(bitsToF(a.fb ^ 0x80000000u));
-    }
-    return std::nullopt;
-  case K::NegD:
-    if (a.flavor == CV::D) {
-      return g.constantD(bitsToD(a.db ^ 0x8000000000000000ull));
-    }
-    return std::nullopt;
-  case K::I2L:
-    if (a.flavor == CV::I) {
-      return g.constantL(a.i);
-    }
-    return std::nullopt;
-  case K::L2I:
-    if (a.flavor == CV::L) {
-      return g.constantI(
-          static_cast<std::int32_t>(static_cast<std::uint32_t>(a.l)));
-    }
-    return std::nullopt;
-  case K::I2B:
-    if (a.flavor == CV::I) {
-      return g.constantI(static_cast<std::int32_t>(
-          static_cast<std::int8_t>(a.i)));
-    }
-    return std::nullopt;
-  case K::I2C:
-    if (a.flavor == CV::I) {
-      return g.constantI(a.i & 0xFFFF);
-    }
-    return std::nullopt;
-  case K::I2S:
-    if (a.flavor == CV::I) {
-      return g.constantI(static_cast<std::int32_t>(
-          static_cast<std::int16_t>(a.i)));
-    }
-    return std::nullopt;
-  case K::I2F:
-    if (a.flavor == CV::I) {
-      return g.constantF(static_cast<float>(a.i));
-    }
-    return std::nullopt;
-  case K::I2D:
-    if (a.flavor == CV::I) {
-      return g.constantD(static_cast<double>(a.i));
-    }
-    return std::nullopt;
-  case K::L2F:
-    if (a.flavor == CV::L) {
-      return g.constantF(static_cast<float>(a.l));
-    }
-    return std::nullopt;
-  case K::L2D:
-    if (a.flavor == CV::L) {
-      return g.constantD(static_cast<double>(a.l));
-    }
-    return std::nullopt;
-  case K::F2I:
-    if (a.flavor == CV::F) {
-      return g.constantI(static_cast<std::int32_t>(
-          fpToInt64(bitsToF(a.fb), false)));
-    }
-    return std::nullopt;
-  case K::F2L:
-    if (a.flavor == CV::F) {
-      return g.constantL(fpToInt64(bitsToF(a.fb), true));
-    }
-    return std::nullopt;
-  case K::F2D:
-    if (a.flavor == CV::F && !std::isnan(bitsToF(a.fb))) {
-      return g.constantD(static_cast<double>(bitsToF(a.fb)));
-    }
-    return std::nullopt;
-  case K::D2I:
-    if (a.flavor == CV::D) {
-      return g.constantI(static_cast<std::int32_t>(
-          fpToInt64(bitsToD(a.db), false)));
-    }
-    return std::nullopt;
-  case K::D2L:
-    if (a.flavor == CV::D) {
-      return g.constantL(fpToInt64(bitsToD(a.db), true));
-    }
-    return std::nullopt;
-  case K::D2F:
-    if (a.flavor == CV::D && !std::isnan(bitsToD(a.db))) {
-      const float r = static_cast<float>(bitsToD(a.db));
-      if (std::isnan(r)) {
-        return std::nullopt; // only from NaN input (checked above): safety
-      }
-      return g.constantF(r);
-    }
-    return std::nullopt;
-  default:
+  const auto r = evalUnaryOp(k, a);
+  if (!r) {
     return std::nullopt;
   }
+  return makeConstNode(g, *r);
 }
 
 // Value-level folds that need graph context (never-null facts, node
@@ -838,6 +719,243 @@ struct ConstVal {
 
 } // namespace
 
+// --- the shared value-level fold evaluators (keys 14 + 38) -------------------
+//
+// Defined here, beside the arithmetic helpers they call (the anonymous-
+// namespace members above are visible at detail scope). SCCP.cpp calls
+// these through PassInternal.h - the semantics table reviewers diff
+// lives once, not twice.
+
+std::optional<ConstVal> evalBinOp(ir::NodeKind k, const ConstVal& a,
+                                  const ConstVal& b) {
+  using K = ir::NodeKind;
+  if (a.flavor == CV::I && b.flavor == CV::I) {
+    const auto r = foldIntBin(k, a.i, b.i);
+    if (!r) {
+      return std::nullopt;
+    }
+    ConstVal c;
+    c.flavor = CV::I;
+    c.i = static_cast<std::int32_t>(*r);
+    return c;
+  }
+  if (a.flavor == CV::L && b.flavor == CV::L) {
+    const auto r = foldLongBin(k, a.l, b.l);
+    if (!r) {
+      return std::nullopt;
+    }
+    // CmpL produces an INT result (-1/0/1) even though its operands are
+    // Long; every other long op produces Long.
+    ConstVal c;
+    if (k == K::CmpL) {
+      c.flavor = CV::I;
+      c.i = static_cast<std::int32_t>(*r);
+    } else {
+      c.flavor = CV::L;
+      c.l = *r;
+    }
+    return c;
+  }
+  if (a.flavor == CV::F && b.flavor == CV::F) {
+    if (const auto r = foldFloatBin(k, bitsToF(a.fb), bitsToF(b.fb))) {
+      ConstVal c;
+      c.flavor = CV::F;
+      c.fb = *r;
+      return c;
+    }
+    // Float COMPARISONS fold even on NaN inputs: the result is a defined
+    // int (NaN compares less/greater per the kind), so the exact-bits
+    // policy does not block them.
+    if (k == K::CmpFl || k == K::CmpFg) {
+      const double x = static_cast<double>(bitsToF(a.fb));
+      const double y = static_cast<double>(bitsToF(b.fb));
+      std::int32_t r = 0;
+      if (k == K::CmpFl) {
+        r = (std::isnan(x) || std::isnan(y))
+                ? -1
+                : static_cast<std::int32_t>((x > y) - (x < y));
+      } else {
+        r = (std::isnan(x) || std::isnan(y))
+                ? 1
+                : static_cast<std::int32_t>((x > y) - (x < y));
+      }
+      ConstVal c;
+      c.flavor = CV::I;
+      c.i = r;
+      return c;
+    }
+    return std::nullopt;
+  }
+  if (a.flavor == CV::D && b.flavor == CV::D) {
+    if (const auto r = foldDoubleBin(k, bitsToD(a.db), bitsToD(b.db))) {
+      ConstVal c;
+      c.flavor = CV::D;
+      c.db = *r;
+      return c;
+    }
+    if (k == K::CmpDl || k == K::CmpDg) {
+      const double x = bitsToD(a.db);
+      const double y = bitsToD(b.db);
+      std::int32_t r = 0;
+      if (k == K::CmpDl) {
+        r = (std::isnan(x) || std::isnan(y))
+                ? -1
+                : static_cast<std::int32_t>((x > y) - (x < y));
+      } else {
+        r = (std::isnan(x) || std::isnan(y))
+                ? 1
+                : static_cast<std::int32_t>((x > y) - (x < y));
+      }
+      ConstVal c;
+      c.flavor = CV::I;
+      c.i = r;
+      return c;
+    }
+    return std::nullopt;
+  }
+  return std::nullopt;
+}
+
+std::optional<ConstVal> evalUnaryOp(ir::NodeKind k, const ConstVal& a) {
+  using K = ir::NodeKind;
+  if (!isConst(a)) {
+    return std::nullopt;
+  }
+  switch (k) {
+  case K::NegI:
+    if (a.flavor == CV::I) {
+      return constOfI(
+          static_cast<std::int32_t>(0u - static_cast<std::uint32_t>(a.i)));
+    }
+    return std::nullopt;
+  case K::Not:
+    if (a.flavor == CV::I) {
+      return constOfI(a.i == 0 ? 1 : 0);
+    }
+    return std::nullopt;
+  case K::NegL:
+    if (a.flavor == CV::L) {
+      return constOfL(
+          static_cast<std::int64_t>(0u - static_cast<std::uint64_t>(a.l)));
+    }
+    return std::nullopt;
+  case K::NegF:
+    // Exact bit flip: sign XOR 0x80000000, NaN payload preserved.
+    if (a.flavor == CV::F) {
+      return constOfF(a.fb ^ 0x80000000u);
+    }
+    return std::nullopt;
+  case K::NegD:
+    if (a.flavor == CV::D) {
+      return constOfD(a.db ^ 0x8000000000000000ull);
+    }
+    return std::nullopt;
+  case K::I2L:
+    if (a.flavor == CV::I) {
+      return constOfL(a.i);
+    }
+    return std::nullopt;
+  case K::L2I:
+    if (a.flavor == CV::L) {
+      return constOfI(
+          static_cast<std::int32_t>(static_cast<std::uint32_t>(a.l)));
+    }
+    return std::nullopt;
+  case K::I2B:
+    if (a.flavor == CV::I) {
+      return constOfI(
+          static_cast<std::int32_t>(static_cast<std::int8_t>(a.i)));
+    }
+    return std::nullopt;
+  case K::I2C:
+    if (a.flavor == CV::I) {
+      return constOfI(a.i & 0xFFFF);
+    }
+    return std::nullopt;
+  case K::I2S:
+    if (a.flavor == CV::I) {
+      return constOfI(
+          static_cast<std::int32_t>(static_cast<std::int16_t>(a.i)));
+    }
+    return std::nullopt;
+  case K::I2F:
+    if (a.flavor == CV::I) {
+      return constOfF(fToBits(static_cast<float>(a.i)));
+    }
+    return std::nullopt;
+  case K::I2D:
+    if (a.flavor == CV::I) {
+      return constOfD(dToBits(static_cast<double>(a.i)));
+    }
+    return std::nullopt;
+  case K::L2F:
+    if (a.flavor == CV::L) {
+      return constOfF(fToBits(static_cast<float>(a.l)));
+    }
+    return std::nullopt;
+  case K::L2D:
+    if (a.flavor == CV::L) {
+      return constOfD(dToBits(static_cast<double>(a.l)));
+    }
+    return std::nullopt;
+  case K::F2I:
+    if (a.flavor == CV::F) {
+      return constOfI(static_cast<std::int32_t>(
+          fpToInt64(bitsToF(a.fb), false)));
+    }
+    return std::nullopt;
+  case K::F2L:
+    if (a.flavor == CV::F) {
+      return constOfL(fpToInt64(bitsToF(a.fb), true));
+    }
+    return std::nullopt;
+  case K::F2D:
+    if (a.flavor == CV::F && !std::isnan(bitsToF(a.fb))) {
+      return constOfD(dToBits(static_cast<double>(bitsToF(a.fb))));
+    }
+    return std::nullopt;
+  case K::D2I:
+    if (a.flavor == CV::D) {
+      return constOfI(static_cast<std::int32_t>(
+          fpToInt64(bitsToD(a.db), false)));
+    }
+    return std::nullopt;
+  case K::D2L:
+    if (a.flavor == CV::D) {
+      return constOfL(fpToInt64(bitsToD(a.db), true));
+    }
+    return std::nullopt;
+  case K::D2F:
+    if (a.flavor == CV::D && !std::isnan(bitsToD(a.db))) {
+      const float r = static_cast<float>(bitsToD(a.db));
+      if (std::isnan(r)) {
+        return std::nullopt; // only from NaN input (checked above): safety
+      }
+      return constOfF(fToBits(r));
+    }
+    return std::nullopt;
+  default:
+    return std::nullopt;
+  }
+}
+
+ir::NodeId makeConstNode(ir::Graph& g, const ConstVal& c) {
+  switch (c.flavor) {
+  case CV::I:
+    return g.constantI(c.i);
+  case CV::L:
+    return g.constantL(c.l);
+  case CV::F:
+    return g.constantF(bitsToF(c.fb));
+  case CV::D:
+    return g.constantD(bitsToD(c.db));
+  case CV::Null:
+    return g.constantNull();
+  default:
+    return ir::kInvalidNodeId;
+  }
+}
+
 void runSimplify(ir::Graph& g, std::uint32_t classMask, PassTelemetry& t,
                  Budget& b, const Junk& jk) {
   for (std::uint32_t sweep = 0; sweep < kMaxSimplifySweeps; ++sweep) {
@@ -860,69 +978,11 @@ void runSimplify(ir::Graph& g, std::uint32_t classMask, PassTelemetry& t,
           const ConstVal a = constOf(g, g.input(n, 0));
           const ConstVal bIn = constOf(g, g.input(n, 1));
           if (isConst(a) && isConst(bIn)) {
-            if (a.flavor == CV::I && bIn.flavor == CV::I) {
-              if (const auto r = foldIntBin(k, a.i, bIn.i)) {
-                rep = g.constantI(static_cast<std::int32_t>(*r));
-              }
-            } else if (a.flavor == CV::L && bIn.flavor == CV::L) {
-              if (const auto r = foldLongBin(k, a.l, bIn.l)) {
-                // CmpL produces an INT result (-1/0/1) even though its
-                // operands are Long; every other long op produces Long.
-                rep = k == ir::NodeKind::CmpL
-                          ? g.constantI(static_cast<std::int32_t>(*r))
-                          : g.constantL(*r);
-              }
-            } else if (a.flavor == CV::F && bIn.flavor == CV::F) {
-              if (const auto r = foldFloatBin(k, bitsToF(a.fb),
-                                              bitsToF(bIn.fb))) {
-                rep = g.constantF(bitsToF(*r));
-              }
-            } else if (a.flavor == CV::D && bIn.flavor == CV::D) {
-              if (const auto r = foldDoubleBin(k, bitsToD(a.db),
-                                                bitsToD(bIn.db))) {
-                rep = g.constantD(bitsToD(*r));
-              }
-            }
-            // Float/double COMPARISONS fold even on NaN inputs: the
-            // result is a defined int (NaN compares less/greater per
-            // the kind), so the exact-bits policy does not block them.
-            // (Separate from the chain above: arithmetic folds that
-            // refuse NaN must not hide the comparison rule.)
-            if (!rep &&
-                (k == ir::NodeKind::CmpFl || k == ir::NodeKind::CmpFg ||
-                 k == ir::NodeKind::CmpDl || k == ir::NodeKind::CmpDg) &&
-                ((a.flavor == CV::F && bIn.flavor == CV::F) ||
-                 (a.flavor == CV::D && bIn.flavor == CV::D))) {
-              // Float/double COMPARISONS fold even on NaN inputs: the
-              // result is a defined int (NaN compares less/greater per
-              // the kind), so the exact-bits policy does not block them.
-              const bool dbl = a.flavor == CV::D;
-              const double x = dbl ? bitsToD(a.db)
-                                   : static_cast<double>(bitsToF(a.fb));
-              const double y = dbl ? bitsToD(bIn.db)
-                                   : static_cast<double>(bitsToF(bIn.fb));
-              std::int32_t r = 0;
-              switch (k) {
-              case ir::NodeKind::CmpFl:
-              case ir::NodeKind::CmpDl:
-                r = (std::isnan(x) || std::isnan(y))
-                        ? -1
-                        : static_cast<std::int32_t>((x > y) - (x < y));
-                break;
-              case ir::NodeKind::CmpFg:
-              case ir::NodeKind::CmpDg:
-                r = (std::isnan(x) || std::isnan(y))
-                        ? 1
-                        : static_cast<std::int32_t>((x > y) - (x < y));
-                break;
-              default:
-                r = 0;
-                break;
-              }
-              if (k == ir::NodeKind::CmpFl || k == ir::NodeKind::CmpFg ||
-                  k == ir::NodeKind::CmpDl || k == ir::NodeKind::CmpDg) {
-                rep = g.constantI(r);
-              }
+            // One evaluator, shared with SCCP's lattice: integer/long
+            // arithmetic + comparisons, exact-bits FP arithmetic, and
+            // the NaN-tolerant FP comparisons (CmpFl/CmpFg/CmpDl/CmpDg).
+            if (const auto r = evalBinOp(k, a, bIn)) {
+              rep = makeConstNode(g, *r);
             }
           }
         }

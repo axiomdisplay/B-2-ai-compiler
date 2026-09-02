@@ -10,10 +10,11 @@ If this document conflicts with docs/laws.md, laws.md wins.
 
 Team: Passes Team. Implementation: `compiler/passes/src/` (Passes.cpp
 registry/driver, PassSupport.cpp shared machinery, Simplify.cpp,
-ControlFlow.cpp, DCE.cpp, GVN.cpp, Escape.cpp), API
-`include/b2/passes/Passes.h`, tests `tests/passes/PassTests.cpp` and
-`tests/passes/EscapeTests.cpp` (Rule 35: >= 10 tests per delivered
-pass key), tool surface `b2graph -O` / `b2graph --pea`.
+SCCP.cpp, ControlFlow.cpp, DCE.cpp, GVN.cpp, Escape.cpp), API
+`include/b2/passes/Passes.h`, tests `tests/passes/PassTests.cpp`,
+`tests/passes/SCCPTests.cpp` and `tests/passes/EscapeTests.cpp` (Rule
+35: >= 10 tests per delivered pass key), tool surface `b2graph -O` /
+`b2graph --pea`.
 
 This document is the **rule-level review artifact** for the pass suite
 v1: every rewrite the passes may perform, the exact soundness argument,
@@ -37,6 +38,7 @@ lives in code (`passRegistry()`); this file is the prose contract.
 | 19 | branchnorm | control | constant-condition Ifs/Guards fold to the taken edge |
 | 20 | cfs | control | unreachable sweep + region repair |
 | 35 | gvn | scalar | structural global value numbering |
+| 38 | sccp | scalar | sparse conditional constant propagation (rows 37-39) |
 | 65 | escape | pea | escape classification lattice + decision log (analysis-only) |
 | 66 | pea | pea | escape-point materialization (Materialize wired into both chains) |
 | 67 | scalar | pea | no-escape allocation replacement (loads forward, stores vanish) |
@@ -47,7 +49,13 @@ Not delivered in v1: **17 (redundant cast removal)** — needs type proofs
 11-20 minus 17 and item 35 are the early-cleanup core; items 12-16 share
 one sweep engine (`runSimplify`) with a class mask so each key is
 independently kill-switchable while the pipeline runs them as one pass
-for cost. The CM-PEA family (65/66/67/69) is one engine (`Escape.cpp`)
+for cost. **SCCP (38) is one engine covering the charter's whole scalar
+constant-propagation family**: rows 37 (CPROP) and 39 (conditional
+constant propagation) are subsumed exactly the way CSE (36) is covered
+by GVN for identical keys — the unconditional reading is the lattice
+with both branch sides always executable, and the conditional reading
+IS the phi-meet-over-executable-edges rule (section 13). The CM-PEA
+family (65/66/67/69) is one engine (`Escape.cpp`)
 with four stage bits — each key is independently kill-switchable and a
 disabled stage REJECTS that disposition (PEA Rule option 4), never
 half-applies.
@@ -64,19 +72,26 @@ mode.
 ```text
 round (max kMaxEarlyCleanupRounds = 3):
   simplify (fold | identity | strength | canon | trivial-phi, one sweep)
+  sccp (38)               [lattice propagation; new constants land NOW]
   nullfold (18)
   branchnorm (19)          [includes the unreachable sweep + repair]
   cfs (20)
   dce (11)
   gvn (35)
-  pea (65|66|67|69, one engine call; stage bits per key)
+  pea (65|66/67|69, one engine call; stage bits per key)
   dce (11)                 [post-PEA orphans + forwarded constants]
 stop when the round changed nothing (converged=true), or at the round
 budget while still changing (converged=false + telemetry diag: the graph
 is valid, the fixpoint is merely unconfirmed).
 ```
 
-PEA runs after GVN (redundant loads are already merged) and after the
+SCCP runs immediately after the local folds (section 13): the folded
+literals are its operand seeds, and every constant it discovers — a
+phi-meet value, a loop-invariant backedge fixpoint, a branch condition
+that only became constant through propagation — is already a literal
+node when nullfold/branchnorm/cfs/dce run in the SAME round, so the
+control-level consequences (a folded branch, a swept dead arm) land
+without burning an extra fixpoint round. PEA runs after GVN (redundant loads are already merged) and after the
 use guards were folded (nullfold + DCE) — that is the engine's documented
 precondition: live guards on the allocation's uses pin FrameStates into
 the locals, which would otherwise force `fs-deopt-ref` rejections.
@@ -282,16 +297,17 @@ surface.
 
 ## 10. Testing (Rule 35) and the corpus gate
 
-`tests/passes/PassTests.cpp`: 126 tests over the ten delivered keys —
+`tests/passes/PassTests.cpp`: 126 tests over the ten pre-SCCP keys —
 ten or more per key, each pinning: the rewrite catalogs above (positive
 and negative: FP NaN non-folds, conservative exclusions, switch
 refusal), tombstone-law legality (verifier after every pass), kill
 switches (byte-identical no-op graphs), idempotency (zero-telemetry
 second runs), determinism (double-build byte identity), and the Rule 14
-FrameState auto-update. The strongest gate is the corpus sweep: all 19
+FrameState auto-update. `tests/passes/SCCPTests.cpp` adds 21 tests over
+key 38 (section 13.6). The strongest gate is the corpus sweep: all 19
 interp-corpus programs, every method, through the full pipeline —
 verified, deterministic, idempotent — plus `b2graph -O` as the human
-surface (telemetry line per method).
+surface (telemetry line per method; the sccp= counter rides it).
 
 ## 11. Deferred (with the blocking reason)
 
@@ -473,3 +489,149 @@ cost gate again. (g) An fs serving two deopt points that observe
 different field states rejects (`fs-multi-deopt`); per-deopt-point
 caller-frame copies (the Graal shape) would lift it — that is an
 inlining-engine IR change, not a PEA one.
+
+---
+
+## 13. SCCP (key 38 — one engine for charter rows 37/38/39)
+
+Implementation: `compiler/passes/src/SCCP.cpp` (`detail::runSCCP`);
+telemetry `sccpConstants`; tool surface `b2graph -O` (the `sccp=`
+counter). The value-level fold semantics are NOT duplicated here: SCCP
+calls the same `detail::evalBinOp` / `detail::evalUnaryOp` / `constOf`
+evaluators constfold (14) uses (lifted to `PassInternal.h` linkage in
+`Simplify.cpp`) — one Java-semantics table for both passes (Rule 72),
+which is why an SCCP claim is exactly as trustworthy as a constfold
+replacement: same wrap arithmetic, same JVM div/rem special cases, same
+JLS 5.1.3 narrowing, same IEEE exact-bits NaN policy (NaN-free FP
+arithmetic folds only; the FP comparisons fold on NaN because their
+result is a defined int).
+
+### 13.1 The lattice
+
+Per live node, values only DESCEND (monotone, Rule 10):
+
+- **Top** — unresolved (optimistic: the propagation is still running).
+- **Const(c)** — provably `c` on every executable path.
+- **Bot** — not a compile-time constant (variable input, opaque op, or
+  a fold refusal such as division by a constant zero: the runtime value
+  does not exist).
+
+`meet(Top, x) = x; meet(c, c) = c; meet(c1, c2) = Bot; Bot absorbs.`
+Seeding: ConstantI/L/F/D/Null resolve to themselves; parameters,
+ConstantSym, Undef, vector/tag/box/extension kinds, and every
+control-pinned or memory-producing node (loads, calls, allocations,
+CheckCast, Start's memory state) seed **Bot**; the evaluator's kinds
+plus Phi seed **Top** and are eagerly queued.
+
+### 13.2 The executable-edge rule (the "conditional")
+
+Control propagates from Start through Ctrl/Parent-slot users — the
+exact successor rule the unreachable sweep uses. An **If** whose
+condition lattice is Const marks only the taken projection executable
+(Bot marks both; Top waits for the condition and re-fires when it
+lowers). An always-failing **Guard** (Const cond == 0) stops flow —
+exactly the Deopt it becomes under branchnorm; a passing-or-unknown
+guard flows onward. **Region/LoopBegin** are executable when any input
+is: the backedge only fires once the body does (natural causality — no
+forward/backedge special case; the builder appends the LoopEnd anchor
+after the forward inputs, and SCCP reads executability, not slot
+order). **Switch** marks ALL projections: case ordinals are
+frontend-opaque payloads (the documented switch-folding blocker), so a
+constant selector is over-approximated — conservatism (b) below.
+**CallExcept** rides the call's Parent edge like every other projection
+(an exception may be thrown).
+
+**Phi meets only over executable region inputs.** A value flowing
+solely on a never-executed edge does not exist; a not-yet-executable
+backedge contributes Top (ignored) — this optimism is what resolves
+loop-invariant phis: `phi = meet(0, phi)` stabilizes at 0, while
+`phi = meet(0, phi+1)` correctly descends to Bot when the backedge
+value refutes the optimism. Memory-state phis can never claim a
+constant (no flavor types as Bottom and no memory producer is Const),
+pinned by test.
+
+### 13.3 The completion rule (the soundness bolt)
+
+At the propagation fixpoint, a **Top** value with at least one LIVE
+user is not "unreachable code" (the classic CFG reading — floating
+values have no block): it is UNRESOLVED, and an unresolved value
+feeding a live use is treated as overdefined — forced to Bot and
+re-propagated until stable (iterated, monotone, bounded by the node
+count). This is what keeps the optimism honest: a phi whose executable
+edge carries a never-resolving value (a hand-buildable shape; builder
+output resolves everything) collapses to Bot instead of claiming the
+meet of its resolved edges alone. Userless Top values (dead-code
+leftovers) stay Top — nobody observes them.
+
+### 13.4 The rewrite surface (deliberately minimal)
+
+APPLY (id order, Rule 124): every live node whose lattice value is
+Const and whose kind is in the evaluator's floating set or Phi is
+replaced by an **interned** constant node (one node per distinct value
+per run, created on first need — byte-stable prints; GVN merges the
+interned nodes with pre-existing identical constants later in the same
+round). Replacements go through `detail::replace`, so FrameState
+snapshots auto-update (Rule 14: deopt reconstruction sees exactly the
+constant the phi was on every executable path) and tombstone edges are
+junked per the tombstone law. A cycle-safe type belt (`typeOfNoCycle`:
+the phi self-marker's type is the phi's own join, and `join(x, Bottom)
+= Bottom`, so on-path inputs are EXCLUDED rather than contributed)
+refuses any replacement whose flavor type disagrees with the node's
+type — unreachable in verified graphs, cheap insurance in hand-built
+ones. **Control is never rewritten**: guards and branches stay
+branchnorm's business — SCCP only makes their conditions literal, and
+the same round's branchnorm/cfs/dce consume them (test-pinned: a
+decided-by-propagation branch folds within one pipeline round).
+
+The value facts mirror constfold's `foldValueFacts` through the
+lattice: `IsNull(null-phi) = 1`, `IsNull(NeverNull node) = 0` (the
+allocation's own lattice value is Bot — the fact is read at NODE
+level), `RefEq(x, x) = 1`, `RefEq(null, null) = 1`,
+`RefEq(null, never-null) = 0`, `InstanceOf(null) = 0`.
+
+### 13.5 Budget
+
+The `Budget` is charged per worklist pop AND per replacement. A
+propagation or completion overrun aborts BEFORE any rewrite — claims
+from a partial fixpoint are not sound, so none are applied (the graph
+is untouched; telemetry reports the overrun). An apply overrun stops
+mid-apply at a valid point: every replacement is individually sound at
+the fixpoint, so a prefix is too.
+
+### 13.6 Testing inventory (Rule 35)
+
+`tests/passes/SCCPTests.cpp`, 21 tests: the meet rule (same value from
+different expressions folds, three rewrites; distinct constants
+refuse), the arithmetic cascade through a meet, the executable-edge
+rule (a decided-by-lattice branch prunes the dead arm; a parameter
+condition keeps both edges), same-round pipeline consumption (the
+branch folds and sweeps in ONE round), the loop family (self-marker
+resolves; `phi+0` invariant resolves INCLUDING the AddI; a varying
+counter refuses; a zero-trip loop resolves to its init value), the
+null lattice (null phi meets to ConstantNull and IsNull folds to 1),
+the NeverNull fact, the guard-condition contract (condition folds,
+guard untouched), the completion rule (an unresolved-but-used value
+collapses the meet — no claim), the parameter seed (never constant),
+idempotency (zero-telemetry second run, byte-identical print),
+determinism (double build), the kill switch (byte-identical no-op),
+the pipeline counter, memory-phi refusal, and the Rule 14 FrameState
+auto-update. Plus the corpus sweep (all 19 programs through the
+SCCP-bearing pipeline, verified + deterministic + idempotent) in
+`PassTests.cpp`, and the `--pgo -O loop_call_demo.rbc` tool demo
+(sccp=6 on the post-inline graph — the guard-inline path feeds SCCP
+phi-meet constants).
+
+### 13.7 Conservatisms (deliberate, each with its lifter)
+
+(a) Parameters are never constants — T3 static mode has no
+argument-constant facts; the PGO ArgumentConstant speculation
+(SpecMeta kind) is the lifter. (b) Switch marks all projections — the
+case-ordinal mapping is frontend-side; the lifter is exposing case
+values in the IR payload. (c) Guard conditions evaluate only through
+the value lattice — no path-refinement along taken branches (the
+classic sparse-predicate extension); the lifter is a dedicated
+predicate-propagation pass, not SCCP growth. (d) Loads, calls, and
+allocations are Bot regardless of context (a LoadStatic after
+ClassInit of a constant static is constant in principle) — the lifter
+is the static-field value table. (e) RefEq of two distinct non-null
+references is Bot (identity is runtime state).

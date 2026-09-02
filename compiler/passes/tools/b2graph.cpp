@@ -215,10 +215,11 @@ int run(const b2::rbc::Program& prog, bool quiet, bool optimize, bool inl,
       }
       if (!quiet) {
         std::printf("  # pipeline: rounds=%u rewrites=%u removals=%u "
-                    "folds=%u gvn=%u pea=%u/%u/%u converged=%d\n",
+                    "folds=%u gvn=%u sccp=%u pea=%u/%u/%u converged=%d\n",
                     pr.telemetry.rounds, pr.telemetry.rewrites,
                     pr.telemetry.removals, pr.telemetry.folds,
-                    pr.telemetry.gvnDedups, pr.telemetry.peaScalarized,
+                    pr.telemetry.gvnDedups, pr.telemetry.sccpConstants,
+                    pr.telemetry.peaScalarized,
                     pr.telemetry.peaMaterialized,
                     pr.telemetry.peaRejected,
                     pr.telemetry.converged ? 1 : 0);

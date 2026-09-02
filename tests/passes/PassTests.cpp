@@ -2877,11 +2877,13 @@ B2_TEST(pipe_verify_flag_configurable) {
 
 B2_TEST(pipe_registry_contract) {
   const auto reg = passes::passRegistry();
-  // 10 early-cleanup/GVN rows + the 4 CM-PEA stage keys (65/66/67/69).
-  CHECK(reg.size() == 14);
+  // 10 early-cleanup/GVN rows + SCCP (38) + the 4 CM-PEA stage keys.
+  CHECK(reg.size() == 15);
   CHECK(passes::passInfo(PK::DeadCodeElimination).key ==
         PK::DeadCodeElimination);
   CHECK(passes::passInfo(PK::GVN).key == PK::GVN);
+  CHECK(passes::passInfo(PK::SparseConditionalConstantPropagation).key ==
+        PK::SparseConditionalConstantPropagation);
   CHECK(passes::passInfo(PK::EscapeAnalysis).key == PK::EscapeAnalysis);
   CHECK(passes::passInfo(PK::PartialEscapeAnalysis).key ==
         PK::PartialEscapeAnalysis);

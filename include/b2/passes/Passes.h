@@ -1,7 +1,7 @@
 #pragma once
 // B-2 Passes - the T2/T3 optimization pass suite v1: pass registry, pass
-// contracts, kill switches, budgets, telemetry, and the early-cleanup + GVN
-// pipeline (charter appendix items 11-20 and 35).
+// contracts, kill switches, budgets, telemetry, and the early-cleanup +
+// GVN + SCCP pipeline (charter appendix items 11-20, 35, and 38).
 //
 // WHY THIS FILE EXISTS:
 // The passes team owns the optimizer on top of b2::ir (Amendment B.4: the
@@ -36,11 +36,14 @@ namespace b2::passes {
 
 // Registry keys: the passes-team charter appendix numbering (stable and
 // normative for pass registry keys). v1 delivers the early-cleanup group
-// (11-20, minus 17: redundant-cast removal needs type proofs), GVN, and
-// the CM-PEA family (65/66/67/69 - one engine, four stage keys; docs/
-// pass_contracts.md section 12 is the normative contract). Keys not
+// (11-20, minus 17: redundant-cast removal needs type proofs), GVN, SCCP,
+// and the CM-PEA family (65/66/67/69 - one engine, four stage keys;
+// docs/ pass_contracts.md section 12 is the normative contract). Keys not
 // delivered yet resolve to the bad registry row (passInfo().key != key)
-// and runSinglePass refuses them with a diagnostic.
+// and runSinglePass refuses them with a diagnostic. Coverage note: SCCP
+// (38) is the engine for the charter's whole conditional/unconditional
+// constant-propagation family - rows 37 CPROP and 39 conditional constant
+// propagation are subsumed by it exactly like CSE (36) is covered by GVN.
 enum class PassKey : std::uint16_t {
   DeadCodeElimination = 11,       // remove pure values with no live users
   TrivialBlockFusion = 12,        // single-pred regions + trivial phis
@@ -53,6 +56,7 @@ enum class PassKey : std::uint16_t {
   BranchNormalization = 19,       // constant If/Guard conditions
   ControlFlowSimplification = 20, // unreachable sweep + region repair
   GVN = 35,                       // structural global value numbering
+  SparseConditionalConstantPropagation = 38, // lattice + executable edges
   EscapeAnalysis = 65,            // CM-PEA: escape classification lattice
   PartialEscapeAnalysis = 66,     // CM-PEA: materialization placement
   ScalarReplacement = 67,         // CM-PEA: virtual objects + forwarding
@@ -130,8 +134,11 @@ struct PassConfig {
   void disableAll();
 
   // Implementation detail: bit i of enabledBits mirrors passRegistry()
-  // entry i (all set by default). Use the accessors, not the bits.
-  std::uint16_t enabledBits = 0xFFFF;
+  // entry i (all set by default). Use the accessors, not the bits. The
+  // registry passed 16 rows (SCCP made 15), so the width is 32 - the
+  // remaining headroom covers the planned inline-registry and loop-pass
+  // rows without another breaking change.
+  std::uint32_t enabledBits = 0xFFFFFFFFu;
 
   // Rule 40: ir::verify runs after every pass while true. Tools, tests,
   // and debug builds keep it on; the T2 runtime driver may turn it off in
@@ -150,6 +157,7 @@ struct PassTelemetry {
   std::uint32_t removals = 0;  // killNode calls
   std::uint32_t folds = 0;     // simplify-family rewrites (13-16, phi)
   std::uint32_t gvnDedups = 0; // GVN replacements
+  std::uint32_t sccpConstants = 0; // SCCP value->constant replacements
   std::uint32_t rounds = 0;    // fixpoint rounds executed
   std::uint32_t budgetOverruns = 0;
   std::uint32_t peaScalarized = 0;   // CM-PEA: allocations fully replaced

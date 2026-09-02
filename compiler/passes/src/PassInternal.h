@@ -23,6 +23,7 @@
 // removal mechanism is requested from the IR team (see messages/).
 
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -33,6 +34,76 @@
 #include "b2/passes/Passes.h"
 
 namespace b2::passes::detail {
+
+// --- the shared constant machinery (keys 14 + 38, one semantics) -------------
+//
+// ConstVal is the exact-bits constant representation; constOf extracts it
+// from constant nodes; evalBinOp/evalUnaryOp are the VALUE-level fold
+// evaluators. constfold (14) creates replacement NODES from these; SCCP
+// (38) holds them as LATTICE values during propagation. One source of
+// truth for Java numeric semantics (Rule 72): integer wrap arithmetic,
+// JVM div/rem special cases (INT_MIN / -1), JLS 5.1.3 narrowing, the
+// IEEE exact-bits NaN policy (NaN-free arithmetic folds only; FP
+// comparisons fold on NaN because the result is a defined int).
+enum class CV : std::uint8_t { None, I, L, F, D, Null };
+struct ConstVal {
+  CV flavor = CV::None;
+  std::int32_t i = 0;
+  std::int64_t l = 0;
+  std::uint32_t fb = 0; // float bits
+  std::uint64_t db = 0; // double bits
+};
+
+// Flavor constructors (the evaluator's return vocabulary).
+[[nodiscard]] inline ConstVal constOfI(std::int32_t v) {
+  ConstVal c;
+  c.flavor = CV::I;
+  c.i = v;
+  return c;
+}
+[[nodiscard]] inline ConstVal constOfL(std::int64_t v) {
+  ConstVal c;
+  c.flavor = CV::L;
+  c.l = v;
+  return c;
+}
+[[nodiscard]] inline ConstVal constOfF(std::uint32_t bits) {
+  ConstVal c;
+  c.flavor = CV::F;
+  c.fb = bits;
+  return c;
+}
+[[nodiscard]] inline ConstVal constOfD(std::uint64_t bits) {
+  ConstVal c;
+  c.flavor = CV::D;
+  c.db = bits;
+  return c;
+}
+
+// The constant a ConstantI/L/F/D/Null node carries (None otherwise).
+[[nodiscard]] ConstVal constOf(const ir::Graph& g, ir::NodeId n);
+[[nodiscard]] bool isConst(const ConstVal& c);
+
+// Two-operand fold: arithmetic (wrap/exact-bits), integer and long
+// comparisons, CmpI/CmpL, and the NaN-tolerant FP comparisons. Returns
+// nullopt when the kind/flavor pair is not foldable or the fold is
+// refused (div/rem by zero, NaN-input arithmetic, kind not in the
+// catalog). Caller guarantees matching flavors for typed graphs; mixed
+// flavors (only possible pre-verification) are not foldable.
+[[nodiscard]] std::optional<ConstVal> evalBinOp(ir::NodeKind k,
+                                                const ConstVal& a,
+                                                const ConstVal& b);
+
+// One-operand fold: conversions (I2L..I2S incl. JLS 5.1.3 narrowing),
+// NegI/NegL (wrap), NegF/NegD (exact sign-bit flip - NaN payload
+// preserved), Not. Same refusal policy as evalBinOp.
+[[nodiscard]] std::optional<ConstVal> evalUnaryOp(ir::NodeKind k,
+                                                  const ConstVal& a);
+
+// The constant NODE for a folded value (the constfold/SCCP replacement
+// vocabulary). kInvalidNodeId for flavor None (never happens for fold
+// results).
+[[nodiscard]] ir::NodeId makeConstNode(ir::Graph& g, const ConstVal& c);
 
 // --- Budget guard (Rules 10, 23, 26) --------------------------------------
 struct Budget {
@@ -248,6 +319,17 @@ void runNullCheckFolding(ir::Graph& g, PassTelemetry& t, Budget& b,
                          const Junk& jk);
 void runDCE(ir::Graph& g, PassTelemetry& t, Budget& b, const Junk& jk);
 void runGVN(ir::Graph& g, PassTelemetry& t, Budget& b, const Junk& jk);
+
+// SCCP (key 38, one engine covering charter rows 37-39): optimistic
+// value-lattice propagation over executable control edges (Wegman-Zadeck
+// adapted to the sea of nodes - pure values float, so they evaluate on
+// operand descent; phis meet over executable region inputs only; If/Guard
+// conditions decide edge executability through the LATTICE, which is what
+// constfold's literal-only view cannot see). Rewrites = Const lattice
+// values replaced by interned constant nodes, in id order (Rule 124).
+// The Budget covers propagation steps AND rewrites; a propagation overrun
+// aborts before any rewrite (partial fixpoint claims are not sound).
+void runSCCP(ir::Graph& g, PassTelemetry& t, Budget& b, const Junk& jk);
 
 // --- CM-PEA engine (Escape.cpp; keys 65/66/67/69 share it) ------------------
 //

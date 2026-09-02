@@ -9,6 +9,7 @@ set(B2_PASSES_SOURCES
   src/Passes.cpp
   src/PassSupport.cpp
   src/Simplify.cpp
+  src/SCCP.cpp
   src/ControlFlow.cpp
   src/DCE.cpp
   src/GVN.cpp

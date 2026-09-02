@@ -76,6 +76,14 @@ constexpr PassInfo kRegistry[] = {
      "eligible set; replacement by the lowest id; FrameStates auto-update "
      "(Rule 14)",
      false, kDefaultPassRewriteBudget},
+    {PassKey::SparseConditionalConstantPropagation, "sccp",
+     "requires: verifier-clean graph; produces: every live floating "
+     "value provably constant on all executable paths replaced by an "
+     "interned constant (optimistic Top/Const/Bot lattice, phi meets "
+     "over executable edges only, unresolved-but-used values forced "
+     "overdefined); control stays branchnorm's business in the same "
+     "round; one engine for charter rows 37-39",
+     true, kDefaultPassRewriteBudget},
     {PassKey::EscapeAnalysis, "escape",
      "requires: verifier-clean post-inline graph (guards folded); "
      "produces: every allocation classified on the height-6 escape "
@@ -157,6 +165,9 @@ void runOne(PassKey key, ir::Graph& g, PassTelemetry& t, detail::Budget& b,
   case PassKey::GVN:
     detail::runGVN(g, t, b, jk);
     return;
+  case PassKey::SparseConditionalConstantPropagation:
+    detail::runSCCP(g, t, b, jk);
+    return;
   case PassKey::EscapeAnalysis:
     // Analysis-only mode (key 65 in isolation): the classification and
     // decision surface without any rewrite.
@@ -231,14 +242,14 @@ bool PassConfig::isPassEnabled(PassKey key) const {
 
 void PassConfig::setPassEnabled(PassKey key, bool on) {
   const std::size_t idx = passRegistryIndex(key);
-  if (idx == kInvalidPassIndex || idx >= 16) {
-    return; // registry is <= 16 rows; unknown keys are no-ops
+  if (idx == kInvalidPassIndex || idx >= 32) {
+    return; // registry is <= 32 rows; unknown keys are no-ops
   }
-  const std::uint16_t bit = static_cast<std::uint16_t>(1u << idx);
+  const std::uint32_t bit = 1u << idx;
   if (on) {
     enabledBits |= bit;
   } else {
-    enabledBits &= static_cast<std::uint16_t>(~bit);
+    enabledBits &= ~bit;
   }
 }
 
@@ -406,6 +417,16 @@ PassResult runEarlyCleanup(ir::Graph& g, const PassConfig& cfg) {
           !verifyInto(r, g, PassKey::ConstantFolding)) {
         return r;
       }
+    }
+    // SCCP (key 38) runs right after the local folds: its lattice sees
+    // the folded constants as literal operands, discovers the constants
+    // constfold cannot (phi meets over executable edges, optimistic loop
+    // fixpoints), and replaces them - so nullfold/branchnorm/cfs/dce in
+    // THIS round consume the new constants (a proven-constant branch
+    // condition folds here, the unreachable arm sweeps here). PEA still
+    // runs after GVN with guards already folded - its precondition.
+    if (!step(PassKey::SparseConditionalConstantPropagation)) {
+      return r;
     }
     if (!step(PassKey::NullCheckFolding)) {
       return r;
