@@ -610,15 +610,51 @@ void emitNode(LowerState& s, ir::NodeId n) {
       s.em.movRaxImm64(nd.constValue); storeLong(s,n); break;
     case K::Parameter: case K::Undef: break;
     // === int arithmetic ===
-    case K::AddI: loadIntEax(s,s.g.input(n,0)); loadIntEcx(s,s.g.input(n,1)); s.em.addEaxEcx(); storeInt(s,n); break;
-    case K::SubI: loadIntEax(s,s.g.input(n,0)); loadIntEcx(s,s.g.input(n,1)); s.em.subEaxEcx(); storeInt(s,n); break;
+    // WHY: direct-register path for loop variables. If the result is in a
+    // register AND the first operand is in the SAME register (the common
+    // loop-body shape: s = s + i), emit a single 'add reg, src' instead of
+    // load→mov→add→mov (4 ops). This is the register allocator's payoff.
+    case K::AddI: case K::SubI: case K::AndI: case K::OrI: case K::XorI: {
+      ir::NodeId aNode = s.g.input(n, 0), bNode = s.g.input(n, 1);
+      auto rRes = s.regOf.find(n), rA = s.regOf.find(aNode);
+      if (rRes != s.regOf.end() && rA != s.regOf.end() &&
+          rRes->second == rA->second) {
+        // Direct: op result_reg, b
+        Reg32 dst = reg32Of(rRes->second);
+        // Load b into ECX (scratch).
+        loadIntEcx(s, bNode);
+        bool rex_b = dst >= Reg32::R8D;
+        if (rex_b) s.em.byte(0x41);
+        s.em.byte(0x09 - (nd.kind == K::AddI ? 0 : nd.kind == K::SubI ? 1 :
+                          nd.kind == K::AndI ? 2 : nd.kind == K::OrI ? 3 : 4));
+        // 01=add 29=sub 21=and 09=or 31=xor
+        // Actually the opcodes are: add=01, sub=29, and=21, or=09, xor=31
+        // Let me fix: the byte above is wrong. Use a proper switch.
+        s.em.buf.pop_back(); // remove the wrong opcode byte
+        std::uint8_t opc = 0x01; // add
+        if (nd.kind == K::SubI) opc = 0x29;
+        else if (nd.kind == K::AndI) opc = 0x21;
+        else if (nd.kind == K::OrI) opc = 0x09;
+        else if (nd.kind == K::XorI) opc = 0x31;
+        if (rex_b) s.em.byte(0x41);
+        s.em.byte(opc);
+        s.em.modrm(3, 1, static_cast<std::uint8_t>(dst)&7); // op dst, ecx
+        break;
+      }
+      // Fallback: EAX/ECX path.
+      loadIntEax(s, aNode); loadIntEcx(s, bNode);
+      if (nd.kind == K::AddI) s.em.addEaxEcx();
+      else if (nd.kind == K::SubI) s.em.subEaxEcx();
+      else if (nd.kind == K::AndI) s.em.andEaxEcx();
+      else if (nd.kind == K::OrI) s.em.orEaxEcx();
+      else s.em.xorEaxEcx();
+      storeInt(s, n);
+      break;
+    }
     case K::MulI: loadIntEax(s,s.g.input(n,0)); loadIntEcx(s,s.g.input(n,1)); s.em.imulEaxEcx(); storeInt(s,n); break;
     case K::DivI: loadIntEax(s,s.g.input(n,0)); loadIntEcx(s,s.g.input(n,1)); s.em.idivEcx(); storeInt(s,n); break;
     case K::RemI: loadIntEax(s,s.g.input(n,0)); loadIntEcx(s,s.g.input(n,1)); s.em.idivEcx(); s.em.movEaxEdx(); storeInt(s,n); break;
     case K::NegI: loadIntEax(s,s.g.input(n,0)); s.em.negEax(); storeInt(s,n); break;
-    case K::AndI: loadIntEax(s,s.g.input(n,0)); loadIntEcx(s,s.g.input(n,1)); s.em.andEaxEcx(); storeInt(s,n); break;
-    case K::OrI:  loadIntEax(s,s.g.input(n,0)); loadIntEcx(s,s.g.input(n,1)); s.em.orEaxEcx(); storeInt(s,n); break;
-    case K::XorI: loadIntEax(s,s.g.input(n,0)); loadIntEcx(s,s.g.input(n,1)); s.em.xorEaxEcx(); storeInt(s,n); break;
     case K::ShlI: loadIntEax(s,s.g.input(n,0)); loadIntEcx(s,s.g.input(n,1)); s.em.andEcxImm31(); s.em.shlEaxCl(); storeInt(s,n); break;
     case K::ShrI: loadIntEax(s,s.g.input(n,0)); loadIntEcx(s,s.g.input(n,1)); s.em.andEcxImm31(); s.em.sarEaxCl(); storeInt(s,n); break;
     case K::UShrI: loadIntEax(s,s.g.input(n,0)); loadIntEcx(s,s.g.input(n,1)); s.em.andEcxImm31(); s.em.shrEaxCl(); storeInt(s,n); break;
