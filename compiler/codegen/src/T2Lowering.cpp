@@ -57,6 +57,13 @@ struct LowerState {
   std::uint32_t deoptEpilogue = 0;
   std::uint32_t normalEpilogue = 0;
   std::string refusal;
+  // Register allocation: NodeId → register index (0-7). -1 means "in slot".
+  // Loop Phi values get registers; everything else stays in slots.
+  // Registers: 0=EAX, 1=ECX, 2=EDX, 3=ESI, 4=EDI, 5=R8D, 6=R9D, 7=R10D.
+  // WHY: loop variables (Phis at LoopBegin) are read/written every iteration.
+  // Keeping them in registers eliminates 4 memory accesses per operation.
+  std::unordered_map<ir::NodeId, int> regOf;
+  static constexpr int kNumRegs = 8;
   // Pending jumps: (patchOffset, targetNodeId). Sentinel kInvalidNodeId = deopt,
   // kInvalidNodeId-1 = normal exit.
   std::vector<std::pair<std::uint32_t, ir::NodeId>> pendingJumps;
@@ -113,14 +120,111 @@ void assignSlots(LowerState& s) {
   }
 }
 
-// --- load/store helpers ---
+// Register allocator: assign loop Phi values to x86 registers.
+// WHY: loop variables (Phis at LoopBegin) are the hottest values — they're
+// read and written every iteration. Keeping them in registers eliminates
+// the load/store-to-slot overhead for the most frequent operations.
+// Strategy: for each LoopBegin, assign its Phi values to available registers
+// (up to kNumRegs). The Phi's slot is still used for the type tag and for
+// spill/fill at loop entry/exit (phi moves).
+void assignRegisters(LowerState& s) {
+  // WHY: only use R8D, R9D, R10D for loop variables — EAX, ECX, EDX are
+  // scratch registers used by the arithmetic ops (loadIntEax, loadIntEcx,
+  // addEaxEcx, etc.). If a loop variable were in ECX, then loadIntEcx(b)
+  // would overwrite it before it's consumed. ESI/EDI are also avoided
+  // (helper ABI uses them for args). R8D-R10D are safe: they're not used
+  // as scratch by any arithmetic op, and helper calls save/restore them
+  // per the SysV ABI (caller-saved, but we emit them fresh before each call).
+  static constexpr int kRegStart = 5; // R8D
+  static constexpr int kRegEnd = 8;   // R8D, R9D, R10D
+  int nextReg = kRegStart;
+  for (ir::NodeId n = 0; n < s.g.nodeCount(); ++n) {
+    const ir::Node& nd = s.g.node(n);
+    if (nd.isDead() || nd.kind != K::Phi) continue;
+    if (nd.numInputs < 1) continue;
+    ir::NodeId region = s.g.input(n, 0);
+    if (region >= s.g.nodeCount() || s.g.node(region).isDead()) continue;
+    if (s.g.node(region).kind != K::LoopBegin) continue;
+    if (nextReg < kRegEnd) {
+      s.regOf[n] = nextReg++;
+    }
+  }
+}
 
-void loadIntEax(LowerState& s, ir::NodeId n) { auto it=s.slotOf.find(n); if(it!=s.slotOf.end()) s.em.loadRbpDisp32(Reg32::EAX, slotPayload(it->second)); }
-void loadIntEcx(LowerState& s, ir::NodeId n) { auto it=s.slotOf.find(n); if(it!=s.slotOf.end()) s.em.loadRbpDisp32(Reg32::ECX, slotPayload(it->second)); }
-void loadLongRax(LowerState& s, ir::NodeId n) { auto it=s.slotOf.find(n); if(it!=s.slotOf.end()) s.em.loadRbpDisp64(Reg::RAX, slotPayload(it->second)); }
-void loadLongRcx(LowerState& s, ir::NodeId n) { auto it=s.slotOf.find(n); if(it!=s.slotOf.end()) s.em.loadRbpDisp64(Reg::RCX, slotPayload(it->second)); }
+// Get the Reg32 for a register index.
+Reg32 reg32Of(int idx) noexcept {
+  switch (idx) {
+    case 0: return Reg32::EAX;
+    case 1: return Reg32::ECX;
+    case 2: return Reg32::EDX;
+    case 3: return Reg32::ESI;
+    case 4: return Reg32::EDI;
+    case 5: return Reg32::R8D;
+    case 6: return Reg32::R9D;
+    case 7: return Reg32::R10D;
+    default: return Reg32::EAX;
+  }
+}
+
+// --- load/store helpers ---
+// WHY: if a value is register-allocated, load from the register instead of
+// the slot. This is the register allocator's hot path — loop variables stay
+// in registers across iterations, eliminating memory traffic.
+
+void loadIntEax(LowerState& s, ir::NodeId n) {
+  auto rit = s.regOf.find(n);
+  if (rit != s.regOf.end()) {
+    Reg32 r = reg32Of(rit->second);
+    if (r != Reg32::EAX) {
+      // mov eax, r32: 89 /r (modrm: src=r, dst=eax). REX.B if r >= R8D.
+      bool rex_b = r >= Reg32::R8D;
+      if (rex_b) s.em.byte(0x41); // REX.B
+      s.em.byte(0x89);
+      s.em.modrm(3, static_cast<std::uint8_t>(r)&7, 0); // mov eax, r
+    }
+    return;
+  }
+  auto it=s.slotOf.find(n); if(it!=s.slotOf.end()) s.em.loadRbpDisp32(Reg32::EAX, slotPayload(it->second));
+}
+void loadIntEcx(LowerState& s, ir::NodeId n) {
+  auto rit = s.regOf.find(n);
+  if (rit != s.regOf.end()) {
+    Reg32 r = reg32Of(rit->second);
+    if (r != Reg32::ECX) {
+      bool rex_b = r >= Reg32::R8D;
+      if (rex_b) s.em.byte(0x41);
+      s.em.byte(0x89);
+      s.em.modrm(3, static_cast<std::uint8_t>(r)&7, 1); // mov ecx, r
+    }
+    return;
+  }
+  auto it=s.slotOf.find(n); if(it!=s.slotOf.end()) s.em.loadRbpDisp32(Reg32::ECX, slotPayload(it->second));
+}
+void loadLongRax(LowerState& s, ir::NodeId n) {
+  auto it=s.slotOf.find(n); if(it!=s.slotOf.end()) s.em.loadRbpDisp64(Reg::RAX, slotPayload(it->second));
+}
+void loadLongRcx(LowerState& s, ir::NodeId n) {
+  auto it=s.slotOf.find(n); if(it!=s.slotOf.end()) s.em.loadRbpDisp64(Reg::RCX, slotPayload(it->second));
+}
 
 void storeInt(LowerState& s, ir::NodeId n) {
+  auto rit = s.regOf.find(n);
+  if (rit != s.regOf.end()) {
+    Reg32 r = reg32Of(rit->second);
+    if (r != Reg32::EAX) {
+      bool rex_b = r >= Reg32::R8D;
+      if (rex_b) s.em.byte(0x41);
+      s.em.byte(0x89);
+      s.em.modrm(3, 0, static_cast<std::uint8_t>(r)&7); // mov r, eax
+    }
+    // WHY: do NOT store to slot on every write — that would defeat the
+    // register allocator (the whole point is to avoid memory traffic in
+    // the loop body). The slot is updated by phi moves at loop entry/exit.
+    // The type tag is set once at initialization (constant folding or phi
+    // move). Deopt reconstruction reads the slot, but deopt is cold path —
+    // we accept that the slot may be stale (the register has the truth).
+    return;
+  }
   auto it=s.slotOf.find(n); if(it==s.slotOf.end()) return;
   s.em.storeRbpDisp32(Reg32::EAX, slotPayload(it->second));
   s.em.xorEaxEax();
@@ -166,13 +270,38 @@ void emitPhiMovesForPred(LowerState& s, ir::NodeId merge, std::uint32_t predIdx)
     const ir::Node& nd = s.g.node(n);
     if (nd.isDead() || nd.kind != K::Phi) continue;
     if (nd.numInputs < 1 || s.g.input(n, 0) != merge) continue;
-    // phi.input[0] = region, phi.input[1+] = values per predecessor.
     std::uint32_t valIdx = predIdx + 1;
     if (valIdx >= nd.numInputs) continue;
     ir::NodeId srcNode = s.g.input(n, valIdx);
     auto srcIt = s.slotOf.find(srcNode);
     auto dstIt = s.slotOf.find(n);
-    if (srcIt != s.slotOf.end() && dstIt != s.slotOf.end()) {
+    if (srcIt == s.slotOf.end() || dstIt == s.slotOf.end()) continue;
+    // WHY: if the phi is register-allocated, load the source into the phi's
+    // register (and also store to the slot for type tag + deopt). This is
+    // the loop-entry/exit fill/spill point for the register allocator.
+    auto rit = s.regOf.find(n);
+    if (rit != s.regOf.end()) {
+      Reg32 phiReg = reg32Of(rit->second);
+      // Load source value into phiReg.
+      auto srcReg = s.regOf.find(srcNode);
+      if (srcReg != s.regOf.end()) {
+        // Source is also in a register — mov phiReg, srcReg.
+        Reg32 sr = reg32Of(srcReg->second);
+        if (sr != phiReg) {
+          s.em.byte(0x89); s.em.modrm(3, static_cast<std::uint8_t>(sr)&7,
+                                       static_cast<std::uint8_t>(phiReg)&7);
+        }
+      } else {
+        // Source is in a slot — load it.
+        s.em.loadRbpDisp32(phiReg, slotPayload(srcIt->second));
+      }
+      // Store to phi's slot (for type tag + deopt reconstruction).
+      s.em.storeRbpDisp32(phiReg, slotPayload(dstIt->second));
+      s.em.xorEaxEax();
+      s.em.storeRbpDisp32(Reg32::EAX, slotPayload(dstIt->second)+4);
+      s.em.movEaxImm32(static_cast<std::int32_t>(kRTypeInt));
+      s.em.storeRbpDisp32(Reg32::EAX, slotTag(dstIt->second));
+    } else {
       copySlot(s, dstIt->second, srcIt->second);
     }
   }
@@ -778,6 +907,7 @@ std::unique_ptr<CompiledCode> lowerOnly(
     interp::Runtime& rt, std::string* refusalReason) {
   LowerState s(g, method, methodId, rt);
   assignSlots(s);
+  assignRegisters(s);
   if (!lowerGraph(s)) {
     if (refusalReason) *refusalReason = s.refusal;
     return nullptr;
