@@ -80,13 +80,22 @@ public:
   // leave = mov rsp,rbp; pop rbp — would corrupt RSP. We just restore RBP.
   void epilogueNormal() { xorEaxEax(); byte(0x5D); byte(0xC3); } // xor eax,eax; pop rbp; ret
   void epilogueDeopt()  { byte(0xB8); imm32(1); byte(0x5D); byte(0xC3); } // mov eax,1; pop rbp; ret
-  std::uint32_t callRip32() { byte(0xFF); modrm(0,2,5); const std::uint32_t p=offset(); imm32(0); return p; }
+  // WHY: use mov rax,imm64; call rax (absolute) instead of call [rip+disp32]
+  // (RIP-relative) because the code is COPIED from the vector to the W^X
+  // block — RIP-relative offsets calculated against buf.data() are wrong.
+  std::uint32_t callAbsRax() {
+    rex(true); byte(0xB8);
+    const std::uint32_t patchOff = offset();
+    imm64(0);
+    byte(0xFF); modrm(3, 2, 0); // call rax
+    return patchOff;
+  }
   void patchCallAbs(std::uint32_t patchOff, void* target) {
-    const std::uintptr_t ripAfter = reinterpret_cast<std::uintptr_t>(buf.data())+patchOff+4;
-    const std::uintptr_t tgt = reinterpret_cast<std::uintptr_t>(target);
-    const std::int32_t rel = static_cast<std::int32_t>(tgt-ripAfter);
-    std::uint32_t u; std::memcpy(&u,&rel,4);
-    buf[patchOff]=u&0xFF; buf[patchOff+1]=(u>>8)&0xFF; buf[patchOff+2]=(u>>16)&0xFF; buf[patchOff+3]=(u>>24)&0xFF;
+    std::uint64_t tgt = reinterpret_cast<std::uint64_t>(target);
+    buf[patchOff+0]=tgt&0xFF; buf[patchOff+1]=(tgt>>8)&0xFF;
+    buf[patchOff+2]=(tgt>>16)&0xFF; buf[patchOff+3]=(tgt>>24)&0xFF;
+    buf[patchOff+4]=(tgt>>32)&0xFF; buf[patchOff+5]=(tgt>>40)&0xFF;
+    buf[patchOff+6]=(tgt>>48)&0xFF; buf[patchOff+7]=(tgt>>56)&0xFF;
   }
   void movRdiRbp()    { bytes({0x48,0x89,0xEF}); }
   void movEsiImm32(std::uint32_t v)  { byte(0xBE); imm32(static_cast<std::int32_t>(v)); }

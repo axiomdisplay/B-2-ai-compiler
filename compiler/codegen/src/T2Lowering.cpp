@@ -189,7 +189,7 @@ void emitHelperCall(LowerState& s, std::uint8_t helperId,
   s.em.movEdxImm32(a2);
   s.em.movEcxImm32u(a3);
   if (a4 != 0) s.em.movR8dImm32(a4);
-  std::uint32_t patchOff = s.em.callRip32();
+  std::uint32_t patchOff = s.em.callAbsRax();
   s.pendingCalls.push_back({patchOff, addr});
   s.em.testEaxEax();
   std::uint32_t jnzPatch = s.em.jccRel32(0x85); // jnz deopt
@@ -208,28 +208,6 @@ struct Block {
   std::vector<ir::NodeId> fixedNodes;       // ctrl-dependent nodes (incl. leader)
   std::vector<ir::NodeId> successors;       // control successor block leaders
 };
-
-// Does this node kind have a Ctrl input in slot 0? (Check Node.h signatures.)
-// WHY: only nodes with Ctrl inputs should be assigned to blocks via the
-// ctrl-chain fixpoint. Data nodes (AddI, IsNull, etc.) have DATA in slot 0
-// and must be assigned via the use-site fixpoint instead.
-bool hasCtrlInput(K k) noexcept {
-  switch (k) {
-    case K::LoadField: case K::StoreField: case K::LoadStatic: case K::StoreStatic:
-    case K::LoadElem: case K::StoreElem:
-    case K::MemBar: case K::MonitorEnter: case K::MonitorExit:
-    case K::New: case K::NewArray: case K::NewRefArray: case K::NewMultiArray:
-    case K::ClassInit:
-    case K::CallStatic: case K::CallVirtual: case K::CallInterface: case K::CallDynamic:
-    case K::CheckCast:
-    case K::Guard: case K::RepTransitionGuard:
-    case K::Materialize:
-    case K::LoopExit: case K::LoopEnd: case K::Return: case K::Unwind: case K::Deopt:
-    case K::End: case K::If: case K::Switch:
-      return true;
-    default: return false; // ArrayLength, InstanceOf, arithmetic, etc.
-  }
-}
 
 // Is this a control node that starts a block?
 bool isBlockLeader(K k) noexcept {
@@ -289,15 +267,6 @@ std::vector<Block> buildBlocks(LowerState& s) {
         auto it = blockIdx.find(region);
         if (it != blockIdx.end()) nodeBlock[n] = it->second;
       }
-      continue;
-    }
-    // Constants/params/undef: always in entry block (0) so they're available
-    // before any phi moves reference them.
-    if (nd.kind == K::ConstantI || nd.kind == K::ConstantL ||
-        nd.kind == K::ConstantF || nd.kind == K::ConstantD ||
-        nd.kind == K::ConstantNull || nd.kind == K::ConstantSym ||
-        nd.kind == K::Parameter || nd.kind == K::Undef) {
-      nodeBlock[n] = 0;
       continue;
     }
     // Check if this node has a ctrl input (input[0] is a control node).
@@ -391,8 +360,8 @@ std::vector<Block> buildBlocks(LowerState& s) {
     if (isBlockLeader(nd.kind)) continue;  // leader is already the block
     if (nd.kind == K::Phi) {
       blocks[b].fixedNodes.push_back(n);  // phis emitted at block top
-    } else if (hasCtrlInput(nd.kind)) {
-      blocks[b].fixedNodes.push_back(n);  // ctrl-dependent (incl. chains)
+    } else if (nd.numInputs >= 1 && isBlockLeader(g.node(g.input(n, 0)).kind)) {
+      blocks[b].fixedNodes.push_back(n);  // ctrl-dependent
     } else {
       blocks[b].dataNodes.push_back(n);   // pure data
     }
@@ -475,12 +444,6 @@ std::vector<Block> buildBlocks(LowerState& s) {
             if (j == leader) continue;
             const ir::Node& cn = g.node(j);
             if (cn.isDead() || !isBlockLeader(cn.kind)) continue;
-            // WHY: skip exception-path nodes (Unwind/Deopt) — they're not
-            // normal control successors. Their ctrl chain reaches through
-            // CallExcept, which makes the scan find them before the real
-            // successor (Return). The real successor is the non-exception
-            // block leader whose ctrl chain reaches this block's fixed nodes.
-            if (cn.kind == K::Unwind || cn.kind == K::Deopt) continue;
             if (cn.numInputs >= 1) {
               ir::NodeId c0 = g.input(j, 0);
               // Walk c0's ctrl chain to see if it reaches `leader` or a
@@ -634,16 +597,6 @@ void emitNode(LowerState& s, ir::NodeId n) {
     }
     case K::Guard: break; // helpers do their own checks
     case K::FrameState: case K::MemBar: case K::ClassInit: break;
-    // === If (not a block leader; emitted as a fixed node in the predecessor block) ===
-    case K::If: {
-      if (nd.numInputs >= 2) {
-        loadIntEax(s, s.g.input(n, 1));
-        s.em.testEaxEax();
-        std::uint32_t patchOff = s.em.jccRel32(0x84); // je IfFalse
-        s.pendingIfFalse.push_back({patchOff, n});
-      }
-      break;
-    }
     default: break;
   }
 }
@@ -656,8 +609,17 @@ void emitTerminator(LowerState& s, ir::NodeId n) {
     case K::Start: break; // no terminator
     case K::Region: case K::LoopBegin: break; // fall through to successor
     case K::IfTrue: case K::IfFalse: break; // fall through
+    case K::If: {
+      if (nd.numInputs >= 2) {
+        loadIntEax(s, s.g.input(n, 1));
+        s.em.testEaxEax();
+        // je IfFalse (cond==0 → false branch). Backpatched later.
+        std::uint32_t patchOff = s.em.jccRel32(0x84);
+        s.pendingIfFalse.push_back({patchOff, n});
+      }
+      break;
+    }
     case K::LoopExit: break; // fall through
-    case K::If: break; // handled by emitNode (If is a fixed node, not a leader)
     case K::LoopEnd: {
       // Backedge phi moves (predecessor 1) then jmp LoopBegin.
       ir::NodeId loopBegin = ir::kInvalidNodeId;
@@ -719,25 +681,13 @@ bool lowerGraph(LowerState& s) {
     ir::NodeId leader = blk.leader;
     if (leader == ir::kInvalidNodeId) continue;
     const ir::Node& ln = s.g.node(leader);
-    // WHY: do NOT emit entry phi moves at LoopBegin — they would overwrite
-    // the backedge phi moves on every iteration, resetting loop variables to
-    // their initial values (infinite loop). Instead, entry phi moves are
-    // emitted at the END of the predecessor block (see the fall-through logic
-    // below). Only Region (non-loop merge) emits entry phi moves here.
-    if (ln.kind == K::Region) {
+    // Merge blocks: emit entry-path phi moves BEFORE the label.
+    if (ln.kind == K::Region || ln.kind == K::LoopBegin) {
       emitPhiMovesForPred(s, leader, 0);
     }
     s.labelOf[leader] = s.em.offset();
-    // WHY: merge data+fixed and emit in NODE-ID order. The builder creates
-    // nodes in topological order (inputs before users), so node-ID order
-    // ensures a data node like IsNull (depends on LoadStatic) is emitted
-    // AFTER LoadStatic, not before.
-    {
-      std::vector<ir::NodeId> allNodes = blk.dataNodes;
-      for (ir::NodeId fn : blk.fixedNodes) allNodes.push_back(fn);
-      std::sort(allNodes.begin(), allNodes.end());
-      for (ir::NodeId n : allNodes) emitNode(s, n);
-    }
+    for (ir::NodeId n : blk.dataNodes) emitNode(s, n);
+    for (ir::NodeId n : blk.fixedNodes) emitNode(s, n);
     emitTerminator(s, leader);
     // Fall-through JMP: if this block has exactly one successor and it's not
     // the next block in emission order, emit a JMP to it. This handles
@@ -748,37 +698,14 @@ bool lowerGraph(LowerState& s) {
     if (ln.kind != K::Return && ln.kind != K::Unwind &&
         ln.kind != K::Deopt && ln.kind != K::End &&
         ln.kind != K::LoopEnd && ln.kind != K::If) {
+      // Single-successor blocks (Region, LoopBegin, IfTrue, IfFalse, LoopExit, Start).
       if (!blk.successors.empty()) {
         ir::NodeId succ = blk.successors[0];
         std::uint32_t succBi = blockIdxMap.count(succ) ? blockIdxMap[succ] : UINT32_MAX;
-        // WHY: if the successor is a LoopBegin, emit entry phi moves BEFORE
-        // the jump/fall-through (the entry-path predecessor's values go into
-        // the phi slots). This is the counterpart to the backedge phi moves
-        // emitted at LoopEnd.
-        if (succ < s.g.nodeCount() && s.g.node(succ).kind == K::LoopBegin) {
-          emitPhiMovesForPred(s, succ, 0);
-        }
         if (succBi != bi + 1 && succBi != UINT32_MAX) {
+          // Successor is not the next block — emit a JMP.
           std::uint32_t patchOff = s.em.jmpRel32();
           s.pendingJumps.push_back({patchOff, succ});
-        }
-      } else {
-        // WHY: no successor found (common for LoopExit — its ctrl-dependent
-        // fixed nodes aren't block leaders). Fall through to the next block
-        // that ISN'T a LoopEnd (which would be a backedge into the loop).
-        // Skip LoopEnd blocks to avoid re-entering the loop on exit.
-        for (std::uint32_t next = bi + 1; next < blocks.size(); ++next) {
-          ir::NodeId nextLeader = blocks[next].leader;
-          if (nextLeader != ir::kInvalidNodeId &&
-              s.g.node(nextLeader).kind != K::LoopEnd &&
-              s.g.node(nextLeader).kind != K::Unwind &&
-              s.g.node(nextLeader).kind != K::Deopt) {
-            if (next != bi + 1) {
-              std::uint32_t patchOff = s.em.jmpRel32();
-              s.pendingJumps.push_back({patchOff, nextLeader});
-            }
-            break;
-          }
         }
       }
     } else if (ln.kind == K::If) {
