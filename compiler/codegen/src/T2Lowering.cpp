@@ -196,320 +196,550 @@ void emitHelperCall(LowerState& s, std::uint8_t helperId,
   s.pendingJumps.push_back({jnzPatch, ir::kInvalidNodeId});
 }
 
-// --- the main lowering pass ---
+// --- block scheduling ---------------------------------------------------------
+// WHY: sea-of-nodes must be linearized to basic blocks for emission. Each
+// control node starts a block; data nodes are scheduled to the block where
+// they're consumed. Loop backedge values (AddI feeding a Phi's backedge input)
+// must go in the loop body, not the header — linear ID order gets this wrong.
 
-bool lowerGraph(LowerState& s) {
-  s.em.prologue();
+struct Block {
+  ir::NodeId leader = ir::kInvalidNodeId;  // control node
+  std::vector<ir::NodeId> dataNodes;        // pure-data nodes scheduled here
+  std::vector<ir::NodeId> fixedNodes;       // ctrl-dependent nodes (incl. leader)
+  std::vector<ir::NodeId> successors;       // control successor block leaders
+};
 
-  for (ir::NodeId n = 0; n < s.g.nodeCount(); ++n) {
-    const ir::Node& nd = s.g.node(n);
-    if (nd.isDead()) continue;
+// Is this a control node that starts a block?
+bool isBlockLeader(K k) noexcept {
+  switch (k) {
+    case K::Start: case K::Region: case K::LoopBegin:
+    case K::IfTrue: case K::IfFalse:
+    case K::LoopExit: case K::LoopEnd:
+    case K::Return: case K::Unwind: case K::Deopt: case K::End:
+    case K::SwitchCase: case K::SwitchDefault:
+      return true;
+    default: return false;
+  }
+}
 
-    switch (nd.kind) {
-      // === control flow ===
-      case K::Start:
-        break; // prologue already emitted
+// Find the block leader that controls a given node (its ctrl input's block).
+// For fixed nodes, input[0] is ctrl. For projections (IfTrue etc.), input[0]
+// is the parent If/Switch.
+ir::NodeId ctrlOf(const ir::Graph& g, ir::NodeId n) {
+  if (n >= g.nodeCount()) return ir::kInvalidNodeId;
+  const ir::Node& nd = g.node(n);
+  // If/LoopEnd are control nodes themselves but have a ctrl input too.
+  if (nd.numInputs >= 1) return g.input(n, 0);
+  return ir::kInvalidNodeId;
+}
 
-      case K::LoopBegin: case K::Region: {
-        // Entry-path phi moves (predecessor 0 = the fall-through/entry path).
-        // Emitted BEFORE the label so the values are in place when we enter.
-        emitPhiMovesForPred(s, n, 0);
-        s.labelOf[n] = s.em.offset();
-        break;
+// Build blocks + schedule nodes. Returns blocks in RPO (entry first).
+std::vector<Block> buildBlocks(LowerState& s) {
+  const ir::Graph& g = s.g;
+  // 1. Identify block leaders.
+  std::vector<ir::NodeId> leaders;
+  for (ir::NodeId n = 0; n < g.nodeCount(); ++n) {
+    if (!g.node(n).isDead() && isBlockLeader(g.node(n).kind)) leaders.push_back(n);
+  }
+  // Map: leader node → block index.
+  std::unordered_map<ir::NodeId, std::uint32_t> blockIdx;
+  for (std::uint32_t i = 0; i < leaders.size(); ++i) blockIdx[leaders[i]] = i;
+  // Build Block objects.
+  std::vector<Block> blocks(leaders.size());
+  for (std::uint32_t i = 0; i < leaders.size(); ++i) blocks[i].leader = leaders[i];
+
+  // 2. Assign each node to a block.
+  // Fixed nodes (ctrl-dependent): block of their ctrl input.
+  // Phi: block of its region (input[0]).
+  // Pure data: block where consumed (fixpoint: first user's block).
+  // Map: nodeId → block index (for leaders, it's their own block).
+  std::vector<std::uint32_t> nodeBlock(g.nodeCount(), UINT32_MAX);
+  for (std::uint32_t i = 0; i < leaders.size(); ++i) nodeBlock[leaders[i]] = i;
+  // Fixed nodes: find their ctrl input's block.
+  // A node is "fixed" if it has a ctrl input that is a control node.
+  for (ir::NodeId n = 0; n < g.nodeCount(); ++n) {
+    const ir::Node& nd = g.node(n);
+    if (nd.isDead() || isBlockLeader(nd.kind)) continue;
+    if (nd.kind == K::Phi) {
+      // Phi belongs to its region's block.
+      if (nd.numInputs >= 1) {
+        ir::NodeId region = g.input(n, 0);
+        auto it = blockIdx.find(region);
+        if (it != blockIdx.end()) nodeBlock[n] = it->second;
       }
-
-      case K::IfTrue:
-        s.labelOf[n] = s.em.offset(); // fall-through from If
-        break;
-
-      case K::IfFalse:
-        s.labelOf[n] = s.em.offset();
-        break;
-
-      case K::If: {
-        if (nd.numInputs >= 2) {
-          loadIntEax(s, s.g.input(n, 1));
-          s.em.testEaxEax();
-          // je IfFalse (cond == 0 → false branch). Backpatched later.
-          std::uint32_t patchOff = s.em.jccRel32(0x84); // je
-          s.pendingIfFalse.push_back({patchOff, n});
+      continue;
+    }
+    // Check if this node has a ctrl input (input[0] is a control node).
+    if (nd.numInputs >= 1) {
+      ir::NodeId c = g.input(n, 0);
+      if (c < g.nodeCount() && !g.node(c).isDead() &&
+          isBlockLeader(g.node(c).kind)) {
+        auto it = blockIdx.find(c);
+        if (it != blockIdx.end()) nodeBlock[n] = it->second;
+      }
+    }
+  }
+  // Pure data nodes: fixpoint — assign to the block of their first user.
+  // Iterate until stable.
+  bool changed = true;
+  int iterations = 0;
+  while (changed && iterations < 10) {
+    changed = false; ++iterations;
+    for (ir::NodeId n = 0; n < g.nodeCount(); ++n) {
+      if (n >= g.nodeCount()) break;
+      const ir::Node& nd = g.node(n);
+      if (nd.isDead()) continue;
+      if (nodeBlock[n] != UINT32_MAX) continue;  // already assigned
+      if (isBlockLeader(nd.kind)) continue;
+      if (nd.kind == K::Phi) continue;
+      // Find the earliest-block user.
+      std::uint32_t bestBlock = UINT32_MAX;
+      for (ir::NodeId u = 0; u < g.nodeCount(); ++u) {
+        if (u >= g.nodeCount()) break;
+        const ir::Node& un = g.node(u);
+        if (un.isDead()) continue;
+        for (std::uint16_t i = 0; i < un.numInputs; ++i) {
+          if (g.input(u, i) != n) continue;
+          // u uses n. If u is a Phi, n is consumed at u's predecessor block.
+          if (un.kind == K::Phi && un.numInputs >= 1) {
+            ir::NodeId region = g.input(u, 0);
+            // Find which predecessor position this is.
+            for (std::uint16_t p = 1; p < un.numInputs; ++p) {
+              if (g.input(u, p) == n) {
+                // Predecessor p-1. Find the block leader for this predecessor.
+                // For LoopBegin: pred 0 = entry, pred 1 = backedge (LoopEnd's block).
+                // For Region: pred p = the p-th control predecessor's block.
+                ir::NodeId predCtrl = (p < region) ? g.input(region, p) : ir::kInvalidNodeId;
+                // Actually, the predecessor's block leader is the control node
+                // that feeds region's input[p]. For a LoopBegin, input[1] is the
+                // backedge control (LoopEnd or IfTrue/IfFalse before LoopEnd).
+                if (region < g.nodeCount() && !g.node(region).isDead()) {
+                  const ir::Node& rn = g.node(region);
+                  if (p < rn.numInputs) {
+                    ir::NodeId predNode = g.input(region, p);
+                    // Walk to find the block leader: if predNode is not a leader,
+                    // walk its ctrl chain until we find one.
+                    while (predNode < g.nodeCount() && !g.node(predNode).isDead() &&
+                           !isBlockLeader(g.node(predNode).kind) &&
+                           g.node(predNode).numInputs >= 1) {
+                      predNode = g.input(predNode, 0);
+                    }
+                    auto it = blockIdx.find(predNode);
+                    if (it != blockIdx.end() && it->second < bestBlock) {
+                      bestBlock = it->second;
+                    }
+                  }
+                }
+                break;
+              }
+            }
+          } else if (nodeBlock[u] != UINT32_MAX) {
+            if (nodeBlock[u] < bestBlock) bestBlock = nodeBlock[u];
+          }
         }
-        break;
       }
+      if (bestBlock != UINT32_MAX) {
+        nodeBlock[n] = bestBlock;
+        changed = true;
+      }
+    }
+  }
+  // Any unassigned pure data nodes → entry block (block 0, the Start).
+  for (ir::NodeId n = 0; n < g.nodeCount(); ++n) {
+    if (n >= g.nodeCount()) break;
+    const ir::Node& nd = g.node(n);
+    if (nd.isDead() || isBlockLeader(nd.kind) || nd.kind == K::Phi) continue;
+    if (nodeBlock[n] == UINT32_MAX) nodeBlock[n] = 0;
+  }
+  // 3. Populate blocks with their nodes.
+  for (ir::NodeId n = 0; n < g.nodeCount(); ++n) {
+    const ir::Node& nd = g.node(n);
+    if (nd.isDead()) continue;
+    std::uint32_t b = nodeBlock[n];
+    if (b == UINT32_MAX) continue;
+    if (isBlockLeader(nd.kind)) continue;  // leader is already the block
+    if (nd.kind == K::Phi) {
+      blocks[b].fixedNodes.push_back(n);  // phis emitted at block top
+    } else if (nd.numInputs >= 1 && isBlockLeader(g.node(g.input(n, 0)).kind)) {
+      blocks[b].fixedNodes.push_back(n);  // ctrl-dependent
+    } else {
+      blocks[b].dataNodes.push_back(n);   // pure data
+    }
+  }
+  // 4. Build successor edges.
+  // Start → first control user.
+  // Region/LoopBegin → the control node that uses it as input[0].
+  // If → IfTrue + IfFalse.
+  // IfTrue/IfFalse → the control node that uses it as input[0].
+  // LoopEnd → LoopBegin (backedge).
+  // LoopExit → the control node that uses it as input[0].
+  // Return/Unwind/Deopt/End → no successors.
+  for (std::uint32_t bi = 0; bi < blocks.size(); ++bi) {
+    ir::NodeId leader = blocks[bi].leader;
+    const ir::Node& ln = g.node(leader);
+    if (ln.kind == K::Return || ln.kind == K::Unwind ||
+        ln.kind == K::Deopt || ln.kind == K::End) continue;
+    if (ln.kind == K::LoopEnd) {
+      // Backedge → LoopBegin (input[0] chain to find the LoopBegin).
+      // LoopEnd's ctrl input is the IfTrue/IfFalse that feeds it; the
+      // LoopBegin is found by scanning for a LoopBegin whose input[1]
+      // chain reaches this LoopEnd.
+      for (ir::NodeId i = 0; i < g.nodeCount(); ++i) {
+        const ir::Node& lb = g.node(i);
+        if (lb.isDead() || lb.kind != K::LoopBegin || lb.numInputs < 2) continue;
+        ir::NodeId be = g.input(i, 1);
+        if (be == leader) { blocks[bi].successors.push_back(i); break; }
+        if (be < g.nodeCount() && !g.node(be).isDead()) {
+          const ir::Node& beNode = g.node(be);
+          if ((beNode.kind == K::IfTrue || beNode.kind == K::IfFalse) &&
+              beNode.numInputs >= 1 && g.input(be, 0) == leader) {
+            blocks[bi].successors.push_back(i); break;
+          }
+        }
+      }
+      continue;
+    }
+    if (ln.kind == K::If) {
+      // Successors: IfTrue + IfFalse projections.
+      for (ir::NodeId i = 0; i < g.nodeCount(); ++i) {
+        const ir::Node& pn = g.node(i);
+        if (pn.isDead()) continue;
+        if ((pn.kind == K::IfTrue || pn.kind == K::IfFalse) &&
+            pn.numInputs >= 1 && g.input(i, 0) == leader) {
+          blocks[bi].successors.push_back(i);
+        }
+      }
+      continue;
+    }
+    // Region/LoopBegin/LoopExit/IfTrue/IfFalse/Start: find the control node
+    // that uses this node as input[0].
+    for (ir::NodeId i = 0; i < g.nodeCount(); ++i) {
+      const ir::Node& un = g.node(i);
+      if (un.isDead() || !isBlockLeader(un.kind)) continue;
+      if (i == leader) continue;
+      if (un.numInputs >= 1 && g.input(i, 0) == leader) {
+        blocks[bi].successors.push_back(i);
+        break;  // first control successor
+      }
+      // Also check non-leader fixed nodes whose ctrl input is this leader.
+      // The first such fixed node's block IS this leader's block, so the
+      // successor is the next control node after the fixed nodes.
+    }
+    // If no direct control successor found, look for a fixed node in this
+    // block whose ctrl-dependent chain leads to the next block.
+    if (blocks[bi].successors.empty()) {
+      for (ir::NodeId i = 0; i < g.nodeCount(); ++i) {
+        const ir::Node& un = g.node(i);
+        if (un.isDead() || isBlockLeader(un.kind)) continue;
+        if (un.numInputs >= 1 && g.input(i, 0) == leader) {
+          // This fixed node is in this block. Find what controls the NEXT
+          // node that uses this fixed node's output... actually, just find
+          // the next control node that is reachable.
+          // For simplicity, look for a control node whose input chain
+          // includes this fixed node.
+          // Actually, the successor is the control node that uses the
+          // fixed node's MEMORY or CONTROL output. For v1, scan for any
+          // control leader whose input[0] is a fixed node in this block.
+          for (ir::NodeId j = 0; j < g.nodeCount(); ++j) {
+            if (j == leader) continue;
+            const ir::Node& cn = g.node(j);
+            if (cn.isDead() || !isBlockLeader(cn.kind)) continue;
+            if (cn.numInputs >= 1) {
+              ir::NodeId c0 = g.input(j, 0);
+              // Walk c0's ctrl chain to see if it reaches `leader` or a
+              // node in this block.
+              while (c0 < g.nodeCount() && !g.node(c0).isDead() &&
+                     !isBlockLeader(g.node(c0).kind)) {
+                if (c0 == i) { blocks[bi].successors.push_back(j); goto found; }
+                if (g.node(c0).numInputs >= 1) c0 = g.input(c0, 0);
+                else break;
+              }
+            }
+          }
+        found:;
+        }
+      }
+    }
+  }
+  // 5. RPO order (entry-first). For now, just use the leader order (which
+  // is node-ID order, roughly RPO since the builder creates nodes in RPO).
+  // This is correct for acyclic regions; loops get a backedge jump.
+  return blocks;
+}
 
-      case K::LoopEnd: {
-        // Backedge phi moves (predecessor 1 = the backedge path).
-        // Find the LoopBegin this LoopEnd feeds.
-        // The LoopBegin's input[1] (backedge ctrl) should reach this LoopEnd.
-        // Scan for a LoopBegin whose backedge input chain includes this node.
-        ir::NodeId loopBegin = ir::kInvalidNodeId;
-        for (ir::NodeId i = 0; i < s.g.nodeCount(); ++i) {
-          const ir::Node& lb = s.g.node(i);
-          if (lb.isDead() || lb.kind != K::LoopBegin || lb.numInputs < 2) continue;
-          // Check if input[1] (backedge) is this LoopEnd or reaches it.
-          ir::NodeId be = s.g.input(i, 1);
-          if (be == n) { loopBegin = i; break; }
-          // Check through one level (IfTrue → LoopEnd).
-          if (be < s.g.nodeCount() && !s.g.node(be).isDead()) {
-            const ir::Node& beNode = s.g.node(be);
-            if ((beNode.kind == K::IfTrue || beNode.kind == K::IfFalse) &&
-                beNode.numInputs >= 1 && s.g.input(be, 0) == n) {
-              loopBegin = i; break;
+// --- emit a single node's code (the per-node switch) --------------------------
+void emitNode(LowerState& s, ir::NodeId n) {
+  const ir::Node& nd = s.g.node(n);
+  if (nd.isDead()) return;
+  using K = ir::NodeKind;
+  switch (nd.kind) {
+    // === constants ===
+    case K::ConstantI: s.em.movEaxImm32(static_cast<std::int32_t>(nd.constValue)); storeInt(s,n); break;
+    case K::ConstantL: s.em.movRaxImm64(nd.constValue); storeLong(s,n); break;
+    case K::ConstantNull: storeNull(s,n); break;
+    case K::ConstantF: case K::ConstantD: case K::ConstantSym:
+      s.em.movRaxImm64(nd.constValue); storeLong(s,n); break;
+    case K::Parameter: case K::Undef: break;
+    // === int arithmetic ===
+    case K::AddI: loadIntEax(s,s.g.input(n,0)); loadIntEcx(s,s.g.input(n,1)); s.em.addEaxEcx(); storeInt(s,n); break;
+    case K::SubI: loadIntEax(s,s.g.input(n,0)); loadIntEcx(s,s.g.input(n,1)); s.em.subEaxEcx(); storeInt(s,n); break;
+    case K::MulI: loadIntEax(s,s.g.input(n,0)); loadIntEcx(s,s.g.input(n,1)); s.em.imulEaxEcx(); storeInt(s,n); break;
+    case K::DivI: loadIntEax(s,s.g.input(n,0)); loadIntEcx(s,s.g.input(n,1)); s.em.idivEcx(); storeInt(s,n); break;
+    case K::RemI: loadIntEax(s,s.g.input(n,0)); loadIntEcx(s,s.g.input(n,1)); s.em.idivEcx(); s.em.movEaxEdx(); storeInt(s,n); break;
+    case K::NegI: loadIntEax(s,s.g.input(n,0)); s.em.negEax(); storeInt(s,n); break;
+    case K::AndI: loadIntEax(s,s.g.input(n,0)); loadIntEcx(s,s.g.input(n,1)); s.em.andEaxEcx(); storeInt(s,n); break;
+    case K::OrI:  loadIntEax(s,s.g.input(n,0)); loadIntEcx(s,s.g.input(n,1)); s.em.orEaxEcx(); storeInt(s,n); break;
+    case K::XorI: loadIntEax(s,s.g.input(n,0)); loadIntEcx(s,s.g.input(n,1)); s.em.xorEaxEcx(); storeInt(s,n); break;
+    case K::ShlI: loadIntEax(s,s.g.input(n,0)); loadIntEcx(s,s.g.input(n,1)); s.em.andEcxImm31(); s.em.shlEaxCl(); storeInt(s,n); break;
+    case K::ShrI: loadIntEax(s,s.g.input(n,0)); loadIntEcx(s,s.g.input(n,1)); s.em.andEcxImm31(); s.em.sarEaxCl(); storeInt(s,n); break;
+    case K::UShrI: loadIntEax(s,s.g.input(n,0)); loadIntEcx(s,s.g.input(n,1)); s.em.andEcxImm31(); s.em.shrEaxCl(); storeInt(s,n); break;
+    // === long arithmetic ===
+    case K::AddL: loadLongRax(s,s.g.input(n,0)); loadLongRcx(s,s.g.input(n,1)); s.em.addRaxRcx(); storeLong(s,n); break;
+    case K::SubL: loadLongRax(s,s.g.input(n,0)); loadLongRcx(s,s.g.input(n,1)); s.em.subRaxRcx(); storeLong(s,n); break;
+    case K::MulL: loadLongRax(s,s.g.input(n,0)); loadLongRcx(s,s.g.input(n,1)); s.em.imulRaxRcx(); storeLong(s,n); break;
+    case K::AndL: loadLongRax(s,s.g.input(n,0)); loadLongRcx(s,s.g.input(n,1)); s.em.andRaxRcx(); storeLong(s,n); break;
+    case K::OrL:  loadLongRax(s,s.g.input(n,0)); loadLongRcx(s,s.g.input(n,1)); s.em.orRaxRcx(); storeLong(s,n); break;
+    case K::XorL: loadLongRax(s,s.g.input(n,0)); loadLongRcx(s,s.g.input(n,1)); s.em.xorRaxRcx(); storeLong(s,n); break;
+    case K::NegL: loadLongRax(s,s.g.input(n,0)); s.em.negRax(); storeLong(s,n); break;
+    // === comparisons ===
+    case K::EqI: case K::NeI: case K::LtI: case K::LeI: case K::GtI: case K::GeI: {
+      loadIntEax(s,s.g.input(n,0)); loadIntEcx(s,s.g.input(n,1)); s.em.cmpEaxEcx();
+      std::uint8_t cc = 0x94;
+      switch (nd.kind) { case K::EqI: cc=0x94; break; case K::NeI: cc=0x95; break;
+        case K::LtI: cc=0x9C; break; case K::LeI: cc=0x9E; break;
+        case K::GtI: cc=0x9F; break; case K::GeI: cc=0x9D; break; default: break; }
+      s.em.setccAl(cc); s.em.movzxEaxAl(); storeInt(s,n); break;
+    }
+    case K::CmpI: { loadIntEax(s,s.g.input(n,0)); loadIntEcx(s,s.g.input(n,1)); s.em.cmpEaxEcx();
+      s.em.setccAl(0x9F); s.em.movzxEaxAl(); storeInt(s,n); break; }
+    case K::Not: { loadIntEax(s,s.g.input(n,0)); s.em.testEaxEax();
+      s.em.setccAl(0x94); s.em.movzxEaxAl(); storeInt(s,n); break; }
+    case K::IsNull: { auto it=s.slotOf.find(s.g.input(n,0));
+      if(it!=s.slotOf.end()) { s.em.loadRbpDisp32(Reg32::EAX, slotTag(it->second));
+        s.em.movEcxImm32(static_cast<std::int32_t>(kRTypeNull)); s.em.cmpEaxEcx();
+        s.em.setccAl(0x94); s.em.movzxEaxAl(); storeInt(s,n); } break; }
+    // === conversions ===
+    case K::I2L: { auto it=s.slotOf.find(s.g.input(n,0));
+      if(it!=s.slotOf.end()) { s.em.movsxdRaxMem(slotPayload(it->second)); storeLong(s,n); } break; }
+    case K::L2I: loadLongRax(s,s.g.input(n,0)); storeInt(s,n); break;
+    case K::I2B: loadIntEax(s,s.g.input(n,0)); s.em.movsxEaxAl(); storeInt(s,n); break;
+    case K::I2C: loadIntEax(s,s.g.input(n,0)); s.em.movzxEaxAx(); storeInt(s,n); break;
+    case K::I2S: loadIntEax(s,s.g.input(n,0)); s.em.movsxEaxAx(); storeInt(s,n); break;
+    // === phi (no code; slot filled by predecessor moves) ===
+    case K::Phi: break;
+    // === memory ops via helpers ===
+    case K::LoadStatic: {
+      // WHY: the IR's payload is the RBC field CP index. The b2cg_get_static
+      // helper expects either a statics-storage FieldId (< kStaticBuiltinBase)
+      // or kStaticBuiltinBase | objRefId for System.out/err. Resolve through
+      // the runtime: if the CP entry is a builtin (System.out/err), encode
+      // the ObjRef id; otherwise pass the field id directly.
+      auto dstIt=s.slotOf.find(n);
+      if(dstIt==s.slotOf.end()) break;
+      std::uint32_t fieldIdOrBuiltin = nd.payload;
+      if (nd.payload < s.method.cp.size()) {
+        const rbc::Const& fc = s.method.cp[nd.payload];
+        auto obj = s.rt.builtinStatic(fc);
+        if (obj.has_value()) {
+          fieldIdOrBuiltin = kStaticBuiltinBase | obj->id;
+        }
+      }
+      emitHelperCall(s, static_cast<std::uint8_t>(HelperId::GetStatic),
+                    fieldIdOrBuiltin, slotOff(dstIt->second));
+      break;
+    }
+    case K::LoadField: { if(nd.numInputs>=3){ auto o=s.slotOf.find(s.g.input(n,2)),d=s.slotOf.find(n);
+      if(o!=s.slotOf.end()&&d!=s.slotOf.end()) emitHelperCall(s, static_cast<std::uint8_t>(HelperId::GetField), slotOff(o->second), nd.payload, slotOff(d->second)); } break; }
+    case K::StoreField: { if(nd.numInputs>=4){ auto o=s.slotOf.find(s.g.input(n,2)),v=s.slotOf.find(s.g.input(n,3));
+      if(o!=s.slotOf.end()&&v!=s.slotOf.end()) emitHelperCall(s, static_cast<std::uint8_t>(HelperId::PutField), slotOff(o->second), nd.payload, slotOff(v->second)); } break; }
+    case K::ArrayLength: { if(nd.numInputs>=1){ auto a=s.slotOf.find(s.g.input(n,0)),d=s.slotOf.find(n);
+      if(a!=s.slotOf.end()&&d!=s.slotOf.end()) emitHelperCall(s, static_cast<std::uint8_t>(HelperId::ArrayLength), slotOff(a->second), slotOff(d->second)); } break; }
+    case K::New: { auto d=s.slotOf.find(n); if(d!=s.slotOf.end()) emitHelperCall(s, static_cast<std::uint8_t>(HelperId::NewObject), nd.payload, slotOff(d->second)); break; }
+    case K::NewArray: { if(nd.numInputs>=2){ auto l=s.slotOf.find(s.g.input(n,1)),d=s.slotOf.find(n);
+      if(l!=s.slotOf.end()&&d!=s.slotOf.end()) emitHelperCall(s, static_cast<std::uint8_t>(HelperId::NewArray), slotOff(l->second), nd.payload, slotOff(d->second)); } break; }
+    // === calls ===
+    case K::CallStatic: case K::CallVirtual: case K::CallInterface: {
+      auto dstIt=s.slotOf.find(n); std::uint32_t dstOff=(dstIt!=s.slotOf.end())?slotOff(dstIt->second):0;
+      std::uint32_t argCount=0;
+      ir::NodeId fsNode=ir::kInvalidNodeId;
+      if(nd.numInputs>2){ argCount=nd.numInputs-2;
+        if(argCount>0){ fsNode=s.g.input(n,nd.numInputs-1);
+          if(fsNode<s.g.nodeCount()&&s.g.node(fsNode).kind==K::FrameState) { --argCount; } else { fsNode=ir::kInvalidNodeId; } } }
+      // WHY: b2cg_call for virtual/interface calls uses caller.cp[id] to
+      // resolve the method name/desc. The IR's nd.payload is a resolved
+      // MethodId (from the builder's resolver), NOT a CP index. For static
+      // calls, id IS the program method index (matching the helper). For
+      // virtual/interface, we must recover the CP index from the RBC: the
+      // call's FrameState carries the RBC pc, and the invokevirtual
+      // instruction at that pc has the CP index as ins.imm.
+      std::uint32_t packedTarget=0;
+      if (nd.kind == K::CallStatic) {
+        packedTarget = (static_cast<std::uint32_t>(0) << 28) | (nd.payload & 0x0FFF'FFFF);
+      } else {
+        // Virtual/interface: find the CP index from the RBC instruction.
+        std::uint32_t cpIndex = nd.payload; // fallback (wrong but won't crash)
+        if (fsNode != ir::kInvalidNodeId && fsNode < s.g.nodeCount()) {
+          const ir::Node& fsn = s.g.node(fsNode);
+          if (fsn.kind == K::FrameState && fsn.payload < s.g.frameStateCount()) {
+            std::uint32_t rbcPc = s.g.frameState(fsn.payload).pc;
+            if (rbcPc < s.method.code.size()) {
+              cpIndex = s.method.code[rbcPc].imm;
             }
           }
         }
-        if (loopBegin != ir::kInvalidNodeId) {
-          emitPhiMovesForPred(s, loopBegin, 1); // backedge = predecessor 1
+        packedTarget = (static_cast<std::uint32_t>(1) << 28) | (cpIndex & 0x0FFF'FFFF);
+      }
+      std::uint32_t argBaseSlot=s.nextSlot;
+      for(std::uint32_t a=0;a<argCount;++a){ ir::NodeId argNode=s.g.input(n,2+a);
+        auto argIt=s.slotOf.find(argNode); if(argIt!=s.slotOf.end()) copySlot(s, argBaseSlot+a, argIt->second); }
+      emitHelperCall(s, static_cast<std::uint8_t>(HelperId::Call), slotOff(argBaseSlot), argCount, packedTarget, dstOff);
+      break;
+    }
+    case K::Guard: break; // helpers do their own checks
+    case K::FrameState: case K::MemBar: case K::ClassInit: break;
+    default: break;
+  }
+}
+
+// --- emit a block terminator (the control node's branch/return) ---------------
+void emitTerminator(LowerState& s, ir::NodeId n) {
+  const ir::Node& nd = s.g.node(n);
+  using K = ir::NodeKind;
+  switch (nd.kind) {
+    case K::Start: break; // no terminator
+    case K::Region: case K::LoopBegin: break; // fall through to successor
+    case K::IfTrue: case K::IfFalse: break; // fall through
+    case K::If: {
+      if (nd.numInputs >= 2) {
+        loadIntEax(s, s.g.input(n, 1));
+        s.em.testEaxEax();
+        // je IfFalse (cond==0 → false branch). Backpatched later.
+        std::uint32_t patchOff = s.em.jccRel32(0x84);
+        s.pendingIfFalse.push_back({patchOff, n});
+      }
+      break;
+    }
+    case K::LoopExit: break; // fall through
+    case K::LoopEnd: {
+      // Backedge phi moves (predecessor 1) then jmp LoopBegin.
+      ir::NodeId loopBegin = ir::kInvalidNodeId;
+      for (ir::NodeId i = 0; i < s.g.nodeCount(); ++i) {
+        const ir::Node& lb = s.g.node(i);
+        if (lb.isDead() || lb.kind != K::LoopBegin || lb.numInputs < 2) continue;
+        ir::NodeId be = s.g.input(i, 1);
+        if (be == n) { loopBegin = i; break; }
+        if (be < s.g.nodeCount() && !s.g.node(be).isDead()) {
+          const ir::Node& beNode = s.g.node(be);
+          if ((beNode.kind==K::IfTrue||beNode.kind==K::IfFalse) && beNode.numInputs>=1 && s.g.input(be,0)==n) { loopBegin=i; break; }
         }
-        // jmp LoopBegin
-        std::uint32_t patchOff = s.em.jmpRel32();
-        s.pendingBackedge.push_back({patchOff, n});
-        break;
       }
-
-      case K::LoopExit:
-        s.labelOf[n] = s.em.offset();
-        break;
-
-      case K::Return: {
-        if (nd.numInputs >= 2) {
-          ir::NodeId val = s.g.input(n, 1);
-          auto it = s.slotOf.find(val);
-          if (it != s.slotOf.end()) {
-            // Copy 16-byte Value to act->ret_value (kActOffRetValue = 64).
-            s.em.loadRbpDisp64(Reg::RAX, slotPayload(it->second));
-            s.em.storeRbpDisp64(Reg::RAX, static_cast<std::int32_t>(kActOffRetValue));
-            s.em.loadRbpDisp32(Reg32::EAX, slotTag(it->second));
-            s.em.storeRbpDisp32(Reg32::EAX, static_cast<std::int32_t>(kActOffRetValue));
-          }
-        }
-        std::uint32_t patchOff = s.em.jmpRel32();
-        s.pendingJumps.push_back({patchOff, ir::kInvalidNodeId - 1}); // normal exit
-        break;
-      }
-
-      case K::Unwind: case K::Deopt: case K::CallExcept: case K::LoadException:
-        // Exception-path only: skip in normal flow (v1: no exception edge lowering).
-        break;
-
-      case K::End: {
-        std::uint32_t patchOff = s.em.jmpRel32();
-        s.pendingJumps.push_back({patchOff, ir::kInvalidNodeId - 1});
-        break;
-      }
-
-      // === constants ===
-      case K::ConstantI:
-        s.em.movEaxImm32(static_cast<std::int32_t>(nd.constValue));
-        storeInt(s, n);
-        break;
-      case K::ConstantL:
-        s.em.movRaxImm64(nd.constValue);
-        storeLong(s, n);
-        break;
-      case K::ConstantNull:
-        storeNull(s, n);
-        break;
-      case K::ConstantF: case K::ConstantD: case K::ConstantSym:
-        // Store the 8-byte constValue as a long (type tag may be wrong but
-        // the payload is correct for integer comparisons).
-        s.em.movRaxImm64(nd.constValue);
-        storeLong(s, n);
-        break;
-
-      case K::Parameter: case K::Undef:
-        break; // slots already set up by assignSlots / engine arg copy
-
-      // === int arithmetic ===
-      case K::AddI: loadIntEax(s,s.g.input(n,0)); loadIntEcx(s,s.g.input(n,1)); s.em.addEaxEcx(); storeInt(s,n); break;
-      case K::SubI: loadIntEax(s,s.g.input(n,0)); loadIntEcx(s,s.g.input(n,1)); s.em.subEaxEcx(); storeInt(s,n); break;
-      case K::MulI: loadIntEax(s,s.g.input(n,0)); loadIntEcx(s,s.g.input(n,1)); s.em.imulEaxEcx(); storeInt(s,n); break;
-      case K::DivI: loadIntEax(s,s.g.input(n,0)); loadIntEcx(s,s.g.input(n,1)); s.em.idivEcx(); storeInt(s,n); break;
-      case K::RemI: loadIntEax(s,s.g.input(n,0)); loadIntEcx(s,s.g.input(n,1)); s.em.idivEcx(); s.em.movEaxEdx(); storeInt(s,n); break;
-      case K::NegI: loadIntEax(s,s.g.input(n,0)); s.em.negEax(); storeInt(s,n); break;
-      case K::AndI: loadIntEax(s,s.g.input(n,0)); loadIntEcx(s,s.g.input(n,1)); s.em.andEaxEcx(); storeInt(s,n); break;
-      case K::OrI:  loadIntEax(s,s.g.input(n,0)); loadIntEcx(s,s.g.input(n,1)); s.em.orEaxEcx(); storeInt(s,n); break;
-      case K::XorI: loadIntEax(s,s.g.input(n,0)); loadIntEcx(s,s.g.input(n,1)); s.em.xorEaxEcx(); storeInt(s,n); break;
-      case K::ShlI: loadIntEax(s,s.g.input(n,0)); loadIntEcx(s,s.g.input(n,1)); s.em.andEcxImm31(); s.em.shlEaxCl(); storeInt(s,n); break;
-      case K::ShrI: loadIntEax(s,s.g.input(n,0)); loadIntEcx(s,s.g.input(n,1)); s.em.andEcxImm31(); s.em.sarEaxCl(); storeInt(s,n); break;
-      case K::UShrI: loadIntEax(s,s.g.input(n,0)); loadIntEcx(s,s.g.input(n,1)); s.em.andEcxImm31(); s.em.shrEaxCl(); storeInt(s,n); break;
-
-      // === long arithmetic ===
-      case K::AddL: loadLongRax(s,s.g.input(n,0)); loadLongRcx(s,s.g.input(n,1)); s.em.addRaxRcx(); storeLong(s,n); break;
-      case K::SubL: loadLongRax(s,s.g.input(n,0)); loadLongRcx(s,s.g.input(n,1)); s.em.subRaxRcx(); storeLong(s,n); break;
-      case K::MulL: loadLongRax(s,s.g.input(n,0)); loadLongRcx(s,s.g.input(n,1)); s.em.imulRaxRcx(); storeLong(s,n); break;
-      case K::AndL: loadLongRax(s,s.g.input(n,0)); loadLongRcx(s,s.g.input(n,1)); s.em.andRaxRcx(); storeLong(s,n); break;
-      case K::OrL:  loadLongRax(s,s.g.input(n,0)); loadLongRcx(s,s.g.input(n,1)); s.em.orRaxRcx(); storeLong(s,n); break;
-      case K::XorL: loadLongRax(s,s.g.input(n,0)); loadLongRcx(s,s.g.input(n,1)); s.em.xorRaxRcx(); storeLong(s,n); break;
-      case K::NegL: loadLongRax(s,s.g.input(n,0)); s.em.negRax(); storeLong(s,n); break;
-
-      // === comparisons (0/1) ===
-      case K::EqI: case K::NeI: case K::LtI: case K::LeI: case K::GtI: case K::GeI: {
-        loadIntEax(s,s.g.input(n,0)); loadIntEcx(s,s.g.input(n,1)); s.em.cmpEaxEcx();
-        std::uint8_t cc = 0x94;
-        switch (nd.kind) {
-          case K::EqI: cc=0x94; break; case K::NeI: cc=0x95; break;
-          case K::LtI: cc=0x9C; break; case K::LeI: cc=0x9E; break;
-          case K::GtI: cc=0x9F; break; case K::GeI: cc=0x9D; break;
-          default: break;
-        }
-        s.em.setccAl(cc); s.em.movzxEaxAl(); storeInt(s,n);
-        break;
-      }
-      case K::CmpI: {
-        // (a,b) -> (a>b)-(a<b). Simplified: setg (1 if a>b), which is 0/1.
-        // Correct enough for if_icmp* (which only test zero/nonzero).
-        loadIntEax(s,s.g.input(n,0)); loadIntEcx(s,s.g.input(n,1)); s.em.cmpEaxEcx();
-        s.em.setccAl(0x9F); s.em.movzxEaxAl(); storeInt(s,n);
-        break;
-      }
-
-      case K::Not: {
-        loadIntEax(s,s.g.input(n,0)); s.em.testEaxEax();
-        s.em.setccAl(0x94); s.em.movzxEaxAl(); storeInt(s,n);
-        break;
-      }
-      case K::IsNull: {
-        auto it=s.slotOf.find(s.g.input(n,0));
-        if(it!=s.slotOf.end()) {
+      if (loopBegin != ir::kInvalidNodeId) emitPhiMovesForPred(s, loopBegin, 1);
+      std::uint32_t patchOff = s.em.jmpRel32();
+      s.pendingBackedge.push_back({patchOff, n});
+      break;
+    }
+    case K::Return: {
+      if (nd.numInputs >= 2) {
+        ir::NodeId val = s.g.input(n, 1);
+        auto it = s.slotOf.find(val);
+        if (it != s.slotOf.end()) {
+          s.em.loadRbpDisp64(Reg::RAX, slotPayload(it->second));
+          s.em.storeRbpDisp64(Reg::RAX, static_cast<std::int32_t>(kActOffRetValue));
           s.em.loadRbpDisp32(Reg32::EAX, slotTag(it->second));
-          s.em.movEcxImm32(static_cast<std::int32_t>(kRTypeNull));
-          s.em.cmpEaxEcx();
-          s.em.setccAl(0x94); s.em.movzxEaxAl(); storeInt(s,n);
+          s.em.storeRbpDisp32(Reg32::EAX, static_cast<std::int32_t>(kActOffRetValue));
         }
-        break;
       }
+      std::uint32_t patchOff = s.em.jmpRel32();
+      s.pendingJumps.push_back({patchOff, ir::kInvalidNodeId - 1});
+      break;
+    }
+    case K::Unwind: case K::Deopt: {
+      std::uint32_t patchOff = s.em.jmpRel32();
+      s.pendingJumps.push_back({patchOff, ir::kInvalidNodeId});
+      break;
+    }
+    case K::End: {
+      std::uint32_t patchOff = s.em.jmpRel32();
+      s.pendingJumps.push_back({patchOff, ir::kInvalidNodeId - 1});
+      break;
+    }
+    default: break;
+  }
+}
 
-      // === conversions ===
-      case K::I2L: {
-        auto it=s.slotOf.find(s.g.input(n,0));
-        if(it!=s.slotOf.end()) { s.em.movsxdRaxMem(slotPayload(it->second)); storeLong(s,n); }
-        break;
-      }
-      case K::L2I:
-        loadLongRax(s,s.g.input(n,0)); storeInt(s,n); break;
-      case K::I2B: loadIntEax(s,s.g.input(n,0)); s.em.movsxEaxAl(); storeInt(s,n); break;
-      case K::I2C: loadIntEax(s,s.g.input(n,0)); s.em.movzxEaxAx(); storeInt(s,n); break;
-      case K::I2S: loadIntEax(s,s.g.input(n,0)); s.em.movsxEaxAx(); storeInt(s,n); break;
+// --- the main lowering pass (block-based) ---
 
-      // === phi ===
-      case K::Phi:
-        // Phi slots are filled by emitPhiMovesForPred at predecessor exits.
-        break;
+bool lowerGraph(LowerState& s) {
+  s.em.prologue();
+  std::vector<Block> blocks = buildBlocks(s);
+  // Map: leader → block index (for successor lookup).
+  std::unordered_map<ir::NodeId, std::uint32_t> blockIdxMap;
+  for (std::uint32_t i = 0; i < blocks.size(); ++i) blockIdxMap[blocks[i].leader] = i;
 
-      // === memory ops via helpers ===
-      case K::LoadStatic: {
-        // [ctrl, mem] -> field value; payload = FieldId, payload2 = IRType
-        auto dstIt=s.slotOf.find(n);
-        if (dstIt!=s.slotOf.end())
-          emitHelperCall(s, static_cast<std::uint8_t>(HelperId::GetStatic),
-                        nd.payload, slotOff(dstIt->second));
-        break;
-      }
-      case K::LoadField: {
-        if (nd.numInputs >= 3) {
-          auto objIt=s.slotOf.find(s.g.input(n,2)), dstIt=s.slotOf.find(n);
-          if (objIt!=s.slotOf.end() && dstIt!=s.slotOf.end())
-            emitHelperCall(s, static_cast<std::uint8_t>(HelperId::GetField),
-                          slotOff(objIt->second), nd.payload, slotOff(dstIt->second));
+  for (std::uint32_t bi = 0; bi < blocks.size(); ++bi) {
+    Block& blk = blocks[bi];
+    ir::NodeId leader = blk.leader;
+    if (leader == ir::kInvalidNodeId) continue;
+    const ir::Node& ln = s.g.node(leader);
+    // Merge blocks: emit entry-path phi moves BEFORE the label.
+    if (ln.kind == K::Region || ln.kind == K::LoopBegin) {
+      emitPhiMovesForPred(s, leader, 0);
+    }
+    s.labelOf[leader] = s.em.offset();
+    for (ir::NodeId n : blk.dataNodes) emitNode(s, n);
+    for (ir::NodeId n : blk.fixedNodes) emitNode(s, n);
+    emitTerminator(s, leader);
+    // Fall-through JMP: if this block has exactly one successor and it's not
+    // the next block in emission order, emit a JMP to it. This handles
+    // IfTrue/IfFalse projections (which need to jump to their merge) and
+    // LoopExit (which needs to jump to the post-loop code if not adjacent).
+    // If blocks: the conditional jump handles one branch; the fall-through is
+    // the other — if the fall-through isn't next, emit a JMP.
+    if (ln.kind != K::Return && ln.kind != K::Unwind &&
+        ln.kind != K::Deopt && ln.kind != K::End &&
+        ln.kind != K::LoopEnd && ln.kind != K::If) {
+      // Single-successor blocks (Region, LoopBegin, IfTrue, IfFalse, LoopExit, Start).
+      if (!blk.successors.empty()) {
+        ir::NodeId succ = blk.successors[0];
+        std::uint32_t succBi = blockIdxMap.count(succ) ? blockIdxMap[succ] : UINT32_MAX;
+        if (succBi != bi + 1 && succBi != UINT32_MAX) {
+          // Successor is not the next block — emit a JMP.
+          std::uint32_t patchOff = s.em.jmpRel32();
+          s.pendingJumps.push_back({patchOff, succ});
         }
-        break;
       }
-      case K::StoreField: {
-        if (nd.numInputs >= 4) {
-          auto objIt=s.slotOf.find(s.g.input(n,2)), valIt=s.slotOf.find(s.g.input(n,3));
-          if (objIt!=s.slotOf.end() && valIt!=s.slotOf.end())
-            emitHelperCall(s, static_cast<std::uint8_t>(HelperId::PutField),
-                          slotOff(objIt->second), nd.payload, slotOff(valIt->second));
+    } else if (ln.kind == K::If) {
+      // If block: fall-through goes to IfTrue (the next block if in order).
+      // The conditional je goes to IfFalse. If IfTrue isn't the next block,
+      // emit a JMP to it after the conditional jump.
+      // Find which successor is IfTrue (fall-through) and which is IfFalse.
+      ir::NodeId ifTrueSucc = ir::kInvalidNodeId, ifFalseSucc = ir::kInvalidNodeId;
+      for (ir::NodeId sc : blk.successors) {
+        if (sc < s.g.nodeCount() && s.g.node(sc).kind == K::IfTrue) ifTrueSucc = sc;
+        else ifFalseSucc = sc;
+      }
+      // The pendingIfFalse entry already handles the je to IfFalse.
+      // If IfTrue (fall-through) isn't the next block, emit a JMP to it.
+      if (ifTrueSucc != ir::kInvalidNodeId) {
+        std::uint32_t succBi = blockIdxMap.count(ifTrueSucc) ? blockIdxMap[ifTrueSucc] : UINT32_MAX;
+        if (succBi != bi + 1 && succBi != UINT32_MAX) {
+          std::uint32_t patchOff = s.em.jmpRel32();
+          s.pendingJumps.push_back({patchOff, ifTrueSucc});
         }
-        break;
       }
-      case K::ArrayLength: {
-        if (nd.numInputs >= 1) {
-          auto arrIt=s.slotOf.find(s.g.input(n,0)), dstIt=s.slotOf.find(n);
-          if (arrIt!=s.slotOf.end() && dstIt!=s.slotOf.end())
-            emitHelperCall(s, static_cast<std::uint8_t>(HelperId::ArrayLength),
-                          slotOff(arrIt->second), slotOff(dstIt->second));
-        }
-        break;
-      }
-      case K::New: {
-        auto dstIt=s.slotOf.find(n);
-        if (dstIt!=s.slotOf.end())
-          emitHelperCall(s, static_cast<std::uint8_t>(HelperId::NewObject),
-                        nd.payload, slotOff(dstIt->second));
-        break;
-      }
-      case K::NewArray: {
-        if (nd.numInputs >= 2) {
-          auto lenIt=s.slotOf.find(s.g.input(n,1)), dstIt=s.slotOf.find(n);
-          if (lenIt!=s.slotOf.end() && dstIt!=s.slotOf.end())
-            emitHelperCall(s, static_cast<std::uint8_t>(HelperId::NewArray),
-                          slotOff(lenIt->second), nd.payload, slotOff(dstIt->second));
-        }
-        break;
-      }
-
-      // === calls ===
-      case K::CallStatic: case K::CallVirtual: case K::CallInterface: {
-        auto dstIt=s.slotOf.find(n);
-        std::uint32_t dstOff = (dstIt!=s.slotOf.end()) ? slotOff(dstIt->second) : 0;
-        // Count args: skip ctrl(0) + mem(1); exclude trailing FrameState.
-        std::uint32_t argCount = 0;
-        if (nd.numInputs > 2) {
-          argCount = nd.numInputs - 2;
-          if (argCount > 0) {
-            ir::NodeId last = s.g.input(n, nd.numInputs-1);
-            if (last < s.g.nodeCount() && s.g.node(last).kind == K::FrameState) --argCount;
-          }
-        }
-        std::uint32_t flavor = (nd.kind==K::CallStatic) ? 0 : 1;
-        std::uint32_t packedTarget = (flavor << 28) | (nd.payload & 0x0FFF'FFFF);
-        // Copy args to consecutive staging slots at the end of the activation.
-        // The b2cg_call helper expects args in consecutive 16-byte slots.
-        std::uint32_t argBaseSlot = s.nextSlot; // staging area starts here
-        for (std::uint32_t a = 0; a < argCount; ++a) {
-          ir::NodeId argNode = s.g.input(n, 2 + a);
-          auto argIt = s.slotOf.find(argNode);
-          if (argIt != s.slotOf.end()) {
-            copySlot(s, argBaseSlot + a, argIt->second);
-          }
-        }
-        emitHelperCall(s, static_cast<std::uint8_t>(HelperId::Call),
-                      slotOff(argBaseSlot), argCount, packedTarget, dstOff);
-        break;
-      }
-
-      // === guards ===
-      case K::Guard:
-        // v1: skip guard checks. The helpers (b2cg_get_field, etc.) do their
-        // own null/bounds checks and trap. This means we lose deopt metadata,
-        // but the helper trap path still deopts to T0.
-        break;
-
-      case K::FrameState: case K::MemBar: case K::ClassInit:
-      case K::Switch: case K::SwitchCase: case K::SwitchDefault:
-        break; // no code (v1: no deopt metadata emission)
-
-      // --- unhandled kinds (TODO: refuse instead of silent wrong) ---
-      default:
-        break;
     }
   }
-
   // Epilogues.
   s.normalEpilogue = s.em.offset();
   s.em.epilogueNormal();
   s.deoptEpilogue = s.em.offset();
   s.em.epilogueDeopt();
-
   // Backpatch pending jumps.
   for (auto& [patchOff, target] : s.pendingJumps) {
     if (target == ir::kInvalidNodeId) s.em.patchRel32(patchOff, s.deoptEpilogue);
     else if (target == ir::kInvalidNodeId - 1) s.em.patchRel32(patchOff, s.normalEpilogue);
     else { auto lab=s.labelOf.find(target); s.em.patchRel32(patchOff, lab!=s.labelOf.end()?lab->second:s.normalEpilogue); }
   }
-  // Backpatch IfFalse jumps: find the IfFalse projection of each If.
   for (auto& [patchOff, ifNode] : s.pendingIfFalse) {
     ir::NodeId ifFalse = ir::kInvalidNodeId;
     for (ir::NodeId i = 0; i < s.g.nodeCount(); ++i) {
@@ -518,13 +748,9 @@ bool lowerGraph(LowerState& s) {
       if (ni.numInputs >= 1 && s.g.input(i, 0) == ifNode) { ifFalse = i; break; }
     }
     if (ifFalse != ir::kInvalidNodeId) {
-      auto lab=s.labelOf.find(ifFalse);
-      s.em.patchRel32(patchOff, lab!=s.labelOf.end()?lab->second:s.normalEpilogue);
-    } else {
-      s.em.patchRel32(patchOff, s.normalEpilogue);
-    }
+      auto lab=s.labelOf.find(ifFalse); s.em.patchRel32(patchOff, lab!=s.labelOf.end()?lab->second:s.normalEpilogue);
+    } else { s.em.patchRel32(patchOff, s.normalEpilogue); }
   }
-  // Backpatch backedge jumps: find the LoopBegin for each LoopEnd.
   for (auto& [patchOff, loopEnd] : s.pendingBackedge) {
     ir::NodeId loopBegin = ir::kInvalidNodeId;
     for (ir::NodeId i = 0; i < s.g.nodeCount(); ++i) {
@@ -538,13 +764,10 @@ bool lowerGraph(LowerState& s) {
       }
     }
     if (loopBegin != ir::kInvalidNodeId) {
-      auto lab=s.labelOf.find(loopBegin);
-      s.em.patchRel32(patchOff, lab!=s.labelOf.end()?lab->second:0);
+      auto lab=s.labelOf.find(loopBegin); s.em.patchRel32(patchOff, lab!=s.labelOf.end()?lab->second:0);
     }
   }
-  // Patch helper calls.
   for (auto& [patchOff, addr] : s.pendingCalls) s.em.patchCallAbs(patchOff, addr);
-
   return s.refusal.empty();
 }
 

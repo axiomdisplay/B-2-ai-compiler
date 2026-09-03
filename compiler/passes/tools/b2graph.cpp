@@ -274,6 +274,12 @@ int run(const b2::rbc::Program& prog, bool quiet, bool optimize, bool inl,
     args.push_back(b2::interp::Value::refVal(
         engine.interp().runtime().newRefArray(engine.interp().runtime().stringClass(), 0)));
   const b2::codegen::Tier1RunResult r = engine.run("main", entryDesc, args);
+  // WHY: println writes to rt.stdout() (an internal string buffer, not real
+  // stdout). b2run flushes it after the run; we must too (b2graph --exec
+  // mirrors b2run's output discipline).
+  std::fwrite(engine.interp().runtime().stdout().data(), 1,
+              engine.interp().runtime().stdout().size(), stdout);
+  std::fflush(stdout);
   if (!quiet) std::fprintf(stderr, "[b2graph --exec] lowered=%u refused=%u status=%d\n",
                           lowered, refused, static_cast<int>(r.status));
   return r.status == b2::codegen::Tier1Status::Returned ? 0 : 1;
