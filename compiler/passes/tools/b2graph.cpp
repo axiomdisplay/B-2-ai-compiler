@@ -280,8 +280,13 @@ int run(const b2::rbc::Program& prog, bool quiet, bool optimize, bool inl,
   std::fwrite(engine.interp().runtime().stdout().data(), 1,
               engine.interp().runtime().stdout().size(), stdout);
   std::fflush(stdout);
-  if (!quiet) std::fprintf(stderr, "[b2graph --exec] lowered=%u refused=%u status=%d\n",
-                          lowered, refused, static_cast<int>(r.status));
+  if (!quiet) std::fprintf(stderr, "[b2graph --exec] lowered=%u refused=%u status=%d "
+                          "t1_entries=%llu helper_calls=%llu deopts=%u/%u/%u t0_fallback=%u\n",
+                          lowered, refused, static_cast<int>(r.status),
+                          static_cast<unsigned long long>(engine.stats().t1_entries),
+                          static_cast<unsigned long long>(engine.stats().helper_calls),
+                          engine.stats().deopt_trap, engine.stats().deopt_call_exception,
+                          engine.stats().deopt_guard, engine.stats().t0_fallback_executions);
   return r.status == b2::codegen::Tier1Status::Returned ? 0 : 1;
 }
 
