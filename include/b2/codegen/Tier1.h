@@ -129,6 +129,11 @@ public:
   // Compiled-code lookup for tools/tests (offsets are into exec blocks).
   [[nodiscard]] const CompiledCode* codeFor(std::uint32_t method_index) const;
 
+  // Install a pre-built CompiledCode (e.g. from T2 lowering) into the cache.
+  // The next runMethod() for this method_index will execute it via the
+  // standard executeCompiled path (helper seam, W^X, deopt-to-T0).
+  void installCompiledCode(std::unique_ptr<CompiledCode> code);
+
 private:
   std::unique_ptr<Impl> impl_;
   // Keep the interpreter by value: its Runtime owns the heap/statics the

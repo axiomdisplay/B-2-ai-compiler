@@ -40,6 +40,8 @@
 #include <vector>
 
 #include "DispatchProfileSnapshot.h"
+#include "b2/codegen/T2Lowering.h"
+#include "b2/codegen/Tier1.h"
 #include "b2/interp/Interp.h"
 #include "b2/ir/Printer.h"
 #include "b2/ir/Verifier.h"
@@ -232,6 +234,51 @@ int run(const b2::rbc::Program& prog, bool quiet, bool optimize, bool inl,
   return failures == 0 ? 0 : 1;
 }
 
+// --- --exec: T2 lowering + execution -------------------------------------------
+[[nodiscard]] int execProgram(const b2::rbc::Program& prog,
+                              bool quiet, bool optimize, bool inl, bool pea,
+                              const b2::passes::DispatchProfile* profile) {
+  b2::codegen::Tier1 engine(prog, b2::codegen::Tier1Config{});
+  std::uint32_t lowered = 0, refused = 0;
+  for (std::size_t i = 0; i < prog.methods.size(); ++i) {
+    const b2::rbc::Method& m = prog.methods[i];
+    const b2::rbc::VerifyResult vr = b2::rbc::verify(m);
+    if (vr.hasErrors()) { std::fprintf(stderr,"  [debug] rbc verify failed for %s\n",m.name.c_str()); ++refused; continue; }
+    b2::passes::ProgramCalleeSource resolver(prog);
+    b2::ir::Graph g;
+    const b2::passes::BuildResult br = b2::passes::buildGraph(
+        m, resolver, g, static_cast<b2::ir::MethodId>(i));
+    if (br.hasErrors()) { std::fprintf(stderr,"  [debug] buildGraph failed for %s\n",m.name.c_str()); ++refused; continue; }
+    if (inl) { b2::passes::InlineConfig icfg; icfg.profile = profile;
+      (void)b2::passes::runInlining(g, resolver, icfg); }
+    if (pea) { (void)b2::passes::runPartialEscapeAnalysis(g); }
+    if (optimize) { (void)b2::passes::runEarlyCleanup(g); }
+    const b2::ir::VerifyResult irv = b2::ir::verify(g);
+    if (irv.hasErrors()) { std::fprintf(stderr,"  [debug] IR verify failed for %s: %s\n",m.name.c_str(), irv.diags.empty()?"":irv.diags[0].message.c_str()); ++refused; continue; }
+    std::string refusalReason;
+    auto cc = b2::codegen::lowerOnly(g, m, static_cast<std::uint32_t>(i),
+                                     engine.interp().runtime(), &refusalReason);
+    if (!cc) { std::fprintf(stderr,"  [debug] lowerOnly refused for %s: %s\n",m.name.c_str(), refusalReason.c_str()); ++refused; continue; }
+    engine.installCompiledCode(std::move(cc));
+    ++lowered;
+  }
+  // Find + execute entry.
+  std::string entryDesc;
+  if (prog.find("main", "()V")) entryDesc = "()V";
+  else if (prog.find("main", "([Ljava/lang/String;)V")) entryDesc = "([Ljava/lang/String;)V";
+  else { for (const b2::rbc::Method& m : prog.methods)
+    if (m.name=="main" && b2::rbc::paramCount(m.descriptor)==0) { entryDesc=m.descriptor; break; } }
+  if (entryDesc.empty()) { std::fprintf(stderr,"b2graph --exec: no main()V\n"); return 1; }
+  std::vector<b2::interp::Value> args;
+  if (entryDesc == "([Ljava/lang/String;)V")
+    args.push_back(b2::interp::Value::refVal(
+        engine.interp().runtime().newRefArray(engine.interp().runtime().stringClass(), 0)));
+  const b2::codegen::Tier1RunResult r = engine.run("main", entryDesc, args);
+  if (!quiet) std::fprintf(stderr, "[b2graph --exec] lowered=%u refused=%u status=%d\n",
+                          lowered, refused, static_cast<int>(r.status));
+  return r.status == b2::codegen::Tier1Status::Returned ? 0 : 1;
+}
+
 } // namespace
 
 // The T0 training run (the --pgo half; ICDG Phase 2): execute the
@@ -280,6 +327,7 @@ int main(int argc, char** argv) {
   bool inl = false;
   bool pgo = false;
   bool pea = false;
+  bool exec = false;
   std::vector<std::string> files;
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
@@ -294,6 +342,8 @@ int main(int argc, char** argv) {
       inl = true; // the profile only has a consumer through the engine
     } else if (arg == "--pea") {
       pea = true;
+    } else if (arg == "--exec") {
+      exec = true; optimize = true; inl = true;
     } else if (arg == "--help" || arg == "-h") {
       std::printf(
           "usage: b2graph [--quiet] [-O] [--inline] [--pgo] [--pea] file.rbc...\n"
@@ -354,7 +404,11 @@ int main(int argc, char** argv) {
     if (pgo) {
       profile = trainAndSnapshot(*parsed, storage);
     }
-    failures += run(*parsed, quiet, optimize, inl, pea, profile) == 0 ? 0 : 1;
+    if (exec) {
+      failures += execProgram(*parsed, quiet, optimize, inl, pea, profile) == 0 ? 0 : 1;
+    } else {
+      failures += run(*parsed, quiet, optimize, inl, pea, profile) == 0 ? 0 : 1;
+    }
   }
   return failures == 0 ? 0 : 1;
 }

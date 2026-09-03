@@ -50,6 +50,7 @@ add_library(b2_codegen STATIC
   src/StencilBodies.cpp
   src/Instantiate.cpp
   src/Engine.cpp
+  src/T2Lowering.cpp
   ${B2_CODEGEN_GEN_DIR}/ArchiveData.cpp
 )
 add_dependencies(b2_codegen b2_codegen_archive_data)
@@ -60,7 +61,7 @@ target_include_directories(b2_codegen PUBLIC
 )
 target_compile_features(b2_codegen PUBLIC cxx_std_26)
 set_target_properties(b2_codegen PROPERTIES CXX_EXTENSIONS OFF)
-target_link_libraries(b2_codegen PUBLIC b2::baseline b2::interp)
+target_link_libraries(b2_codegen PUBLIC b2::baseline b2::interp b2::ir)
 
 if(B2_BUILD_TOOLS)
   add_executable(b2jit tools/b2jit.cpp)

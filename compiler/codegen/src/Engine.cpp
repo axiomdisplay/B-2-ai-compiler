@@ -1021,4 +1021,17 @@ const CompiledCode* Tier1::codeFor(std::uint32_t method_index) const {
   return it == impl_->cache.end() ? nullptr : it->second.get();
 }
 
+// WHY: the T2 lowering produces a CompiledCode by emitting its own machine
+// bytes (instruction selection over the sea-of-nodes IR); this seam lets it
+// reuse the T1 engine's helper-call dispatch, W^X activation, and deopt-to-T0
+// path WITHOUT re-implementing them (docs/codegen_contract.md SS8/SS9).
+void Tier1::installCompiledCode(std::unique_ptr<CompiledCode> code) {
+  if (code == nullptr) return;
+  const std::uint32_t methodIdx = code->method_index;
+  impl_->stats->code_bytes += static_cast<std::uint32_t>(code->code.size());
+  ++impl_->stats->compile_ok;
+  impl_->cache[methodIdx] = std::move(code);
+  last_run_compiled_ = true;
+}
+
 } // namespace b2::codegen
