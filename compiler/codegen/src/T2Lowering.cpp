@@ -100,6 +100,28 @@ bool isValueNode(K k) noexcept {
   }
 }
 
+// Does this node kind have a Ctrl input in slot 0? (Check Node.h signatures.)
+// WHY: only nodes with Ctrl inputs should be assigned to blocks via the
+// ctrl-chain fixpoint. Data nodes (AddI, IsNull, etc.) have DATA in slot 0
+// and must be assigned via the use-site fixpoint instead.
+bool hasCtrlInput(K k) noexcept {
+  switch (k) {
+    case K::LoadField: case K::StoreField: case K::LoadStatic: case K::StoreStatic:
+    case K::LoadElem: case K::StoreElem:
+    case K::MemBar: case K::MonitorEnter: case K::MonitorExit:
+    case K::New: case K::NewArray: case K::NewRefArray: case K::NewMultiArray:
+    case K::ClassInit:
+    case K::CallStatic: case K::CallVirtual: case K::CallInterface: case K::CallDynamic:
+    case K::CheckCast:
+    case K::Guard: case K::RepTransitionGuard:
+    case K::Materialize:
+    case K::LoopExit: case K::LoopEnd: case K::Return: case K::Unwind: case K::Deopt:
+    case K::End: case K::If: case K::Switch:
+      return true;
+    default: return false; // ArrayLength, InstanceOf, arithmetic, etc.
+  }
+}
+
 void assignSlots(LowerState& s) {
   // Parameters first (sorted by index → slots 0..N-1, matching T1 arg copy).
   std::vector<std::pair<std::uint32_t, ir::NodeId>> params;
@@ -840,6 +862,40 @@ bool lowerGraph(LowerState& s) {
   // Map: leader → block index (for successor lookup).
   std::unordered_map<ir::NodeId, std::uint32_t> blockIdxMap;
   for (std::uint32_t i = 0; i < blocks.size(); ++i) blockIdxMap[blocks[i].leader] = i;
+
+  // WHY: fixed nodes whose ctrl chain doesn't reach a block leader (e.g.
+  // ClassInit→LoadStatic→Guard→CallVirtual where ClassInit's ctrl is Start
+  // but the chain isn't detected by the direct check) are unassigned. Emit
+  // them in the Return block (the post-loop exit block). Find the Return
+  // block and append unassigned fixed nodes to it, sorted by node ID.
+  {
+    std::uint32_t returnBi = UINT32_MAX;
+    for (std::uint32_t bi = 0; bi < blocks.size(); ++bi) {
+      if (blocks[bi].leader != ir::kInvalidNodeId &&
+          s.g.node(blocks[bi].leader).kind == K::Return) {
+        returnBi = bi; break;
+      }
+    }
+    if (returnBi != UINT32_MAX) {
+      std::vector<ir::NodeId> unassigned;
+      for (ir::NodeId n = 0; n < s.g.nodeCount(); ++n) {
+        const ir::Node& nd = s.g.node(n);
+        if (nd.isDead() || isBlockLeader(nd.kind)) continue;
+        if (nd.kind == K::Phi) continue;
+        if (hasCtrlInput(nd.kind)) {
+          // Check if it's already assigned to a block.
+          bool found = false;
+          for (auto& blk : blocks) {
+            for (ir::NodeId fn : blk.fixedNodes) if (fn == n) { found = true; break; }
+            if (found) break;
+          }
+          if (!found) unassigned.push_back(n);
+        }
+      }
+      std::sort(unassigned.begin(), unassigned.end());
+      for (ir::NodeId n : unassigned) blocks[returnBi].fixedNodes.push_back(n);
+    }
+  }
 
   for (std::uint32_t bi = 0; bi < blocks.size(); ++bi) {
     Block& blk = blocks[bi];
