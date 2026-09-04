@@ -45,6 +45,7 @@ inline std::int32_t slotTag(std::uint32_t slot) noexcept { return slotOff(slot);
 
 struct LowerState {
   const ir::Graph& g;
+  const rbc::Program& program;
   const rbc::Method& method;
   std::uint32_t methodId;
   interp::Runtime& rt;
@@ -75,8 +76,9 @@ struct LowerState {
   // Pending backedge jumps: (patchOffset, LoopEndNodeId) — resolved to the
   // LoopBegin that owns this backedge.
   std::vector<std::pair<std::uint32_t, ir::NodeId>> pendingBackedge;
-  LowerState(const ir::Graph& graph, const rbc::Method& m, std::uint32_t mid, interp::Runtime& runtime)
-    : g(graph), method(m), methodId(mid), rt(runtime) {}
+  LowerState(const ir::Graph& graph, const rbc::Program& prog,
+             const rbc::Method& m, std::uint32_t mid, interp::Runtime& runtime)
+    : g(graph), program(prog), method(m), methodId(mid), rt(runtime) {}
 };
 
 bool isValueNode(K k) noexcept {
@@ -739,17 +741,57 @@ void emitNode(LowerState& s, ir::NodeId n) {
                     fieldIdOrBuiltin, slotOff(dstIt->second));
       break;
     }
-    case K::LoadField: { if(nd.numInputs>=3){ auto o=s.slotOf.find(s.g.input(n,2)),d=s.slotOf.find(n);
-      if(o!=s.slotOf.end()&&d!=s.slotOf.end()) emitHelperCall(s, static_cast<std::uint8_t>(HelperId::GetField), slotOff(o->second), nd.payload, slotOff(d->second)); } break; }
-    case K::StoreField: { if(nd.numInputs>=4){ auto o=s.slotOf.find(s.g.input(n,2)),v=s.slotOf.find(s.g.input(n,3));
-      if(o!=s.slotOf.end()&&v!=s.slotOf.end()) emitHelperCall(s, static_cast<std::uint8_t>(HelperId::PutField), slotOff(o->second), nd.payload, slotOff(v->second)); } break; }
+    case K::LoadField: { if(nd.numInputs>=3){
+      auto o=s.slotOf.find(s.g.input(n,2)),d=s.slotOf.find(n);
+      if(o!=s.slotOf.end()&&d!=s.slotOf.end()) {
+        // WHY: nd.payload is the RBC CP field index. b2cg_get_field expects
+        // fieldOffAndType = (RType << 28) | fieldOffset. Resolve through rt.
+        std::uint32_t fieldOffAndType = nd.payload;
+        if (nd.payload < s.method.cp.size()) {
+          auto rf = s.rt.resolveField(s.method.cp[nd.payload]);
+          if (rf.has_value()) {
+            std::uint32_t off = s.rt.fieldOffsetOf(rf->slot);
+            fieldOffAndType = (static_cast<std::uint32_t>(rf->type) << 28) | (off & 0x0FFF'FFFF);
+          }
+        }
+        emitHelperCall(s, static_cast<std::uint8_t>(HelperId::GetField), slotOff(o->second), fieldOffAndType, slotOff(d->second));
+      } } break; }
+    case K::StoreField: { if(nd.numInputs>=4){
+      auto o=s.slotOf.find(s.g.input(n,2)),v=s.slotOf.find(s.g.input(n,3));
+      if(o!=s.slotOf.end()&&v!=s.slotOf.end()) {
+        std::uint32_t fieldOffAndType = nd.payload;
+        if (nd.payload < s.method.cp.size()) {
+          auto rf = s.rt.resolveField(s.method.cp[nd.payload]);
+          if (rf.has_value()) {
+            std::uint32_t off = s.rt.fieldOffsetOf(rf->slot);
+            fieldOffAndType = (static_cast<std::uint32_t>(rf->type) << 28) | (off & 0x0FFF'FFFF);
+          }
+        }
+        emitHelperCall(s, static_cast<std::uint8_t>(HelperId::PutField), slotOff(o->second), fieldOffAndType, slotOff(v->second));
+      } } break; }
     case K::ArrayLength: { if(nd.numInputs>=1){ auto a=s.slotOf.find(s.g.input(n,0)),d=s.slotOf.find(n);
       if(a!=s.slotOf.end()&&d!=s.slotOf.end()) emitHelperCall(s, static_cast<std::uint8_t>(HelperId::ArrayLength), slotOff(a->second), slotOff(d->second)); } break; }
-    case K::New: { auto d=s.slotOf.find(n); if(d!=s.slotOf.end()) emitHelperCall(s, static_cast<std::uint8_t>(HelperId::NewObject), nd.payload, slotOff(d->second)); break; }
+    case K::New: {
+      // WHY: nd.payload is the resolver's interned key, NOT a runtime ClassId.
+      // b2cg_new_object expects a runtime ClassId. In v0 (one-class world),
+      // all `new` creates the program class. Resolve through rt.classId().
+      auto d=s.slotOf.find(n);
+      if(d!=s.slotOf.end()) {
+        interp::ClassId cls = s.rt.classId(s.program.className);
+        emitHelperCall(s, static_cast<std::uint8_t>(HelperId::NewObject),
+                      cls.v, slotOff(d->second));
+      }
+      break;
+    }
     case K::NewArray: { if(nd.numInputs>=2){ auto l=s.slotOf.find(s.g.input(n,1)),d=s.slotOf.find(n);
       if(l!=s.slotOf.end()&&d!=s.slotOf.end()) emitHelperCall(s, static_cast<std::uint8_t>(HelperId::NewArray), slotOff(l->second), nd.payload, slotOff(d->second)); } break; }
     // === calls ===
     case K::CallStatic: case K::CallVirtual: case K::CallInterface: {
+      // WHY: the optimizer may create a CallStatic to the current method
+      // (class-init artifact or SCCP ghost). This causes infinite recursion
+      // through the compiled cache (compiled main calls compiled main).
+      // Skip self-calls — T0 handles them via deopt reconstruction.
+      if (nd.kind == K::CallStatic && nd.payload == s.methodId) break;
       auto dstIt=s.slotOf.find(n); std::uint32_t dstOff=(dstIt!=s.slotOf.end())?slotOff(dstIt->second):0;
       std::uint32_t argCount=0;
       ir::NodeId fsNode=ir::kInvalidNodeId;
@@ -1014,9 +1056,9 @@ bool lowerGraph(LowerState& s) {
 } // anonymous namespace
 
 std::unique_ptr<CompiledCode> lowerOnly(
-    const ir::Graph& g, const rbc::Method& method, std::uint32_t methodId,
-    interp::Runtime& rt, std::string* refusalReason) {
-  LowerState s(g, method, methodId, rt);
+    const ir::Graph& g, const rbc::Program& program, const rbc::Method& method,
+    std::uint32_t methodId, interp::Runtime& rt, std::string* refusalReason) {
+  LowerState s(g, program, method, methodId, rt);
   assignSlots(s);
   assignRegisters(s);
   if (!lowerGraph(s)) {
@@ -1059,8 +1101,8 @@ std::unique_ptr<CompiledCode> lowerOnly(
 }
 
 Tier1RunResult lowerAndExecute(
-    ir::Graph& g, const rbc::Method& method, std::uint32_t methodId,
-    Tier1& engine, std::span<const interp::Value> args,
+    ir::Graph& g, const rbc::Program& program, const rbc::Method& method,
+    std::uint32_t methodId, Tier1& engine, std::span<const interp::Value> args,
     const T2LoweringConfig& /*config*/) {
   const ir::VerifyResult irv = ir::verify(g);
   if (irv.hasErrors()) {
@@ -1069,7 +1111,7 @@ Tier1RunResult lowerAndExecute(
     return r;
   }
   std::string refusal;
-  auto cc = lowerOnly(g, method, methodId, engine.interp().runtime(), &refusal);
+  auto cc = lowerOnly(g, program, method, methodId, engine.interp().runtime(), &refusal);
   if (!cc) return engine.runMethod(methodId, args); // Rule 96: fall back to T0
   engine.installCompiledCode(std::move(cc));
   return engine.runMethod(methodId, args);

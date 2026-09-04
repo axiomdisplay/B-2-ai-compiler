@@ -256,7 +256,7 @@ int run(const b2::rbc::Program& prog, bool quiet, bool optimize, bool inl,
     const b2::ir::VerifyResult irv = b2::ir::verify(g);
     if (irv.hasErrors()) { std::fprintf(stderr,"  [debug] IR verify failed for %s: %s\n",m.name.c_str(), irv.diags.empty()?"":irv.diags[0].message.c_str()); ++refused; continue; }
     std::string refusalReason;
-    auto cc = b2::codegen::lowerOnly(g, m, static_cast<std::uint32_t>(i),
+    auto cc = b2::codegen::lowerOnly(g, prog, m, static_cast<std::uint32_t>(i),
                                      engine.interp().runtime(), &refusalReason);
     if (!cc) { std::fprintf(stderr,"  [debug] lowerOnly refused for %s: %s\n",m.name.c_str(), refusalReason.c_str()); ++refused; continue; }
     engine.installCompiledCode(std::move(cc));
