@@ -664,8 +664,22 @@ void emitNode(LowerState& s, ir::NodeId n) {
       break;
     }
     case K::MulI: loadIntEax(s,s.g.input(n,0)); loadIntEcx(s,s.g.input(n,1)); s.em.imulEaxEcx(); storeInt(s,n); break;
-    case K::DivI: loadIntEax(s,s.g.input(n,0)); loadIntEcx(s,s.g.input(n,1)); s.em.idivEcx(); storeInt(s,n); break;
-    case K::RemI: loadIntEax(s,s.g.input(n,0)); loadIntEcx(s,s.g.input(n,1)); s.em.idivEcx(); s.em.movEaxEdx(); storeInt(s,n); break;
+    case K::DivI: case K::RemI: {
+      // WHY: idiv traps with SIGFPE on divisor=0. The optimizer may kill
+      // the zero-check Guard but leave the DivI as a floating node. Emit
+      // a runtime zero-check: if divisor==0, jump to deopt epilogue (T0
+      // handles the ArithmeticException).
+      loadIntEax(s,s.g.input(n,0)); loadIntEcx(s,s.g.input(n,1));
+      s.em.testEaxEax(); // test if ECX... wait, test ECX
+      // Actually: test ecx, ecx; jz deopt
+      s.em.byte(0x85); s.em.modrm(3,1,1); // test ecx, ecx
+      std::uint32_t jzPatch = s.em.jccRel32(0x84); // je (jz) deopt
+      s.pendingJumps.push_back({jzPatch, ir::kInvalidNodeId}); // deopt
+      s.em.idivEcx();
+      if (nd.kind == K::RemI) s.em.movEaxEdx();
+      storeInt(s,n);
+      break;
+    }
     case K::NegI: loadIntEax(s,s.g.input(n,0)); s.em.negEax(); storeInt(s,n); break;
     case K::ShlI: loadIntEax(s,s.g.input(n,0)); loadIntEcx(s,s.g.input(n,1)); s.em.andEcxImm31(); s.em.shlEaxCl(); storeInt(s,n); break;
     case K::ShrI: loadIntEax(s,s.g.input(n,0)); loadIntEcx(s,s.g.input(n,1)); s.em.andEcxImm31(); s.em.sarEaxCl(); storeInt(s,n); break;
