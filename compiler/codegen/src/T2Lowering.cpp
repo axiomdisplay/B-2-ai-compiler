@@ -778,7 +778,22 @@ void emitNode(LowerState& s, ir::NodeId n) {
       }
       std::uint32_t argBaseSlot=s.nextSlot;
       for(std::uint32_t a=0;a<argCount;++a){ ir::NodeId argNode=s.g.input(n,2+a);
-        auto argIt=s.slotOf.find(argNode); if(argIt!=s.slotOf.end()) copySlot(s, argBaseSlot+a, argIt->second); }
+        auto argIt=s.slotOf.find(argNode);
+        if(argIt!=s.slotOf.end()) {
+          // WHY: if the arg is register-allocated, spill it to its slot first
+          // (copySlot reads from the slot, but the register has the truth).
+          auto rit = s.regOf.find(argNode);
+          if (rit != s.regOf.end()) {
+            Reg32 r = reg32Of(rit->second);
+            bool rex_b = r >= Reg32::R8D;
+            if (rex_b) s.em.byte(0x41);
+            s.em.byte(0x89);
+            s.em.modrm(2, static_cast<std::uint8_t>(r)&7, 5); // mov [rbp+disp], r
+            s.em.imm32(slotPayload(argIt->second));
+          }
+          copySlot(s, argBaseSlot+a, argIt->second);
+        }
+      }
       emitHelperCall(s, static_cast<std::uint8_t>(HelperId::Call), slotOff(argBaseSlot), argCount, packedTarget, dstOff);
       break;
     }
