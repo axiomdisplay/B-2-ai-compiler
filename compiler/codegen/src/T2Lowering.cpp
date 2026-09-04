@@ -1033,6 +1033,11 @@ std::unique_ptr<CompiledCode> lowerOnly(
   cc->num_regs = (s.nextSlot + 16) - s.numParams;
   CodeEntry entry; entry.native_offset = 0; entry.rbc_pc = 0; entry.is_method_entry = true;
   cc->entries.push_back(entry);
+  // WHY: pc_map entry at native offset 0 → RBC pc 0. When a helper traps and
+  // the compiled code deopts, the engine reads act->deopt_pc (0 — the
+  // activation is zeroed) and calls cc->rbcPcAt(0) to find the RBC resume pc.
+  RealPcEntry pcEntry; pcEntry.native_offset = 0; pcEntry.rbc_pc = 0;
+  cc->pc_map.push_back(pcEntry);
   // W^X publish: page-aligned alloc (mprotect requires page alignment).
   const std::size_t pageSize = sysconf(_SC_PAGESIZE);
   const std::size_t allocSize = (cc->code.size() + pageSize - 1) & ~(pageSize - 1);
