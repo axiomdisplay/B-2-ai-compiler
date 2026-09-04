@@ -583,22 +583,12 @@ std::vector<Block> buildBlocks(LowerState& s) {
         const ir::Node& un = g.node(i);
         if (un.isDead() || isBlockLeader(un.kind)) continue;
         if (un.numInputs >= 1 && g.input(i, 0) == leader) {
-          // This fixed node is in this block. Find what controls the NEXT
-          // node that uses this fixed node's output... actually, just find
-          // the next control node that is reachable.
-          // For simplicity, look for a control node whose input chain
-          // includes this fixed node.
-          // Actually, the successor is the control node that uses the
-          // fixed node's MEMORY or CONTROL output. For v1, scan for any
-          // control leader whose input[0] is a fixed node in this block.
           for (ir::NodeId j = 0; j < g.nodeCount(); ++j) {
             if (j == leader) continue;
             const ir::Node& cn = g.node(j);
             if (cn.isDead() || !isBlockLeader(cn.kind)) continue;
             if (cn.numInputs >= 1) {
               ir::NodeId c0 = g.input(j, 0);
-              // Walk c0's ctrl chain to see if it reaches `leader` or a
-              // node in this block.
               while (c0 < g.nodeCount() && !g.node(c0).isDead() &&
                      !isBlockLeader(g.node(c0).kind)) {
                 if (c0 == i) { blocks[bi].successors.push_back(j); goto found; }
