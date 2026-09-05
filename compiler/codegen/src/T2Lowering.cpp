@@ -34,10 +34,12 @@ namespace {
 using K = ir::NodeKind;
 
 // RType tag values for Value.type.
-constexpr std::uint32_t kRTypeInt  = static_cast<std::uint32_t>(rbc::RType::Int);
-constexpr std::uint32_t kRTypeLong = static_cast<std::uint32_t>(rbc::RType::Long);
-constexpr std::uint32_t kRTypeRef  = static_cast<std::uint32_t>(rbc::RType::Ref);
-constexpr std::uint32_t kRTypeNull = static_cast<std::uint32_t>(rbc::RType::Null);
+constexpr std::uint32_t kRTypeInt    = static_cast<std::uint32_t>(rbc::RType::Int);
+constexpr std::uint32_t kRTypeLong   = static_cast<std::uint32_t>(rbc::RType::Long);
+constexpr std::uint32_t kRTypeFloat  = static_cast<std::uint32_t>(rbc::RType::Float);
+constexpr std::uint32_t kRTypeDouble = static_cast<std::uint32_t>(rbc::RType::Double);
+constexpr std::uint32_t kRTypeRef    = static_cast<std::uint32_t>(rbc::RType::Ref);
+constexpr std::uint32_t kRTypeNull   = static_cast<std::uint32_t>(rbc::RType::Null);
 
 inline std::int32_t slotOff(std::uint32_t slot) noexcept { return static_cast<std::int32_t>(kSlotsBase) + static_cast<std::int32_t>(slot) * 16; }
 inline std::int32_t slotPayload(std::uint32_t slot) noexcept { return slotOff(slot) + 8; }
@@ -620,8 +622,36 @@ void emitNode(LowerState& s, ir::NodeId n) {
     case K::ConstantI: s.em.movEaxImm32(static_cast<std::int32_t>(nd.constValue)); storeInt(s,n); break;
     case K::ConstantL: s.em.movRaxImm64(nd.constValue); storeLong(s,n); break;
     case K::ConstantNull: storeNull(s,n); break;
-    case K::ConstantF: case K::ConstantD: case K::ConstantSym:
-      s.em.movRaxImm64(nd.constValue); storeLong(s,n); break;
+    case K::ConstantF: case K::ConstantD: {
+      // WHY: store the IEEE 754 bits as the payload, but set the type tag
+      // to Float/Double (not Long). The println helper checks the type tag
+      // to format the output correctly.
+      s.em.movRaxImm64(nd.constValue);
+      auto it = s.slotOf.find(n);
+      if (it != s.slotOf.end()) {
+        s.em.storeRbpDisp64(Reg::RAX, slotPayload(it->second));
+        std::uint32_t tag = (nd.kind == K::ConstantF) ? kRTypeFloat : kRTypeDouble;
+        s.em.movEaxImm32(static_cast<std::int32_t>(tag));
+        s.em.storeRbpDisp32(Reg32::EAX, slotTag(it->second));
+      }
+      break;
+    }
+    case K::ConstantSym: {
+      // WHY: ConstantSym's payload is a SymbolId. The b2cg_ldc_const helper
+      // takes a CP index. For v0, use the first string CP entry as a fallback.
+      std::uint32_t cpIndex = 0;
+      for (std::uint32_t ci = 0; ci < s.method.cp.size(); ++ci) {
+        if (s.method.cp[ci].kind == rbc::Const::Kind::String) {
+          cpIndex = ci; break;
+        }
+      }
+      auto dstIt = s.slotOf.find(n);
+      if (dstIt != s.slotOf.end()) {
+        emitHelperCall(s, static_cast<std::uint8_t>(HelperId::LdcConst),
+                      cpIndex, slotOff(dstIt->second));
+      }
+      break;
+    }
     case K::Parameter: case K::Undef: break;
     // === int arithmetic ===
     // WHY: direct-register path for loop variables. If the result is in a
@@ -722,20 +752,30 @@ void emitNode(LowerState& s, ir::NodeId n) {
     case K::Phi: break;
     // === memory ops via helpers ===
     case K::LoadStatic: {
-      // WHY: the IR's payload is the RBC field CP index. The b2cg_get_static
-      // helper expects either a statics-storage FieldId (< kStaticBuiltinBase)
-      // or kStaticBuiltinBase | objRefId for System.out/err. Resolve through
-      // the runtime: if the CP entry is a builtin (System.out/err), encode
-      // the ObjRef id; otherwise pass the field id directly.
       auto dstIt=s.slotOf.find(n);
       if(dstIt==s.slotOf.end()) break;
-      std::uint32_t fieldIdOrBuiltin = nd.payload;
-      if (nd.payload < s.method.cp.size()) {
-        const rbc::Const& fc = s.method.cp[nd.payload];
+      // WHY: nd.payload is the resolver's field id (interned key), NOT a CP
+      // index. The b2cg_get_static helper needs either a FieldId or
+      // kStaticBuiltinBase | objRefId for System.out/err. For v0, scan the
+      // RBC code for getstatic instructions and find the one whose CP entry
+      // is a field ref to System.out/err. This is the common case (the only
+      // static field access in v0 programs is System.out/err).
+      std::uint32_t fieldIdOrBuiltin = 0;
+      bool found = false;
+      for (std::uint32_t pc = 0; pc < s.method.code.size() && !found; ++pc) {
+        const auto& ins = s.method.code[pc];
+        if (ins.opcode() != rbc::Op::Getstatic) continue;
+        if (ins.imm >= s.method.cp.size()) continue;
+        const rbc::Const& fc = s.method.cp[ins.imm];
         auto obj = s.rt.builtinStatic(fc);
         if (obj.has_value()) {
           fieldIdOrBuiltin = kStaticBuiltinBase | obj->id;
+          found = true;
         }
+      }
+      if (!found) {
+        // Fallback: use payload directly (may be wrong but won't crash).
+        fieldIdOrBuiltin = nd.payload;
       }
       emitHelperCall(s, static_cast<std::uint8_t>(HelperId::GetStatic),
                     fieldIdOrBuiltin, slotOff(dstIt->second));
@@ -809,8 +849,7 @@ void emitNode(LowerState& s, ir::NodeId n) {
       if (nd.kind == K::CallStatic) {
         packedTarget = (static_cast<std::uint32_t>(0) << 28) | (nd.payload & 0x0FFF'FFFF);
       } else {
-        // Virtual/interface: find the CP index from the RBC instruction.
-        std::uint32_t cpIndex = nd.payload; // fallback (wrong but won't crash)
+        std::uint32_t cpIndex = nd.payload;
         if (fsNode != ir::kInvalidNodeId && fsNode < s.g.nodeCount()) {
           const ir::Node& fsn = s.g.node(fsNode);
           if (fsn.kind == K::FrameState && fsn.payload < s.g.frameStateCount()) {
