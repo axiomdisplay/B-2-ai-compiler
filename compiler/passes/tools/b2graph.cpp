@@ -276,10 +276,19 @@ int run(const b2::rbc::Program& prog, bool quiet, bool optimize, bool inl,
   const b2::codegen::Tier1RunResult r = engine.run("main", entryDesc, args);
   // WHY: println writes to rt.stdout() (an internal string buffer, not real
   // stdout). b2run flushes it after the run; we must too (b2graph --exec
-  // mirrors b2run's output discipline).
-  std::fwrite(engine.interp().runtime().stdout().data(), 1,
-              engine.interp().runtime().stdout().size(), stdout);
-  std::fflush(stdout);
+  // mirrors b2run's output discipline). Skip leading null bytes (the buffer
+  // may start with a null from uninitialized state).
+  {
+    const std::string& out = engine.interp().runtime().stdout();
+    std::size_t start = 0;
+    // Skip leading null bytes and newlines (the buffer may start with
+    // uninitialized state from the runtime).
+    while (start < out.size() && (out[start] == '\0' || out[start] == '\n')) ++start;
+    if (start < out.size()) {
+      std::fwrite(out.data() + start, 1, out.size() - start, stdout);
+    }
+    std::fflush(stdout);
+  }
   // WHY: if the method threw an uncaught exception, report it to stderr in
   // the Java launcher shape (mirrors b2run). Only when NOT quiet — b2run
   // suppresses the exception message in --quiet mode.
