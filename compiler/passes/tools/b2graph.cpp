@@ -280,6 +280,20 @@ int run(const b2::rbc::Program& prog, bool quiet, bool optimize, bool inl,
   std::fwrite(engine.interp().runtime().stdout().data(), 1,
               engine.interp().runtime().stdout().size(), stdout);
   std::fflush(stdout);
+  // WHY: if the method threw an uncaught exception, report it to stderr in
+  // the Java launcher shape (mirrors b2run). Only when NOT quiet — b2run
+  // suppresses the exception message in --quiet mode.
+  if (!quiet && r.status == b2::codegen::Tier1Status::Threw && r.exception.valid()) {
+    std::string cls(engine.interp().runtime().classNameOf(r.exception));
+    for (auto& c : cls) if (c == '/') c = '.';
+    std::string msg(engine.interp().runtime().exceptionMessage(r.exception));
+    if (msg.empty()) {
+      std::fprintf(stderr, "Exception in thread \"main\" %s\n", cls.c_str());
+    } else {
+      std::fprintf(stderr, "Exception in thread \"main\" %s: %s\n",
+                   cls.c_str(), msg.c_str());
+    }
+  }
   if (!quiet) std::fprintf(stderr, "[b2graph --exec] lowered=%u refused=%u status=%d "
                           "t1_entries=%llu helper_calls=%llu deopts=%u/%u/%u t0_fallback=%u\n",
                           lowered, refused, static_cast<int>(r.status),
