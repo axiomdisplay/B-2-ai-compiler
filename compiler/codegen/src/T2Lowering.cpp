@@ -60,6 +60,8 @@ struct LowerState {
   std::uint32_t deoptEpilogue = 0;
   std::uint32_t normalEpilogue = 0;
   std::string refusal;
+  // Lazy cache of CP indices for ldc-string instructions (for ConstantSym).
+  std::vector<std::uint32_t> ldcStringCps;
   // Register allocation: NodeId → register index (0-7). -1 means "in slot".
   // Loop Phi values get registers; everything else stays in slots.
   // Registers: 0=EAX, 1=ECX, 2=EDX, 3=ESI, 4=EDI, 5=R8D, 6=R9D, 7=R10D.
@@ -637,19 +639,35 @@ void emitNode(LowerState& s, ir::NodeId n) {
       break;
     }
     case K::ConstantSym: {
-      // WHY: ConstantSym's payload is a SymbolId. The b2cg_ldc_const helper
-      // takes a CP index. For v0, use the first string CP entry as a fallback.
-      std::uint32_t cpIndex = 0;
-      for (std::uint32_t ci = 0; ci < s.method.cp.size(); ++ci) {
-        if (s.method.cp[ci].kind == rbc::Const::Kind::String) {
-          cpIndex = ci; break;
+      // WHY: ConstantSym's payload is a SymbolId (interned by the resolver,
+      // shared with class names). We can't map it back to a CP index.
+      // Heuristic: scan the RBC for ldc-string instructions, collect their
+      // CP indices in order, and assign them to ConstantSym nodes by node-ID
+      // order. This works because the builder creates ConstantSym nodes in
+      // RBC instruction order.
+      auto dstIt = s.slotOf.find(n);
+      if (dstIt == s.slotOf.end()) break;
+      // Build the ldc-string CP index list (lazy, per-method).
+      if (s.ldcStringCps.empty()) {
+        for (std::uint32_t pc = 0; pc < s.method.code.size(); ++pc) {
+          if (s.method.code[pc].opcode() == rbc::Op::Ldc &&
+              s.method.code[pc].imm < s.method.cp.size() &&
+              s.method.cp[s.method.code[pc].imm].kind == rbc::Const::Kind::String) {
+            s.ldcStringCps.push_back(s.method.code[pc].imm);
+          }
         }
       }
-      auto dstIt = s.slotOf.find(n);
-      if (dstIt != s.slotOf.end()) {
-        emitHelperCall(s, static_cast<std::uint8_t>(HelperId::LdcConst),
-                      cpIndex, slotOff(dstIt->second));
+      // Count how many live ConstantSym nodes appear before this one.
+      std::uint32_t symIdx = 0;
+      for (ir::NodeId i = 0; i < n; ++i) {
+        if (!s.g.node(i).isDead() && s.g.node(i).kind == K::ConstantSym) ++symIdx;
       }
+      std::uint32_t cpIndex = 0;
+      if (symIdx < s.ldcStringCps.size()) {
+        cpIndex = s.ldcStringCps[symIdx];
+      }
+      emitHelperCall(s, static_cast<std::uint8_t>(HelperId::LdcConst),
+                    cpIndex, slotOff(dstIt->second));
       break;
     }
     case K::Parameter: case K::Undef: break;
