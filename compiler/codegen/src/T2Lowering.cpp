@@ -436,6 +436,14 @@ std::vector<Block> buildBlocks(LowerState& s) {
       }
     }
   }
+  // WHY: ConstantSym emits a helper CALL (side effect), not a pure data
+  // computation. It must be in block 0 (entry) so it runs before any use.
+  // Force it here, before the use-site fixpoint assigns it to a later block.
+  for (ir::NodeId n = 0; n < g.nodeCount(); ++n) {
+    const ir::Node& nd = g.node(n);
+    if (nd.isDead()) continue;
+    if (nd.kind == K::ConstantSym) nodeBlock[n] = 0;
+  }
   // Pure data nodes: fixpoint — assign to the block of their first user.
   // Iterate until stable.
   bool changed = true;
