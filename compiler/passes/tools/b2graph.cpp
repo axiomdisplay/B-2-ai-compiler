@@ -281,9 +281,11 @@ int run(const b2::rbc::Program& prog, bool quiet, bool optimize, bool inl,
   {
     const std::string& out = engine.interp().runtime().stdout();
     std::size_t start = 0;
-    // Skip leading null bytes and newlines (the buffer may start with
-    // uninitialized state from the runtime).
-    while (start < out.size() && (out[start] == '\0' || out[start] == '\n')) ++start;
+    // Skip leading null bytes (the buffer may start with a null from
+    // uninitialized state). Also skip ONE leading newline if present
+    // (the null byte becomes \n after the buffer is used).
+    while (start < out.size() && out[start] == '\0') ++start;
+    if (start < out.size() && out[start] == '\n') ++start;
     if (start < out.size()) {
       std::fwrite(out.data() + start, 1, out.size() - start, stdout);
     }

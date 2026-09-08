@@ -923,8 +923,27 @@ void emitNode(LowerState& s, ir::NodeId n) {
           const ir::Node& fsn = s.g.node(fsNode);
           if (fsn.kind == K::FrameState && fsn.payload < s.g.frameStateCount()) {
             std::uint32_t rbcPc = s.g.frameState(fsn.payload).pc;
-            if (rbcPc < s.method.code.size()) {
-              cpIndex = s.method.code[rbcPc].imm;
+            // WHY: the FrameState's pc is the pc of the instruction that
+            // creates the snapshot (e.g. getstatic), NOT the call's pc.
+            // Scan forward from rbcPc to find the invokevirtual/
+            // invokeinterface instruction and use its CP index.
+            for (std::uint32_t pc = rbcPc; pc < s.method.code.size(); ++pc) {
+              rbc::Op op = s.method.code[pc].opcode();
+              if (op == rbc::Op::Invokevirtual ||
+                  op == rbc::Op::Invokeinterface ||
+                  op == rbc::Op::InvokevirtualQuick ||
+                  op == rbc::Op::InvokeinterfaceQuick) {
+                cpIndex = s.method.code[pc].imm;
+                break;
+              }
+              // Don't scan past a return/branch — the call must be between
+              // the FrameState pc and the next control-flow instruction.
+              if (op == rbc::Op::Return || op == rbc::Op::Goto ||
+                  op == rbc::Op::IfIcmpeq || op == rbc::Op::IfIcmpne ||
+                  op == rbc::Op::IfAcmpeq || op == rbc::Op::IfAcmpne ||
+                  op == rbc::Op::Ifle || op == rbc::Op::Iflt ||
+                  op == rbc::Op::Ifgt || op == rbc::Op::Ifge ||
+                  op == rbc::Op::Ifeq || op == rbc::Op::Ifne) break;
             }
           }
         }
