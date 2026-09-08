@@ -457,6 +457,19 @@ std::vector<Block> buildBlocks(LowerState& s) {
       if (nodeBlock[n] != UINT32_MAX) continue;  // already assigned
       if (isBlockLeader(nd.kind)) continue;
       if (nd.kind == K::Phi) continue;
+      // WHY: only skip nodes whose ctrl input is a NON-LEADER fixed node
+      // (these are handled by the ctrl chain fixpoint). Nodes whose ctrl
+      // input IS a block leader (e.g. CallStatic[ctrl=Start]) are already
+      // assigned and don't reach here. Nodes whose ctrl input is a fixed
+      // node in block 0 (e.g. LoadStatic[ctrl=ClassInit]) should NOT be
+      // assigned by the use-site fixpoint — the ctrl chain fixpoint handles
+      // them.
+      if (hasCtrlInput(nd.kind) && nd.numInputs >= 1) {
+        ir::NodeId c = g.input(n, 0);
+        if (c < g.nodeCount() && !g.node(c).isDead() &&
+            !isBlockLeader(g.node(c).kind) &&
+            nodeBlock[c] == 0) continue;
+      }
       // Find the earliest-block user.
       std::uint32_t bestBlock = UINT32_MAX;
       for (ir::NodeId u = 0; u < g.nodeCount(); ++u) {
@@ -509,6 +522,36 @@ std::vector<Block> buildBlocks(LowerState& s) {
       }
     }
   }
+  // Fixed-node chains: propagate block assignment through ctrl chains.
+  // WHY: only propagate to block 0 (entry). This avoids changing loop-body
+  // assignments (which would break the successor scan). For strings_intern,
+  // LoadStatic[ctrl=ClassInit] where ClassInit is in block 0 → LoadStatic
+  // gets block 0. Then Guard[ctrl=LoadStatic] → block 0. Then CallVirtual
+  // [ctrl=Guard] → block 0. This puts the entire chain in the entry block
+  // where it's reached before any branch.
+  {
+    bool fchanged = true;
+    int fiters = 0;
+    while (fchanged && fiters < 20) {
+      fchanged = false; ++fiters;
+      for (ir::NodeId n = 0; n < g.nodeCount(); ++n) {
+        if (n >= g.nodeCount()) break;
+        const ir::Node& nd = g.node(n);
+        if (nd.isDead() || isBlockLeader(nd.kind)) continue;
+        if (nodeBlock[n] != UINT32_MAX) continue;
+        if (nd.kind == K::Phi) continue;
+        if (!hasCtrlInput(nd.kind)) continue;
+        if (nd.numInputs >= 1) {
+          ir::NodeId c = g.input(n, 0);
+          if (c < g.nodeCount() && !g.node(c).isDead() &&
+              nodeBlock[c] == 0) {  // ONLY propagate from block 0
+            nodeBlock[n] = 0;
+            fchanged = true;
+          }
+        }
+      }
+    }
+  }
   // Any unassigned pure data nodes → entry block (block 0, the Start).
   for (ir::NodeId n = 0; n < g.nodeCount(); ++n) {
     if (n >= g.nodeCount()) break;
@@ -525,8 +568,8 @@ std::vector<Block> buildBlocks(LowerState& s) {
     if (isBlockLeader(nd.kind)) continue;  // leader is already the block
     if (nd.kind == K::Phi) {
       blocks[b].fixedNodes.push_back(n);  // phis emitted at block top
-    } else if (nd.numInputs >= 1 && isBlockLeader(g.node(g.input(n, 0)).kind)) {
-      blocks[b].fixedNodes.push_back(n);  // ctrl-dependent
+    } else if (hasCtrlInput(nd.kind)) {
+      blocks[b].fixedNodes.push_back(n);  // ctrl-dependent (incl. chains)
     } else {
       blocks[b].dataNodes.push_back(n);   // pure data
     }
@@ -1013,6 +1056,7 @@ bool lowerGraph(LowerState& s) {
           bool found = false;
           for (auto& blk : blocks) {
             for (ir::NodeId fn : blk.fixedNodes) if (fn == n) { found = true; break; }
+            if (!found) for (ir::NodeId dn : blk.dataNodes) if (dn == n) { found = true; break; }
             if (found) break;
           }
           if (!found) unassigned.push_back(n);
@@ -1033,8 +1077,15 @@ bool lowerGraph(LowerState& s) {
       emitPhiMovesForPred(s, leader, 0);
     }
     s.labelOf[leader] = s.em.offset();
-    for (ir::NodeId n : blk.dataNodes) emitNode(s, n);
-    for (ir::NodeId n : blk.fixedNodes) emitNode(s, n);
+    // WHY: merge data+fixed and emit in NODE-ID order. The builder creates
+    // nodes in topological order (inputs before users), so node-ID order
+    // ensures data nodes are emitted after their fixed-node dependencies.
+    {
+      std::vector<ir::NodeId> allNodes = blk.dataNodes;
+      for (ir::NodeId fn : blk.fixedNodes) allNodes.push_back(fn);
+      std::sort(allNodes.begin(), allNodes.end());
+      for (ir::NodeId n : allNodes) emitNode(s, n);
+    }
     emitTerminator(s, leader);
     // Fall-through JMP: if this block has exactly one successor and it's not
     // the next block in emission order, emit a JMP to it. This handles
