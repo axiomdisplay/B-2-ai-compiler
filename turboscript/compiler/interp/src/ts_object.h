@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <deque>
 #include <functional>
+#include <map>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -96,12 +97,48 @@ struct Closure {
 };
 
 // ---------------------------------------------------------------------------
-// Object — shape-based property storage + prototype.
+// Elements kinds (v0.2 arrays). Order is load-bearing: packed->holey is
+// `kind | 1`; smi->double is `+2` from the smi kinds; ->tagged is `+2` from
+// the double kinds and `+4` from the smi kinds (widenFor in
+// ts_interpreter.cpp asserts this layout).
+// ---------------------------------------------------------------------------
+enum class ElementsKind : uint8_t {
+  PackedSmi = 0,
+  HoleySmi = 1,
+  PackedDouble = 2,
+  HoleyDouble = 3,
+  PackedTagged = 4,
+  HoleyTagged = 5,
+};
+
+[[nodiscard]] constexpr ElementsKind holeyOf(ElementsKind k) {
+  return static_cast<ElementsKind>(static_cast<uint8_t>(k) | 1);
+}
+
+// ---------------------------------------------------------------------------
+// Object — shape-based property storage + prototype. v0.2: an Object may be
+// an exotic Array (isArray): then `length` is the array-length property
+// (writable, non-enumerable, non-configurable) and `elements`/`sparse` hold
+// indexed storage per `elementsKind`. Non-array objects leave these unused.
+// Design note (interp_contract.md 3): Tier 0 keeps ONE tagged element
+// backend; kinds are enforced as invariants on every store and transitioned
+// eagerly (smi -> double -> tagged, packed -> holey). Unboxed backends are a
+// stencil-layer (Tier 1) concern, not a semantic one.
 // ---------------------------------------------------------------------------
 struct Object {
   Shape* shape = nullptr;       // root shape => empty instance
   Value proto = Value::null();  // object value (Object or Closure) or Null
   std::vector<Value> slots;     // size == shape->slotCount (Hole = deleted)
+
+  // --- Array state (meaningful iff isArray) ---
+  bool isArray = false;
+  ElementsKind elementsKind = ElementsKind::PackedSmi;
+  uint32_t length = 0;  // exotic "length" property value
+  // Dense element storage; indices >= kMaxDenseElements live in `sparse`.
+  // Hole values are real holes (prototype-chain lookups); size <=
+  // kMaxDenseElements. Growth via length writes does NOT allocate here.
+  std::vector<Value> elements;
+  std::map<uint32_t, Value> sparse;  // ordered: deterministic (Rule 124)
 
   // Own-slot lookup along the shape parent chain; -1 when absent.
   [[nodiscard]] int32_t findOwnSlot(SymbolId key) const;
@@ -205,7 +242,16 @@ struct LookupResult {
   Object* holder = nullptr;
 };
 
-// Find `key` starting at `start`, walking the prototype chain.
+// Find `key` starting at `start`, walking the prototype chain (named
+// properties only; array elements/length are handled by the Isolate).
 [[nodiscard]] LookupResult lookupProperty(Object* start, SymbolId key);
+
+// Own-property lookup on a single object (named properties only; no chain
+// walk, no array exotic behavior).
+[[nodiscard]] LookupResult lookupOwnProperty(Object* obj, SymbolId key);
+
+// Canonical array-index test (ECMA-262: canonical numeric strings, values
+// 0..2^32-2; "00" and "4294967295" are NOT array indices).
+[[nodiscard]] bool arrayIndexFromKey(std::u16string_view key, uint32_t* out);
 
 }  // namespace ts

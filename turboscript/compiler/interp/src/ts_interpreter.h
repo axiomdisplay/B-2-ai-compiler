@@ -107,6 +107,19 @@ class Isolate {
   [[nodiscard]] JsResult<bool> hasPropertyImpl(const Value& recv,
                                                SymbolId key);
 
+  // ---- Array operations (v0.2: bytecode_spec.md Section 5.12). ----
+  // Exotic "length" as a Number (Smi when it fits, HeapNumber above 2^31-1).
+  [[nodiscard]] Value arrayLengthValue(const Object* arr) const;
+  // ArraySetLength: ToUint32/ToNumber equality check (RangeError otherwise),
+  // shrink hole-ifies dense slots and drops sparse entries >= new length.
+  [[nodiscard]] JsResult<bool> arraySetLength(Object* arr,
+                                              const Value& newLen);
+  [[nodiscard]] JsResult<bool> setArrayElement(Object* arr, uint32_t idx,
+                                               const Value& val);
+  // Intern the canonical decimal key text of an element index (Rule 16).
+  [[nodiscard]] SymbolId internIndexKey(uint32_t idx);
+  [[nodiscard]] SymbolId lengthSymbol() const { return sym_length_; }
+
   // ---- Call machinery. ----
   [[nodiscard]] JsResult<Value> callValue(const Value& callee, Value thisVal,
                                           const Value* args, uint32_t argc);
@@ -180,7 +193,25 @@ class Isolate {
   [[nodiscard]] JsException makeError(const char* name,
                                       const std::string& message);
 
+  // Array element helpers (ts_interpreter.cpp).
+  [[nodiscard]] bool arrayHasOwnElement(const Object* arr, uint32_t idx) const;
+  // Own element value or Hole when absent (never walks the chain).
+  [[nodiscard]] Value ownElementValue(const Object* arr, uint32_t idx) const;
+  // Raise the storage kind so `val` satisfies the kind invariant; creates no
+  // holes (widenFor layout contract in ts_object.h).
+  void widenElementsFor(Object* arr, const Value& val) const;
+  [[nodiscard]] JsResult<Value> getAlongChain(Object* start,
+                                              const Value& recv,
+                                              SymbolId key, bool isIndex,
+                                              uint32_t idx);
+  [[nodiscard]] JsResult<bool> setAlongChain(Object* start,
+                                             const Value& recv, SymbolId key,
+                                             const Value& val);
+  [[nodiscard]] bool hasAlongChain(Object* start, SymbolId key, bool isIndex,
+                                   uint32_t idx);
+
   void recordPropertySite(uint32_t slot, const Value& recv);
+  void recordElementSite(uint32_t slot, const Value& recv);
   void recordBinarySite(uint32_t slot, const Value& l, const Value& r);
   void recordBranchSite(uint32_t slot, bool taken);
   void recordCallSite(uint32_t slot, const Value& callee);
@@ -203,6 +234,7 @@ class Isolate {
   SymbolId sym_message_ = kInvalidSymbol;
   SymbolId sym_valueOf_ = kInvalidSymbol;
   SymbolId sym_toString_ = kInvalidSymbol;
+  SymbolId sym_length_ = kInvalidSymbol;
 
   const Module* module_ = nullptr;
   std::vector<Value> constants_;  // materialized

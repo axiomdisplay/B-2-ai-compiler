@@ -700,6 +700,7 @@ TsResult<bool> Assembler::encodeFunction(FunctionSource& src) {
       case Opcode::kLoadTrue:
       case Opcode::kLoadFalse:
       case Opcode::kNewObject:
+      case Opcode::kNewArray:
       case Opcode::kGetContext:
       case Opcode::kReturn:
       case Opcode::kThrow: {
@@ -801,6 +802,7 @@ TsResult<bool> Assembler::encodeFunction(FunctionSource& src) {
         break;
       }
       case Opcode::kGetProperty:
+      case Opcode::kGetElement:
       case Opcode::kDeleteProperty:
       case Opcode::kHasProperty:
       case Opcode::kSetPrototype:
@@ -819,7 +821,8 @@ TsResult<bool> Assembler::encodeFunction(FunctionSource& src) {
         encodedFnCode_.push_back(w2(*b, 0, 0));
         break;
       }
-      case Opcode::kSetProperty: {
+      case Opcode::kSetProperty:
+      case Opcode::kSetElement: {
         TsResult<bool> ok = need(3);
         if (!ok) return std::unexpected(ok.error());
         TsResult<uint32_t> o = reg(0);

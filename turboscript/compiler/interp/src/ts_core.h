@@ -30,6 +30,8 @@ constexpr uint32_t kMaxStringCodeUnits = 1u << 26;  // 64M UTF-16 units.
 constexpr uint32_t kMaxBigIntBits = 1u << 20;    // 1Mbit BigInt magnitude.
 constexpr uint32_t kMaxModuleCodeWords = 1u << 26;
 constexpr uint32_t kMaxHandlerTable = 1u << 16;
+constexpr uint32_t kMaxArrayLength = 0xFFFFFFFFu;  // 2^32-1 (excluded as index)
+constexpr uint32_t kMaxDenseElements = 1u << 20;   // beyond this: sparse map
 constexpr uint32_t kMegamorphicThreshold = 4;    // >4 distinct shapes => mega.
 constexpr uint32_t kCallProfileRing = 4;
 constexpr int32_t  kSmiMin = INT32_MIN;

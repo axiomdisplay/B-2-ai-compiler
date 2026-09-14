@@ -1,0 +1,50 @@
+; V0.2 arrays: 2^32 boundaries.
+;  * 4294967295 (2^32-1) is NOT an array index (ECMA-262): the store becomes
+;    a NAMED property and length stays 0.
+;  * 4294967294 (2^32-2) IS the last array index: storing it uses the sparse
+;    element map (no 4G-slot allocation) and raises length to 4294967295,
+;    which reads back as a HeapNumber-formatted "4294967295".
+.module arrays
+.global @print
+.const @KLEN = "length"
+.const @KMAX = 4294967295
+.const @KMAXM1 = 4294967294
+.entry @main
+
+.function @main 0 12
+  LoadGlobal r9, @print
+
+  NewArray r1
+  LoadConst r2, @KMAX
+  LoadConstS r3, 1
+  SetElement r1, r2, r3         ; arr[4294967295] = 1 -> NAMED property
+
+  LoadConst r2, @KLEN
+  GetProperty r4, r1, r2
+  Call r9, r4, 1, r0            ; 0 (not an index: length untouched)
+
+  LoadConst r2, @KMAX
+  HasProperty r4, r1, r2
+  Call r9, r4, 1, r0            ; true (own named property)
+
+  LoadConst r2, @KMAXM1
+  SetElement r1, r2, r3         ; arr[4294967294] = 1 -> sparse element
+
+  LoadConst r2, @KLEN
+  GetProperty r4, r1, r2
+  Call r9, r4, 1, r0            ; 4294967295 (length = 2^32-2 + 1)
+
+  LoadConst r2, @KMAXM1
+  GetElement r4, r1, r2
+  Call r9, r4, 1, r0            ; 1
+
+  LoadConst r2, @KMAXM1
+  HasProperty r4, r1, r2
+  Call r9, r4, 1, r0            ; true
+
+  LoadConst r2, @KMAX
+  GetElement r4, r1, r2
+  Call r9, r4, 1, r0            ; 1 (the named property is still readable)
+
+  Return r0
+.end

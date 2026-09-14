@@ -466,6 +466,46 @@ L_NewObject : {
   pc += 1;
   TS_DISPATCH();
 }
+L_NewArray : {
+  TS_FIELDS();
+  {
+    // v0.2 array: length 0, PackedSmi, no elements, proto null
+    // (Array.prototype is a builtin-layer feature, bytecode_spec 11).
+    Object* arr = heap_.makeObject();
+    arr->isArray = true;
+    regs[a_] = Value::raw(ValueKind::Object, arr);
+  }
+  pc += 1;
+  TS_DISPATCH();
+}
+L_GetElement : {
+  TS_FIELDS();
+  {
+    // W2_RR_D layout: a_=dst, b_=receiver, c_=key. Semantics are exactly
+    // GetProperty's (ToPropertyKey routing inside); only the feedback
+    // class differs (Element-kind sites, bytecode_spec Section 8).
+    Value recv = regs[b_];
+    SymbolId keySym;
+    TS_GET(toPropertyKey(regs[c_]), keySym);
+    if (fb != nullptr) recordElementSite(fn->slotOfPc[pc], recv);
+    TS_GET(getProperty(recv, keySym), regs[a_]);
+  }
+  pc += 2;
+  TS_DISPATCH();
+}
+L_SetElement : {
+  TS_FIELDS();
+  {
+    // W2_RR_V layout: a_=obj, b_=key, c_=val.
+    Value recv = regs[a_];
+    SymbolId keySym;
+    TS_GET(toPropertyKey(regs[b_]), keySym);
+    if (fb != nullptr) recordElementSite(fn->slotOfPc[pc], recv);
+    TS_TAKE(setProperty(recv, keySym, regs[c_]));
+  }
+  pc += 2;
+  TS_DISPATCH();
+}
 L_GetContext : {
   TS_FIELDS();
   {

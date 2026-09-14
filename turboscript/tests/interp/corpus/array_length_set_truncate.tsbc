@@ -1,0 +1,66 @@
+; V0.2 arrays: exotic length SETTER. Shrinking truncates (hole-ifies dense
+; slots >= new length, drops sparse >= new length); growing just raises the
+; length without allocating. Shrink hole-ifies -> packed becomes holey.
+.module arrays
+.global @print
+.const @KLEN = "length"
+.const @K2 = "2"
+.const @K3 = "3"
+.const @K5 = "5"
+.entry @main
+
+.function @main 0 10
+  LoadGlobal r8, @print
+
+  NewArray r1
+  LoadConstS r2, 10
+  LoadConstS r3, 0
+  SetElement r1, r3, r2
+  LoadConstS r2, 11
+  LoadConstS r3, 1
+  SetElement r1, r3, r2
+  LoadConstS r2, 12
+  LoadConstS r3, 2
+  SetElement r1, r3, r2
+  LoadConstS r2, 13
+  LoadConstS r3, 3
+  SetElement r1, r3, r2
+  LoadConstS r2, 14
+  LoadConstS r3, 4
+  SetElement r1, r3, r2         ; arr = [10,11,12,13,14], length 5
+
+  LoadConstS r2, 2
+  LoadConst r3, @KLEN
+  SetProperty r1, r3, r2        ; arr.length = 2 (shrink + truncate)
+
+  LoadConstS r3, 0
+  GetElement r4, r1, r3
+  Call r8, r4, 1, r0            ; 10
+  LoadConstS r3, 1
+  GetElement r4, r1, r3
+  Call r8, r4, 1, r0            ; 11
+  LoadConstS r3, 2
+  GetElement r4, r1, r3
+  Call r8, r4, 1, r0            ; undefined (truncated)
+  LoadConst r3, @K3
+  HasProperty r4, r1, r3
+  Call r8, r4, 1, r0            ; false
+  LoadConst r3, @KLEN
+  GetProperty r4, r1, r3
+  Call r8, r4, 1, r0            ; 2
+
+  LoadConstS r2, 6
+  SetProperty r1, r3, r2        ; arr.length = 6 (grow, no allocation)
+
+  LoadConst r3, @K5
+  HasProperty r4, r1, r3
+  Call r8, r4, 1, r0            ; false (length grow does not create own)
+  LoadConstS r3, 5
+  GetElement r4, r1, r3
+  Call r8, r4, 1, r0            ; undefined
+  LoadConst r3, @KLEN
+  GetProperty r4, r1, r3
+  Call r8, r4, 1, r0            ; 6
+
+  Return r0
+.end

@@ -73,6 +73,7 @@ Isolate::Isolate() : shapes_(heap_) {
   sym_message_ = symbols_.intern(u"message");
   sym_valueOf_ = symbols_.intern(u"valueOf");
   sym_toString_ = symbols_.intern(u"toString");
+  sym_length_ = symbols_.intern(u"length");
   opcodeCounts_.assign(kOpcodeSpace, 0);
 }
 
@@ -134,6 +135,12 @@ TsResult<bool> Isolate::loadModule(const Module& module,
   feedback_.assign(module.functions.size(), {});
   for (const auto& fn : module.functions) {
     feedback_[fn->index].resize(fn->feedbackLayout.size());
+    // Slot kinds come from the verifier-computed layout (Section 8); without
+    // this, --dump-feedback mislabels every slot and prints the wrong
+    // per-kind counters (fixed in v0.2; Rule 150).
+    for (size_t i = 0; i < fn->feedbackLayout.size(); i++) {
+      feedback_[fn->index][i].kind = fn->feedbackLayout[i];
+    }
   }
   return true;
 }
@@ -264,15 +271,216 @@ JsException Isolate::syntaxError(const std::string& m) {
 }
 
 // ---------------------------------------------------------------------------
-// Property operations
+// Property operations. v0.2: array-aware. Exotic behavior (elements, length)
+// is consulted at EVERY node of the prototype chain (an array can inherit
+// from an object and vice versa), while named properties use the ordinary
+// shape machinery. One semantic source feeds GetProperty/GetProperty-keyed
+// opcodes alike (Rule 96).
 // ---------------------------------------------------------------------------
 Object* Isolate::protoOfObject(Object* obj) const {
   return obj->proto.isObjectLike() ? objectOfValue(obj->proto) : nullptr;
 }
 
+bool Isolate::arrayHasOwnElement(const Object* arr, uint32_t idx) const {
+  if (idx < arr->elements.size()) return !arr->elements[idx].isHole();
+  return arr->sparse.find(idx) != arr->sparse.end();
+}
+
+Value Isolate::ownElementValue(const Object* arr, uint32_t idx) const {
+  if (idx < arr->elements.size()) {
+    Value v = arr->elements[idx];
+    if (!v.isHole()) return v;
+    return Value::hole();  // dense hole: present-in-range but empty
+  }
+  auto it = arr->sparse.find(idx);
+  if (it != arr->sparse.end()) return it->second;
+  return Value::hole();
+}
+
+void Isolate::widenElementsFor(Object* arr, const Value& val) const {
+  const ElementsKind k = arr->elementsKind;
+  ElementsKind target = k;
+  switch (k) {
+    case ElementsKind::PackedSmi:
+    case ElementsKind::HoleySmi:
+      if (!val.isSmi()) {
+        target = val.isNumber() ? static_cast<ElementsKind>(static_cast<uint8_t>(k) + 2)
+                                : static_cast<ElementsKind>(static_cast<uint8_t>(k) + 4);
+      }
+      break;
+    case ElementsKind::PackedDouble:
+    case ElementsKind::HoleyDouble:
+      if (!val.isNumber()) {
+        target = static_cast<ElementsKind>(static_cast<uint8_t>(k) + 2);
+      }
+      break;
+    case ElementsKind::PackedTagged:
+    case ElementsKind::HoleyTagged:
+      break;
+  }
+  arr->elementsKind = target;
+}
+
+Value Isolate::arrayLengthValue(const Object* arr) const {
+  if (arr->length <= static_cast<uint32_t>(kSmiMax)) {
+    return Value::smi(static_cast<int32_t>(arr->length));
+  }
+  return Value::heapNumber(static_cast<double>(arr->length));
+}
+
+SymbolId Isolate::internIndexKey(uint32_t idx) {
+  char buf[16];
+  int n = std::snprintf(buf, sizeof buf, "%u", idx);
+  std::u16string text(buf, buf + n);
+  return symbols_.intern(text);
+}
+
+JsResult<bool> Isolate::arraySetLength(Object* arr, const Value& newLen) {
+  // ArraySetLength (ECMA-262): ToUint32(newLen) must equal ToNumber(newLen).
+  JsResult<Value> numR = toNumberValue(newLen);  // may run user hooks
+  if (!numR) return std::unexpected(numR.error());
+  double lenNum = numR->asDouble();
+  uint32_t uintLen = pure::toUint32(lenNum);
+  if (static_cast<double>(uintLen) != lenNum) {
+    // Strict-mode receiver semantics (v0.1+): throw, never return false.
+    return std::unexpected(rangeError(
+        "Invalid array length (expected: ToUint32(length) == ToNumber(length), "
+        "got " + pure::doubleToString(lenNum) + ")"));
+  }
+  if (uintLen >= arr->length) {
+    arr->length = uintLen;  // growth: holes are implied, no storage change
+    return true;
+  }
+  // Shrink: hole-ify dense slots in [newLen, oldDenseEnd), drop sparse >=.
+  bool madeHole = false;
+  for (size_t i = arr->elements.size(); i-- > uintLen;) {
+    if (!arr->elements[i].isHole()) {
+      arr->elements[i] = Value::hole();
+      madeHole = true;
+    }
+  }
+  for (auto it = arr->sparse.begin(); it != arr->sparse.end();) {
+    if (it->first >= uintLen) {
+      it = arr->sparse.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  if (madeHole) {
+    arr->elementsKind = holeyOf(arr->elementsKind);
+  }
+  arr->length = uintLen;
+  return true;
+}
+
+JsResult<bool> Isolate::setArrayElement(Object* arr, uint32_t idx,
+                                        const Value& val) {
+  // Array length is writable in v0.2 (no freeze/ seal opcodes exist yet),
+  // so every element store succeeds and then updates length (ECMA-262:
+  // "if idx >= length, set length to idx+1" — uint32-safe: idx <= 2^32-2).
+  if (idx < arr->elements.size()) {
+    widenElementsFor(arr, val);
+    arr->elements[idx] = val;
+    if (arr->length <= idx) arr->length = idx + 1;
+    return true;
+  }
+  if (idx < kMaxDenseElements) {
+    size_t oldSize = arr->elements.size();
+    if (idx >= oldSize) {
+      arr->elements.resize(static_cast<size_t>(idx) + 1, Value::hole());
+      arr->elementsKind = holeyOf(arr->elementsKind);  // gap slots are holes
+    }
+    widenElementsFor(arr, val);
+    arr->elements[idx] = val;
+    if (arr->length <= idx) arr->length = idx + 1;
+    return true;
+  }
+  // Sparse territory: no dense allocation (a store at 2^32-2 must not
+  // reserve 4G slots); values are tagged here.
+  arr->sparse[idx] = val;
+  arr->elementsKind = ElementsKind::HoleyTagged;
+  if (arr->length <= idx) arr->length = idx + 1;
+  return true;
+}
+
+JsResult<Value> Isolate::getAlongChain(Object* start, const Value& recv,
+                                       SymbolId key, bool isIndex,
+                                       uint32_t idx) {
+  for (Object* cur = start; cur != nullptr; cur = protoOfObject(cur)) {
+    if (cur->isArray && isIndex) {
+      Value v = ownElementValue(cur, idx);
+      if (!v.isHole()) return v;
+      continue;  // hole/absent on this array node: keep walking
+    }
+    if (cur->isArray && key == sym_length_) {
+      return arrayLengthValue(cur);
+    }
+    LookupResult own = lookupOwnProperty(cur, key);
+    if (!own.found) continue;
+    if (own.accessor != nullptr) {
+      if (own.accessor->getter.isUndefined()) return Value::undefined();
+      return callValue(own.accessor->getter, recv, nullptr, 0);
+    }
+    return *own.dataSlot;
+  }
+  return Value::undefined();
+}
+
+JsResult<bool> Isolate::setAlongChain(Object* start, const Value& recv,
+                                      SymbolId key, const Value& val) {
+  for (Object* cur = start; cur != nullptr; cur = protoOfObject(cur)) {
+    LookupResult own = lookupOwnProperty(cur, key);
+    if (!own.found) continue;
+    if (own.accessor != nullptr) {
+      if (own.accessor->setter.isUndefined()) {
+        return std::unexpected(typeError(
+            "Cannot set property '" + utf16ToUtf8(symbols_.text(key)) +
+            "': no setter"));
+      }
+      // Setter invoked with the ORIGINAL receiver as `this`.
+      JsResult<Value> r = callValue(own.accessor->setter, recv, &val, 1);
+      if (!r) return std::unexpected(r.error());
+      return true;
+    }
+    // Data property found on the chain: v0.2 data attrs are always writable,
+    // so the write succeeds (own) or shadows (inherited,
+    // OrdinarySetWithOwnDescriptor).
+    if (cur == start) {
+      *own.dataSlot = val;
+    } else {
+      return defineProperty(start, key, val, kDefaultDataAttrs);
+    }
+    return true;
+  }
+  // Nothing on the chain: define a fresh own property. Arrays route exotic
+  // keys through the element/length machinery before ever reaching here.
+  return defineProperty(start, key, val, kDefaultDataAttrs);
+}
+
+bool Isolate::hasAlongChain(Object* start, SymbolId key, bool isIndex,
+                            uint32_t idx) {
+  for (Object* cur = start; cur != nullptr; cur = protoOfObject(cur)) {
+    if (cur->isArray) {
+      if (isIndex && arrayHasOwnElement(cur, idx)) return true;
+      if (key == sym_length_) return true;  // own exotic length
+    }
+    if (lookupOwnProperty(cur, key).found) return true;
+  }
+  return false;
+}
+
 JsResult<bool> Isolate::defineProperty(Object* obj, SymbolId key,
                                        const Value& val,
                                        PropertyAttrs attrs) {
+  // Defensive routing: arrays never define "length" or index keys as plain
+  // named properties (they are exotic). Ordinary receivers are unaffected.
+  if (obj->isArray) {
+    uint32_t idx = 0;
+    if (key == sym_length_) return arraySetLength(obj, val);
+    if (arrayIndexFromKey(symbols_.text(key), &idx)) {
+      return setArrayElement(obj, idx, val);
+    }
+  }
   // Fresh objects carry shape == nullptr; the root shape is the implicit
   // origin of every transition chain (interp_contract.md 3).
   Shape* from = obj->shape != nullptr ? obj->shape : shapes_.root();
@@ -283,17 +491,14 @@ JsResult<bool> Isolate::defineProperty(Object* obj, SymbolId key,
 
 JsResult<Value> Isolate::getProperty(const Value& recv, SymbolId key) {
   if (!recv.isObjectLike()) {
-    // v0.1: no primitive wrappers (bytecode_spec.md Section 11).
+    // v0.2: no primitive wrappers (bytecode_spec.md Section 11).
     return Value::undefined();
   }
   Object* obj = objectOfValue(recv);
-  LookupResult lr = lookupProperty(obj, key);
-  if (!lr.found) return Value::undefined();
-  if (lr.accessor != nullptr) {
-    if (lr.accessor->getter.isUndefined()) return Value::undefined();
-    return callValue(lr.accessor->getter, recv, nullptr, 0);
-  }
-  return *lr.dataSlot;
+  uint32_t idx = 0;
+  const bool isIndex =
+      arrayIndexFromKey(symbols_.text(key), &idx);
+  return getAlongChain(obj, recv, key, isIndex, idx);
 }
 
 JsResult<bool> Isolate::setProperty(const Value& recv, SymbolId key,
@@ -305,50 +510,56 @@ JsResult<bool> Isolate::setProperty(const Value& recv, SymbolId key,
         "' on " + pure::kindName(recv)));
   }
   Object* obj = objectOfValue(recv);
-  LookupResult lr = lookupProperty(obj, key);
-  if (lr.found) {
-    if (lr.accessor != nullptr) {
-      if (lr.accessor->setter.isUndefined()) {
-        return std::unexpected(typeError(
-            "Cannot set property '" + utf16ToUtf8(symbols_.text(key)) +
-            "': no setter"));
-      }
-      // Setter invoked with the ORIGINAL receiver as `this`.
-      JsResult<Value> r = callValue(lr.accessor->setter, recv, &val, 1);
-      if (!r) return std::unexpected(r.error());
-      return true;
+  // Exotic array keys are handled BEFORE any chain walk (the array's own
+  // length/elements are not shape slots).
+  if (obj->isArray) {
+    if (key == sym_length_) return arraySetLength(obj, val);
+    uint32_t idx = 0;
+    if (arrayIndexFromKey(symbols_.text(key), &idx)) {
+      return setArrayElement(obj, idx, val);
     }
-    // Own or inherited data property: v0.1 data attrs are always writable,
-    // so the write succeeds (inherited data writes shadow on the receiver
-    // per OrdinarySetWithOwnDescriptor).
-    if (lr.holder == obj) {
-      *lr.dataSlot = val;
-      return true;
-    }
-    // Inherited data property: create own shadow property on the receiver.
-    return defineProperty(obj, key, val, kDefaultDataAttrs);
   }
-  return defineProperty(obj, key, val, kDefaultDataAttrs);
+  return setAlongChain(obj, recv, key, val);
 }
 
 JsResult<bool> Isolate::deletePropertyImpl(const Value& recv, SymbolId key) {
   if (!recv.isObjectLike()) return true;  // ToObject(prim) has no such own.
   Object* obj = objectOfValue(recv);
+  // Array exotic behavior: "length" is non-configurable (delete -> false);
+  // element deletion hole-ifies the slot (packed -> holey) and never
+  // changes length.
+  if (obj->isArray) {
+    if (key == sym_length_) return false;
+    uint32_t idx = 0;
+    if (arrayIndexFromKey(symbols_.text(key), &idx)) {
+      if (idx < obj->elements.size()) {
+        if (obj->elements[idx].isHole()) return true;
+        obj->elements[idx] = Value::hole();
+        obj->elementsKind = holeyOf(obj->elementsKind);
+        return true;
+      }
+      obj->sparse.erase(idx);
+      return true;
+    }
+  }
   int32_t slot = obj->findOwnSlot(key);
   if (slot < 0) return true;
   Value& v = obj->slots[static_cast<size_t>(slot)];
   if (v.isHole()) return true;
-  // Invariant: v0.1 property attrs are always configurable
-  // (kDefaultDataAttrs), so the delete always succeeds. Non-configurable
-  // properties arrive with define-property semantics in v0.2.
+  // Invariant: v0.2 property attrs are always configurable
+  // (kDefaultDataAttrs) except the array "length" intercepted above, so the
+  // delete always succeeds. Frozen/sealed semantics arrive with
+  // define-property descriptor opcodes.
   v = Value::hole();
   return true;
 }
 
 JsResult<bool> Isolate::hasPropertyImpl(const Value& recv, SymbolId key) {
   if (!recv.isObjectLike()) return false;
-  LookupResult lr = lookupProperty(objectOfValue(recv), key);
-  return lr.found;
+  Object* obj = objectOfValue(recv);
+  uint32_t idx = 0;
+  const bool isIndex = arrayIndexFromKey(symbols_.text(key), &idx);
+  return hasAlongChain(obj, key, isIndex, idx);
 }
 
 // ---------------------------------------------------------------------------
@@ -844,6 +1055,36 @@ void Isolate::recordPropertySite(uint32_t slot, const Value& recv) {
   }
   if (s.distinctShapes < kMegamorphicThreshold) {
     s.shapeIds[s.distinctShapes] = shapeId;
+    s.shapeCounts[s.distinctShapes] = 1;
+    s.distinctShapes++;
+  } else {
+    s.distinctShapes = kMegamorphicThreshold;  // stays megamorphic
+  }
+}
+
+void Isolate::recordElementSite(uint32_t slot, const Value& recv) {
+  if (slot == kNoFeedbackSlot) return;
+  FeedbackSlot& s = feedback_[module_->functions.empty()
+                                  ? 0
+                                  : frameStack_.back()->fn->index][slot];
+  // Element-kind identity: 0 = non-array receiver; 1..6 = ElementsKind+1 of
+  // an array receiver (deterministic; saturating buckets as Property sites).
+  uint32_t kindId = 0;
+  if (recv.isObjectLike()) {
+    Object* obj = objectOfValue(recv);
+    if (obj->isArray) {
+      kindId = static_cast<uint32_t>(obj->elementsKind) + 1;
+    }
+  }
+  s.propertyHits++;
+  for (uint32_t i = 0; i < s.distinctShapes; i++) {
+    if (s.shapeIds[i] == kindId) {
+      if (s.shapeCounts[i] < UINT32_MAX) s.shapeCounts[i]++;
+      return;
+    }
+  }
+  if (s.distinctShapes < kMegamorphicThreshold) {
+    s.shapeIds[s.distinctShapes] = kindId;
     s.shapeCounts[s.distinctShapes] = 1;
     s.distinctShapes++;
   } else {

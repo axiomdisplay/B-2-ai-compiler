@@ -1,0 +1,36 @@
+; V0.2 arrays: the generic SetProperty opcode routes array-index keys into
+; element storage exactly like SetElement (one semantic source, Rule 96);
+; BigInt keys ToPropertyKey to canonical decimal strings ("1") and therefore
+; address elements too.
+.module arrays
+.global @print
+.const @KLEN = "length"
+.const @KBIG = 1n
+.entry @main
+
+.function @main 0 12
+  LoadGlobal r9, @print
+
+  NewArray r1
+  LoadConstS r2, 0
+  LoadConstS r3, 41
+  SetProperty r1, r2, r3        ; arr[0] = 41 via GENERIC property opcode
+
+  LoadConstS r2, 0
+  GetElement r4, r1, r2
+  Call r9, r4, 1, r0            ; 41 (same storage)
+
+  LoadConst r2, @KBIG
+  LoadConstS r3, 42
+  SetElement r1, r2, r3         ; arr[1n] = 42 (BigInt key -> "1" -> element)
+
+  LoadConstS r2, 1
+  GetElement r4, r1, r2
+  Call r9, r4, 1, r0            ; 42
+
+  LoadConst r2, @KLEN
+  GetProperty r4, r1, r2
+  Call r9, r4, 1, r0            ; 2
+
+  Return r0
+.end

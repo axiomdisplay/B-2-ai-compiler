@@ -124,3 +124,12 @@ TS_OP(JmpTrueWide,    W2_BR, Pure, true,  roles(1, {kPosA}, 0, {0,0}))
 TS_OP(JmpFalseWide,   W2_BR, Pure, true,  roles(1, {kPosA}, 0, {0,0}))
 TS_OP(Throw,          W1_R,  Throw, false, roles(1, {kPosA}, 0, {0,0}))
 TS_OP(Rethrow,        W0,    Throw, false, roles(0, {0,0,0,0}, 0, {0,0}))
+
+// --- Arrays (v0.2: bytecode_spec.md Section 5.12) ------------------------------
+// GetElement/SetElement are keyed-access opcodes with IDENTICAL semantics to
+// GetProperty/SetProperty (full ToPropertyKey routing, prototype chain, user
+// hooks); the frontend picks them when the key is index-like so the feedback
+// vector records element-kind sites (Section 8) instead of shape sites.
+TS_OP(NewArray,       W1_R,    Alloc,  false, roles(0, {0,0,0,0}, 1, {kPosA}))
+TS_OP(GetElement,     W2_RR_D, Invoke, true,  roles(2, {kPosB, kPosC}, 1, {kPosA}))
+TS_OP(SetElement,     W2_RR_V, Invoke, true,  roles(3, {kPosA, kPosB, kPosC}, 0, {0,0}))

@@ -1,0 +1,48 @@
+; V0.2 arrays: shrink drops sparse elements >= the new length (mixing dense
+; and sparse territory); regrowing length does not resurrect them; dense
+; elements below the cut survive untouched.
+.module arrays
+.global @print
+.const @KLEN = "length"
+.const @KMAXM1 = 4294967294
+.entry @main
+
+.function @main 0 12
+  LoadGlobal r9, @print
+
+  NewArray r1
+  LoadConstS r2, 10
+  LoadConstS r3, 0
+  SetElement r1, r3, r2         ; arr[0] = 10 (dense)
+  LoadConstS r2, 11
+  LoadConstS r3, 1
+  SetElement r1, r3, r2         ; arr[1] = 11 (dense)
+  LoadConst r2, @KMAXM1
+  LoadConstS r3, 99
+  SetElement r1, r2, r3         ; arr[4294967294] = 99 (sparse)
+
+  LoadConst r2, @KMAXM1
+  GetElement r4, r1, r2
+  Call r9, r4, 1, r0            ; 99
+
+  LoadConstS r2, 2
+  LoadConst r3, @KLEN
+  SetProperty r1, r3, r2        ; arr.length = 2: sparse >= 2 is dropped
+
+  LoadConst r2, @KMAXM1
+  GetElement r4, r1, r2
+  Call r9, r4, 1, r0            ; undefined
+
+  LoadConstS r2, 0
+  GetElement r4, r1, r2
+  Call r9, r4, 1, r0            ; 10
+  LoadConstS r2, 1
+  GetElement r4, r1, r2
+  Call r9, r4, 1, r0            ; 11
+
+  LoadConst r2, @KLEN
+  GetProperty r4, r1, r2
+  Call r9, r4, 1, r0            ; 2
+
+  Return r0
+.end

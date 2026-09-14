@@ -1,0 +1,85 @@
+; V0.2 arrays: length setter RangeErrors when ToUint32(newLen) !=
+; ToNumber(newLen) (strict-mode receiver semantics: throw, never return
+; false). Covers fractional doubles, non-numeric strings, negatives, and
+; Infinity. Failed sets leave length untouched. Errors are caught per
+; bytecode_spec.md Section 7 and identified by their name property.
+.module arrays
+.global @print
+.const @KLEN = "length"
+.const @KNAME = "name"
+.const @C35 = 3.5
+.const @KABC = "abc"
+.const @KINF = Infinity
+.entry @main
+
+.function @main 0 12
+  LoadGlobal r9, @print
+
+  NewArray r1
+  LoadConstS r2, 1
+  LoadConstS r3, 0
+  SetElement r1, r3, r2         ; arr = [1], length 1
+  LoadConst r3, @KLEN
+
+  ; --- arr.length = 3.5 -> RangeError ---
+  LoadConst r4, @C35
+  .catch r8, .Lt1s, .Lt1e, .Lh1
+.Lt1s:
+  SetProperty r1, r3, r4
+  LoadConst r5, @KABC
+  Call r9, r5, 1, r0            ; "abc" (marker: must not print)
+.Lt1e:
+  Jmp .La1
+.Lh1:
+  LoadConst r7, @KNAME
+  GetProperty r6, r8, r7
+  Call r9, r6, 1, r0            ; RangeError
+.La1:
+  ; --- arr.length = "abc" -> RangeError (ToNumber = NaN) ---
+  LoadConst r4, @KABC
+  .catch r8, .Lt2s, .Lt2e, .Lh2
+.Lt2s:
+  SetProperty r1, r3, r4
+  LoadConst r5, @KABC
+  Call r9, r5, 1, r0
+.Lt2e:
+  Jmp .La2
+.Lh2:
+  LoadConst r7, @KNAME
+  GetProperty r6, r8, r7
+  Call r9, r6, 1, r0            ; RangeError
+.La2:
+  ; --- arr.length = -1 -> RangeError ---
+  LoadConstS r4, -1
+  .catch r8, .Lt3s, .Lt3e, .Lh3
+.Lt3s:
+  SetProperty r1, r3, r4
+  LoadConst r5, @KABC
+  Call r9, r5, 1, r0
+.Lt3e:
+  Jmp .La3
+.Lh3:
+  LoadConst r7, @KNAME
+  GetProperty r6, r8, r7
+  Call r9, r6, 1, r0            ; RangeError
+.La3:
+  ; --- arr.length = Infinity -> RangeError ---
+  LoadConst r4, @KINF
+  .catch r8, .Lt4s, .Lt4e, .Lh4
+.Lt4s:
+  SetProperty r1, r3, r4
+  LoadConst r5, @KABC
+  Call r9, r5, 1, r0
+.Lt4e:
+  Jmp .La4
+.Lh4:
+  LoadConst r7, @KNAME
+  GetProperty r6, r8, r7
+  Call r9, r6, 1, r0            ; RangeError
+.La4:
+  ; --- length survived all failed sets ---
+  GetProperty r5, r1, r3
+  Call r9, r5, 1, r0            ; 1
+
+  Return r0
+.end

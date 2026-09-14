@@ -1,0 +1,8 @@
+.module neg
+.entry @main
+
+.function @main 0 6
+  NewArray r1
+  SetElement r1, r2, r3         ; r2/r3 never defined -> verifier must reject
+  Return r1
+.end

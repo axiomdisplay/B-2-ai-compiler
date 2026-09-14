@@ -147,11 +147,26 @@ int main(int argc, char** argv) {
         const char* kind = s.kind == ts::FeedbackKind::Property   ? "prop"
                            : s.kind == ts::FeedbackKind::Binary   ? "bin"
                            : s.kind == ts::FeedbackKind::Branch   ? "br"
+                           : s.kind == ts::FeedbackKind::Element  ? "elem"
                                                                   : "call";
         std::printf("  slot %zu (%s):", i, kind);
         if (s.kind == ts::FeedbackKind::Property) {
           std::printf(" distinct=%u hits=%u megamorphic=%d",
                       s.distinctShapes, s.propertyHits,
+                      s.distinctShapes >= ts::kMegamorphicThreshold ? 1 : 0);
+        } else if (s.kind == ts::FeedbackKind::Element) {
+          // Kind ids: 0 = non-array receiver, 1..6 = ElementsKind + 1.
+          static const char* kElemKindNames[] = {
+              "non-array", "packed-smi", "holey-smi", "packed-double",
+              "holey-double", "packed-tagged", "holey-tagged"};
+          std::printf(" distinct=%u hits=%u kinds=[", s.distinctShapes,
+                      s.propertyHits);
+          for (uint32_t k = 0; k < s.distinctShapes; k++) {
+            uint32_t id = s.shapeIds[k];
+            const char* n = id < 7 ? kElemKindNames[id] : "?";
+            std::printf("%s%s x%u", k ? ", " : "", n, s.shapeCounts[k]);
+          }
+          std::printf("] megamorphic=%d",
                       s.distinctShapes >= ts::kMegamorphicThreshold ? 1 : 0);
         } else if (s.kind == ts::FeedbackKind::Binary) {
           std::printf(" smi=%u num=%u str=%u big=%u obj=%u other=%u",

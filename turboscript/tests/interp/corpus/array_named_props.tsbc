@@ -1,0 +1,41 @@
+; V0.2 arrays: named (non-index) properties live in the ordinary shape
+; machinery alongside elements; they never affect the exotic length;
+; element-key access through GetElement still works; proto stays null.
+.module arrays
+.global @print
+.const @KFOO = "foo"
+.const @KLEN = "length"
+.entry @main
+
+.function @main 0 12
+  LoadGlobal r9, @print
+
+  NewArray r1
+  LoadConstS r2, 9
+  LoadConstS r3, 0
+  SetElement r1, r3, r2         ; arr[0] = 9
+
+  LoadConst r2, @KFOO
+  LoadConstS r3, 1
+  SetProperty r1, r2, r3        ; arr.foo = 1 (shape transition)
+
+  LoadConst r2, @KFOO
+  GetProperty r4, r1, r2
+  Call r9, r4, 1, r0            ; 1
+  LoadConst r2, @KFOO
+  GetElement r4, r1, r2
+  Call r9, r4, 1, r0            ; 1 (same semantics via keyed opcode)
+
+  LoadConst r2, @KLEN
+  GetProperty r4, r1, r2
+  Call r9, r4, 1, r0            ; 1 (foo did not change length)
+
+  GetPrototype r4, r1
+  Call r9, r4, 1, r0            ; null
+
+  LoadConstS r3, 0
+  GetElement r4, r1, r3
+  Call r9, r4, 1, r0            ; 9 (elements intact after shape store)
+
+  Return r0
+.end

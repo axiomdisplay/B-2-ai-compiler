@@ -1,10 +1,14 @@
-# TurboScript Bytecode Specification (TSBC v0.1)
+# TurboScript Bytecode Specification (TSBC v0.2)
 
-**Status:** Draft v0.1 — implemented by the T0 interpreter (`compiler/interp/`)
+**Status:** Draft v0.2 — implemented by the T0 interpreter (`compiler/interp/`)
 **Owner:** TurboScript Interp Team
-**Last Updated:** 2026-09-12
+**Last Updated:** 2026-09-14
 **Governing Laws:** `docs/laws/turboscript_compiler_laws.md` (Part 0, Part I Tier 0, Rules 15, 16, 23, 32, 33, 47, 90, 96, 105, 124)
 **Related:** `docs/laws/turboscript_master_architecture_spec.md` (Section 2 node taxonomy), `interp_contract.md`
+
+**v0.2 changes:** arrays are first-class (Section 5.12: `NewArray`,
+`GetElement`, `SetElement`), the feedback vector gains the Element slot kind
+(Section 8), and the Section 11 register marks arrays implemented.
 
 This document defines the TurboScript Bytecode (TSBC) format: a typed,
 register-based, effect-carrying bytecode that can be validated (this spec +
@@ -233,6 +237,45 @@ applied to bytecode):
 | 78 | `NewObject` | W1_R | dst | Alloc | dst = new ordinary object with no own properties (shape assigned on first store). Object/prototype opcodes operate on it. |
 | 79 | `GetContext` | W1_R | dst | Read | dst = the frame's current context (from the closure's captured context); null if none. Enables closures to read captured cells. |
 
+## 5.12 Arrays (v0.2)
+
+| # | Opcode | Format | Operands | Effect | Semantics |
+|---|---|---|---|---|---|
+| 80 | `NewArray` | W1_R | dst | Alloc | dst = new array: length 0, elements kind PackedSmi, no elements, [[Prototype]] = null (Array.prototype is a builtin-layer feature, Section 11). |
+| 81 | `GetElement` | W2_RR_D | dst, obj, key | Invoke, IC | dst = `obj[key]` with EXACTLY the semantics of `GetProperty` (ToPropertyKey routing, prototype chain, getters). The frontend chooses `GetElement` over `GetProperty` when the key is index-like so the feedback slot records element-kind sites (Section 8) instead of shape sites. |
+| 82 | `SetElement` | W2_RR_V | obj, key, val | Invoke, IC | `obj[key] = val` with EXACTLY the semantics of `SetProperty` (strict-mode store; setters; array exotic routing). Same opcode-choice rule as `GetElement`. |
+
+Array exotic behavior (enforced inside the shared property implementation,
+not per opcode — one semantic source, Rule 96):
+
+- **Array index:** a key is an array index iff it is a canonical numeric
+  string (ECMA-262) whose value is < 2^32-1. `"0"` is an index; `"00"`,
+  `"+0"`, and `"4294967295"` are named properties. Number keys route
+  through ToString, so `1`, `1.0`, and `"1"` address the same element;
+  `1n` addresses element 1 (`ToPropertyKey(1n) = "1"`).
+- **Elements kinds:** PackedSmi / HoleySmi / PackedDouble / HoleyDouble /
+  PackedTagged / HoleyTagged. Kind invariants are enforced on every element
+  store (a PackedSmi array can never contain a non-Smi); transitions are
+  eager and monotonic: smi -> double -> tagged, packed -> holey. Holes are
+  created by `DeleteProperty` on an index, by growth past the end
+  (SetElement), and by `length` shrink — never by length growth alone.
+- **Hole reads** fall through the prototype chain (the array's own storage
+  does not shadow); holes are not own properties, so `HasProperty`/`In`
+  report false for them.
+- **length:** writable, non-enumerable, non-configurable exotic property.
+  Reading it yields the current length as a Number (Smi when it fits).
+  Writing it runs ArraySetLength: `ToUint32(newLen)` must equal
+  `ToNumber(newLen)` or a RangeError is thrown (strict-mode receiver
+  semantics; failed writes leave length untouched). Shrinking truncates:
+  dense slots >= newLen are hole-ified and sparse entries >= newLen are
+  dropped. Growing never allocates or creates own elements.
+- **Element stores** update `length` to `index + 1` when `index >= length`
+  (uint32-safe: the largest index is 2^32-2). Stores at indices >= 2^20
+  (`kMaxDenseElements`) go to a sparse ordered map; no dense allocation of
+  2^32 slots ever happens.
+- **delete arr.length** returns false (non-configurable); deleting an
+  element hole-ifies it and never changes length.
+
 ## 6. Instruction Formats (Exhaustive)
 
 | Format | Words | Layout |
@@ -285,6 +328,7 @@ Slots are typed:
 | Slot kind | Owner opcodes | Recorded data |
 |---|---|---|
 | Property | GetProperty, SetProperty | Up to 4 seen shapes with hit counts; megamorphic flag after the 5th distinct shape. |
+| Element | GetElement, SetElement | Up to 4 seen element-kind identities (0 = non-array receiver, 1..6 = elements kind + 1) with hit counts; megamorphic flag after the 5th. |
 | Binary | All arithmetic/bitwise/comparison IC ops | Type histogram: Smi / HeapNumber / String / BigInt / Object / Other counts (8 counters). |
 | Branch | JmpTrue, JmpFalse | Taken / not-taken counts (branch probabilities). |
 | Call | Call, CallMethod, Construct | Ring of 4 callee function indices with counts; unknown-callee count. |
@@ -353,13 +397,14 @@ hint)`.
 
 | Feature | State | Owner | Target |
 |---|---|---|---|
-| Arrays (elements kinds, length exotic behavior) | Deferred; objects only | Interp team | v0.2 |
+| Arrays (elements kinds, length exotic behavior) | **Implemented v0.2** (Section 5.12; dense tagged backend with enforced kind invariants + sparse map beyond 2^20) | Interp team | done |
+| Array.prototype builtins (join/push/pop/slice/...) | Deferred; arrays exist but carry no methods | Interp team | v0.3 |
 | Proxy (13 traps) | Deferred; semantics ordinary-object | Interp team | v0.3 |
 | Generators / async (suspension) | Deferred; no suspend opcodes yet | Interp team | v0.3 |
 | Sloppy mode (mapped arguments, with) | Strict-mode semantics only | Interp team | v0.3 |
 | GC (heap is arena-owned, non-collecting) | Deferred | GC team | v0.4 |
 | Symbol literals / well-known symbols from user code | Deferred | Frontend team | v0.3 |
-| eval / Function constructor | Not representable in v0.1 bytecode | Frontend team | v0.4 |
+| eval / Function constructor | Not representable in v0.2 bytecode | Frontend team | v0.4 |
 
 Every divergence above is tracked, owned, and expiry-dated per Rule 143;
 none silently changes observable semantics of the features that ARE

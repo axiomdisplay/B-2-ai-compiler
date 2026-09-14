@@ -1,0 +1,46 @@
+; V0.2 arrays: holes observe the prototype chain. arr[1] is a hole (never
+; stored between 0 and 2); after attaching a prototype object that owns the
+; canonical numeric string property "1", arr[1] resolves to the inherited
+; value. Own elements win over the prototype. SetPrototype works on arrays
+; (their length is writable in v0.2).
+.module arrays
+.global @print
+.const @K1 = "1"
+.entry @main
+
+.function @main 0 12
+  LoadGlobal r9, @print
+
+  NewObject r1                  ; proto object
+  LoadConst r2, @K1
+  LoadConstS r3, 77
+  SetProperty r1, r2, r3        ; proto["1"] = 77
+
+  NewArray r4
+  LoadConstS r5, 0
+  LoadConstS r6, 0
+  SetElement r4, r6, r5         ; arr[0] = 0
+  LoadConstS r5, 2
+  LoadConstS r6, 2
+  SetElement r4, r6, r5         ; arr[2] = 2  (slot 1 is a hole)
+
+  SetPrototype r5, r4, r1       ; arr.__proto__ = protoObject
+
+  LoadConstS r6, 1
+  GetElement r5, r4, r6
+  Call r9, r5, 1, r0            ; 77 (hole -> prototype chain)
+
+  LoadConstS r6, 0
+  GetElement r5, r4, r6
+  Call r9, r5, 1, r0            ; 0 (own element wins)
+
+  LoadConst r6, @K1
+  HasProperty r5, r4, r6
+  Call r9, r5, 1, r0            ; true ("1" found on the prototype)
+
+  LoadConstS r6, 2
+  GetElement r5, r4, r6
+  Call r9, r5, 1, r0            ; 2
+
+  Return r0
+.end

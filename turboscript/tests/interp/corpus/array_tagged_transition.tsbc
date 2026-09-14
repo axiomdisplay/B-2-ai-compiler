@@ -1,0 +1,44 @@
+; V0.2 arrays: transition to tagged elements (PackedSmi -> PackedTagged via
+; an object store, then a string store keeps the tagged kind), object
+; identity of stored elements, and widened-kind reads.
+.module arrays
+.global @print
+.const @KLEN = "length"
+.entry @main
+
+.const @CD = 3.5
+.const @KS = "s"
+
+.function @main 0 10
+  LoadGlobal r8, @print
+
+  NewArray r1
+  LoadConstS r2, 1
+  LoadConstS r3, 0
+  SetElement r1, r3, r2         ; arr[0] = 1 (PackedSmi)
+  NewObject r2                  ; sentinel object
+  LoadConstS r3, 1
+  SetElement r1, r3, r2         ; arr[1] = obj (-> PackedTagged)
+
+  LoadConstS r3, 1
+  GetElement r4, r1, r3
+  StrictEq r4, r2               ; identity: arr[1] === obj (r4 = r4 === r2)
+  Call r8, r4, 1, r0            ; true
+
+  LoadConst r5, @KS
+  LoadConstS r3, 2
+  SetElement r1, r3, r5         ; arr[2] = "s"
+  LoadConstS r3, 2
+  GetElement r4, r1, r3
+  Call r8, r4, 1, r0            ; s
+
+  LoadConstS r3, 0
+  GetElement r4, r1, r3
+  Call r8, r4, 1, r0            ; 1 (earlier Smi readable after widening)
+
+  LoadConst r3, @KLEN
+  GetProperty r4, r1, r3
+  Call r8, r4, 1, r0            ; 3
+
+  Return r0
+.end

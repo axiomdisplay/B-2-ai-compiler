@@ -443,6 +443,9 @@ TsResult<bool> Verifier::verifyFunction(const Module& module, Function& fn,
       } else if (opcode == Opcode::kGetProperty ||
                  opcode == Opcode::kSetProperty) {
         kind = FeedbackKind::Property;
+      } else if (opcode == Opcode::kGetElement ||
+                 opcode == Opcode::kSetElement) {
+        kind = FeedbackKind::Element;
       } else {
         kind = FeedbackKind::Binary;
       }

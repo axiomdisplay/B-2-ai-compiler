@@ -1,0 +1,59 @@
+; V0.2 arrays: delete creates holes (packed -> holey transition) without
+; touching length; hole reads fall through (proto null -> undefined); "in"
+; distinguishes holes from present elements; delete is idempotent.
+.module arrays
+.global @print
+.const @KLEN = "length"
+.const @K1 = "1"
+.const @K0 = "0"
+.entry @main
+
+.function @main 0 12
+  LoadGlobal r9, @print
+
+  NewArray r1
+  LoadConstS r2, 1
+  LoadConstS r3, 0
+  SetElement r1, r3, r2
+  LoadConstS r2, 2
+  LoadConstS r3, 1
+  SetElement r1, r3, r2
+  LoadConstS r2, 3
+  LoadConstS r3, 2
+  SetElement r1, r3, r2
+  LoadConstS r2, 4
+  LoadConstS r3, 3
+  SetElement r1, r3, r2         ; arr = [1,2,3,4] (PackedSmi)
+
+  LoadConst r3, @K1
+  DeleteProperty r4, r1, r3
+  Call r9, r4, 1, r0            ; true
+
+  HasProperty r4, r1, r3
+  Call r9, r4, 1, r0            ; false ("1" in arr)
+
+  LoadConst r3, @K0
+  HasProperty r4, r1, r3
+  Call r9, r4, 1, r0            ; true
+
+  LoadConstS r3, 1
+  GetElement r4, r1, r3
+  Call r9, r4, 1, r0            ; undefined (hole)
+
+  LoadConstS r3, 0
+  GetElement r4, r1, r3
+  Call r9, r4, 1, r0            ; 1 (neighbors intact)
+
+  LoadConst r3, @KLEN
+  GetProperty r4, r1, r3
+  Call r9, r4, 1, r0            ; 4 (delete never shrinks)
+
+  LoadConst r3, @K1
+  DeleteProperty r4, r1, r3
+  Call r9, r4, 1, r0            ; true (idempotent)
+  LoadConst r3, @KLEN
+  GetProperty r4, r1, r3
+  Call r9, r4, 1, r0            ; 4
+
+  Return r0
+.end

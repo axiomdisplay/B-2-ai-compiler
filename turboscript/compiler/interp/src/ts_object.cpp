@@ -23,6 +23,25 @@ int32_t Object::findOwnSlot(SymbolId key) const {
   return -1;
 }
 
+// ---------------------------------------------------------------------------
+// Canonical array-index test. "0" is an index; "00", "+0", "-0" and
+// "4294967295" (2^32-1) are not (ECMA-262 ArrayCreate / canonical numeric
+// string). Inputs up to 10 digits; overflow rejected during accumulation.
+// ---------------------------------------------------------------------------
+bool arrayIndexFromKey(std::u16string_view key, uint32_t* out) {
+  if (key.empty() || key.size() > 10) return false;
+  if (key.size() > 1 && key[0] == u'0') return false;  // no leading zeros
+  uint64_t v = 0;
+  for (char16_t c : key) {
+    if (c < u'0' || c > u'9') return false;
+    v = v * 10 + static_cast<uint64_t>(c - u'0');
+    if (v > 0xFFFFFFFFull) return false;
+  }
+  if (v == kMaxArrayLength) return false;  // 2^32-1 is not an array index
+  *out = static_cast<uint32_t>(v);
+  return true;
+}
+
 Shape* ShapeTree::transition(Shape* from, SymbolId key, PropertyAttrs attrs) {
   auto mapKey = std::make_tuple(from->id, key, attrs.raw());
   auto it = transitions_.find(mapKey);
@@ -47,6 +66,7 @@ Object* protoOf(Object* obj) {
 }
 
 // Classify a found own slot: accessor or data, honoring Hole semantics.
+// (Shared by lookupOwnProperty and lookupProperty.)
 bool classifyOwn(Object* holder, SymbolId key, Value* slot,
                  LookupResult* out) {
   if (slot->isHole()) return false;  // deleted: invisible
@@ -63,6 +83,15 @@ bool classifyOwn(Object* holder, SymbolId key, Value* slot,
 }
 
 }  // namespace
+
+LookupResult lookupOwnProperty(Object* obj, SymbolId key) {
+  LookupResult result;
+  int32_t slot = obj->findOwnSlot(key);
+  if (slot >= 0) {
+    classifyOwn(obj, key, &obj->slots[static_cast<size_t>(slot)], &result);
+  }
+  return result;
+}
 
 LookupResult lookupProperty(Object* start, SymbolId key) {
   LookupResult result;

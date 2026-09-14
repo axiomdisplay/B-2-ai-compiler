@@ -32,7 +32,7 @@ struct Handler {
 };
 
 // Feedback slot kinds (bytecode_spec.md Section 8).
-enum class FeedbackKind : uint8_t { Property, Binary, Branch, Call };
+enum class FeedbackKind : uint8_t { Property, Binary, Branch, Call, Element };
 
 struct Function {
   SymbolId name = kInvalidSymbol;
