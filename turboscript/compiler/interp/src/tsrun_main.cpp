@@ -1,12 +1,15 @@
 // tsrun — TurboScript Tier 0 driver.
 // Usage: tsrun <file.tsbc> [--verify-only] [--dump] [--dump-feedback]
-//               [--stats] [--check <expected.out>]
+//               [--stats] [--time] [--check <expected.out>]
 // Exit codes: 0 ok; 1 runtime failure / check mismatch; 2 usage/compile error.
+// --time measures the run() execution phase only (assembly, verification and
+// module load are excluded) and prints "elapsed_ms=<x.xx>" on stderr.
 // Host environment: the native global `print` (ToString of args joined with
 // a single space, newline-terminated) — driver contract,
 // docs/interp_contract.md. Program output is buffered and flushed once, so
 // --check can compare it exactly against an expected file (Rule 52:
 // self-contained, reproducible tests).
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -68,11 +71,12 @@ int main(int argc, char** argv) {
   if (argc < 2) {
     std::fprintf(stderr,
                  "usage: tsrun <file.tsbc> [--verify-only] [--dump] "
-                 "[--dump-feedback] [--stats] [--check <expected.out>]\n");
+                 "[--dump-feedback] [--stats] [--time] [--check <expected.out>]\n");
     return 2;
   }
   std::string path = argv[1];
   bool verifyOnly = false, dump = false, dumpFeedback = false, stats = false;
+  bool timing = false;
   std::string checkPath;
   for (int i = 2; i < argc; i++) {
     if (std::strcmp(argv[i], "--verify-only") == 0) {
@@ -83,6 +87,8 @@ int main(int argc, char** argv) {
       dumpFeedback = true;
     } else if (std::strcmp(argv[i], "--stats") == 0) {
       stats = true;
+    } else if (std::strcmp(argv[i], "--time") == 0) {
+      timing = true;
     } else if (std::strcmp(argv[i], "--check") == 0 && i + 1 < argc) {
       checkPath = argv[++i];
     } else {
@@ -126,7 +132,16 @@ int main(int argc, char** argv) {
   }
   isolate.registerNative("print", nativePrint);
 
+  const std::chrono::steady_clock::time_point runStart =
+      std::chrono::steady_clock::now();
   ts::JsResult<ts::Value> result = isolate.run();
+  if (timing) {
+    const double elapsedMs =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - runStart)
+            .count();
+    std::fprintf(stderr, "elapsed_ms=%.2f\n", elapsedMs);
+  }
   const bool failed = !result;
   if (failed) {
     const ts::Value& thrown = result.error().thrown;

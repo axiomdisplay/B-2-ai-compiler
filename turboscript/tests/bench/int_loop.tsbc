@@ -1,0 +1,35 @@
+; bench: int_loop — djb2-style integer hash loop (Smi/ToInt32 hot path).
+; h = 5381; repeat N: h = ((h << 5) + h + i) | 0;  result = h >>> 0.
+; JS twin: int_loop.js (identical operation order — Rule 96 differential pair).
+.module int_loop
+.global @print
+.entry @main
+
+.const @cN = 5000000
+.const @cH0 = 5381
+.const @sLabel = "int_loop"
+
+.function @main 0 12
+  LoadGlobal r0, @print
+  LoadConst r1, @cN           ; N
+  LoadConst r2, @cH0          ; h = 5381
+  LoadConstS r3, 5            ; shift
+  LoadConstS r4, 0            ; zero
+  LoadConstS r5, 0            ; i
+.Lloop:
+  Mov r7, r2
+  Shl r7, r3                  ; h << 5 (ToInt32; shift count & 31)
+  Add r7, r2                  ; + h
+  Add r7, r5                  ; + i
+  BitOr r7, r4                ; | 0
+  Mov r2, r7
+  Inc r5
+  Mov r8, r5
+  Lt r8, r1                   ; i < N
+  JmpTrue r8, .Lloop
+  UShr r2, r4                 ; h >>> 0
+  LoadConst r6, @sLabel
+  Mov r7, r2
+  Call r0, r6, 2, r10         ; print("int_loop", result)
+  Return r10
+.end

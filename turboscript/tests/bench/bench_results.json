@@ -1,0 +1,66 @@
+{
+  "benchmarks": [
+    {
+      "name": "int_loop",
+      "desc": "5,000,000 iters, djb2 int hash (Shl/Add/BitOr)"
+    },
+    {
+      "name": "fib",
+      "desc": "fib(27), naive double recursion (~635k calls)"
+    },
+    {
+      "name": "float_loop",
+      "desc": "mandelbrot-lite 200x200 grid, max 100 iters"
+    },
+    {
+      "name": "string_concat",
+      "desc": "20k x (40-char build + number->string concat)"
+    },
+    {
+      "name": "object_fields",
+      "desc": "1M x (new object, 3 shape stores, 3 IC loads)"
+    },
+    {
+      "name": "array_loop",
+      "desc": "300-elem smi array, 3k sum passes (900k loads)"
+    }
+  ],
+  "engines": {
+    "turbo": "TurboScript Tier 0 (computed goto)",
+    "node-jitless": "V8 Ignition only (node --jitless)",
+    "qjs": "quickjs-ng (pure interpreter)",
+    "node-jit(ref)": "V8 full JIT (reference, not interp)"
+  },
+  "median_ms": {
+    "int_loop|turbo": 783.57,
+    "int_loop|node-jitless": 160.2,
+    "int_loop|qjs": 441.49,
+    "int_loop|node-jit(ref)": 28.41,
+    "fib|turbo": 133.63,
+    "fib|node-jitless": 21.57,
+    "fib|qjs": 40.22,
+    "fib|node-jit(ref)": 2.13,
+    "float_loop|turbo": 181.12,
+    "float_loop|node-jitless": 72.63,
+    "float_loop|qjs": 78.95,
+    "float_loop|node-jit(ref)": 3.54,
+    "string_concat|turbo": 100.32,
+    "string_concat|node-jitless": 25.38,
+    "string_concat|qjs": 74.1,
+    "string_concat|node-jit(ref)": 8.04,
+    "object_fields|turbo": 467.79,
+    "object_fields|node-jitless": 97.13,
+    "object_fields|qjs": 405.86,
+    "object_fields|node-jit(ref)": 10.45,
+    "array_loop|turbo": 623.44,
+    "array_loop|node-jitless": 17.76,
+    "array_loop|qjs": 55.37,
+    "array_loop|node-jit(ref)": 2.27
+  },
+  "geomean_slowdown_vs_turbo": {
+    "turbo": null,
+    "node-jitless": 0.16448358450287523,
+    "qjs": 0.4017912357714552,
+    "node-jit(ref)": 0.02047285919574581
+  }
+}

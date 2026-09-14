@@ -1,0 +1,49 @@
+; bench: string_concat — string allocation + concatenation throughput.
+; Per outer iteration: build a 40-char string by repeated s += "x", build
+; u = "id:" + i (number -> string), accumulate length checksum.
+; JS twin: string_concat.js (Rule 96 differential pair).
+.module string_concat
+.global @print
+.entry @main
+
+.const @cR = 20000
+.const @sX = "x"
+.const @sId = "id:"
+.const @sEmpty = ""
+.const @sLabel = "string_concat"
+
+.function @main 0 16
+  LoadGlobal r0, @print
+  LoadConst r1, @cR           ; R
+  LoadConstS r2, 40           ; 40
+  LoadConst r3, @sX           ; "x"
+  LoadConst r4, @sId          ; "id:"
+  LoadConst r5, @sEmpty       ; ""
+  LoadConstS r6, 0            ; i = 0
+  LoadConstS r7, 0            ; acc = 0
+.Louter:
+  Mov r8, r5                  ; s = ""
+  LoadConstS r9, 0            ; j = 0
+.Linner:
+  StringConcat r8, r3         ; s += "x"
+  Inc r9
+  Mov r10, r9
+  Lt r10, r2
+  JmpTrue r10, .Linner
+  Mov r11, r4                 ; u = "id:"
+  Add r11, r6                 ; u += i
+  StringLength r8             ; len(s)
+  Mov r12, r8
+  Mov r13, r11
+  StringLength r13            ; len(u)
+  Add r12, r13
+  Add r7, r12                 ; acc += len(s) + len(u)
+  Inc r6                      ; i++
+  Mov r10, r6
+  Lt r10, r1
+  JmpTrue r10, .Louter
+  LoadConst r13, @sLabel
+  Mov r14, r7
+  Call r0, r13, 2, r15        ; print("string_concat", acc)
+  Return r15
+.end

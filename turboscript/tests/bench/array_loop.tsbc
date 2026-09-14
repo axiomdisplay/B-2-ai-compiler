@@ -1,0 +1,48 @@
+; bench: array_loop — packed-Smi element store, then repeated full passes of
+; element loads. Fill A[0..299] = i*2, then PASSES passes of acc += A[i].
+; JS twin: array_loop.js (Rule 96 differential pair).
+.module array_loop
+.global @print
+.entry @main
+
+.const @cSize = 300
+.const @cPasses = 3000
+.const @sLabel = "array_loop"
+
+.function @main 0 14
+  LoadGlobal r0, @print
+  LoadConst r1, @cSize        ; SIZE
+  LoadConst r2, @cPasses      ; PASSES
+  NewArray r3                 ; A = []
+  LoadConstS r7, 2            ; 2
+  LoadConstS r11, 0           ; zero
+  LoadConstS r4, 0            ; i = 0
+.Lfill:
+  Mov r6, r4
+  Mul r6, r7                  ; i * 2
+  SetElement r3, r4, r6       ; A[i] = i*2
+  Inc r4
+  Mov r5, r4
+  Lt r5, r1
+  JmpTrue r5, .Lfill
+  LoadConstS r4, 0            ; p = 0
+  LoadConstS r8, 0            ; acc = 0
+.Lpass:
+  LoadConstS r9, 0            ; i = 0
+.Lelem:
+  GetElement r10, r3, r9      ; A[i]
+  Add r8, r10
+  BitOr r8, r11               ; acc = (acc + A[i]) | 0
+  Inc r9
+  Mov r5, r9
+  Lt r5, r1
+  JmpTrue r5, .Lelem
+  Inc r4                      ; p++
+  Mov r5, r4
+  Lt r5, r2
+  JmpTrue r5, .Lpass
+  LoadConst r10, @sLabel
+  Mov r11, r8                 ; arg1 = acc (args window is r10..r11)
+  Call r0, r10, 2, r13        ; print("array_loop", acc)
+  Return r13
+.end

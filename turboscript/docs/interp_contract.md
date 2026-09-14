@@ -165,3 +165,20 @@ Proxy, generators/async, sloppy mode, GC, user symbols, eval,
 Array.prototype builtins. Each is owned and expiry-dated there per Rule
 143. Nothing in this list is silently degradable: opcodes or semantics that
 depend on them do not exist in v0.2 bytecode.
+
+## 10. Driver CLI (tsrun)
+
+```text
+tsrun <file.tsbc> [--verify-only] [--dump] [--dump-feedback] [--stats]
+                  [--time] [--check <expected.out>]
+```
+
+- `--time` measures the `run()` execution phase only — assembly, verification
+  and module load are excluded — and prints `elapsed_ms=<x.xx>` on stderr
+  (program output on stdout stays untouched for `--check`).
+- `--time` is the timing source for the interpreter-only benchmark suite
+  (`tests/bench/`, results in `docs/benchmarks_v0.2.md`): the JS twin
+  kernels time `kernel()` in-script, so every engine is compared
+  kernel-execution-only. Feedback collection stays ON during timed runs —
+  the numbers include the spec-mandated Tier 0 profiling cost
+  (Section 5 / Part I Tier 0), and that is deliberate.
