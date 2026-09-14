@@ -1,0 +1,71 @@
+; Relational comparisons (numeric + UTF-16 code-unit string ordering) and
+; typeof for every value kind.
+.module typeof_rel
+.global @print
+.const @SA = "a"
+.const @B1N = 1n
+.const @SB = "b"
+.const @SCAP = "Z"
+.const @SABC = "abc"
+.const @SABD = "abd"
+.entry @main
+
+.function @main 0 12
+  LoadGlobal r11, @print
+
+  ; string ordering by code units
+  LoadConst r1, @SA
+  LoadConst r2, @SB
+  Lt r1, r2             ; "a" < "b" -> true
+  Call r11, r1, 1, r0
+
+  LoadConst r1, @SCAP
+  LoadConst r2, @SA
+  Lt r1, r2             ; "Z" < "a" -> true (90 < 97)
+  Call r11, r1, 1, r0
+
+  LoadConst r1, @SABC
+  LoadConst r2, @SABD
+  Le r1, r2             ; "abc" <= "abd" -> true
+  Call r11, r1, 1, r0
+
+  LoadConstS r1, 3
+  LoadConstS r2, 2
+  Gt r1, r2             ; true
+  Call r11, r1, 1, r0
+
+  ; typeof matrix
+  LoadUndefined r1
+  TypeOf r1
+  Call r11, r1, 1, r0   ; undefined
+
+  LoadNull r1
+  TypeOf r1
+  Call r11, r1, 1, r0   ; object
+
+  LoadTrue r1
+  TypeOf r1
+  Call r11, r1, 1, r0   ; boolean
+
+  LoadConstS r1, 1
+  TypeOf r1
+  Call r11, r1, 1, r0   ; number
+
+  LoadConst r1, @SA
+  TypeOf r1
+  Call r11, r1, 1, r0   ; string
+
+  LoadConst r1, @B1N
+  TypeOf r1
+  Call r11, r1, 1, r0   ; bigint
+
+  LoadGlobal r1, @print
+  TypeOf r1
+  Call r11, r1, 1, r0   ; function
+
+  NewObject r1
+  TypeOf r1
+  Call r11, r1, 1, r0   ; object
+
+  Return r0
+.end

@@ -1,0 +1,48 @@
+; String semantics: concat, length, char access, code-unit ordering, ToString.
+.module strings
+.global @print
+.const @HELLO = "hello"
+.const @WORLD = "world"
+.const @NU = "line1\nline2\ttab"
+.const @BIG = 1e21
+.entry @main
+
+.function @main 0 12
+  LoadGlobal r11, @print
+
+  LoadConst r1, @HELLO
+  LoadConst r2, @WORLD
+  StringConcat r1, r2   ; "helloworld"
+  Call r11, r1, 1, r0
+
+  LoadConst r1, @HELLO
+  StringLength r1       ; 5
+  Call r11, r1, 1, r0
+
+  LoadConst r1, @HELLO
+  LoadConstS r2, 1
+  CharCodeAt r3, r1, r2 ; 101 ("e")
+  Call r11, r3, 1, r0
+
+  LoadConstS r2, 99
+  CharCodeAt r3, r1, r2 ; out of range -> NaN
+  Call r11, r3, 1, r0
+
+  LoadConstS r1, 97
+  StringFromCharCode r1 ; "a"
+  Call r11, r1, 1, r0
+
+  LoadConst r1, @NU
+  StringLength r1       ; "line1\nline2\ttab" = 5+1+5+1+3 = 15
+  Call r11, r1, 1, r0
+
+  LoadConstS r1, 42
+  ToString r1           ; "42"
+  Call r11, r1, 1, r0
+
+  LoadConst r1, @BIG
+  ToString r1           ; "1e+21"
+  Call r11, r1, 1, r0
+
+  Return r0
+.end

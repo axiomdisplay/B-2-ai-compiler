@@ -1,0 +1,31 @@
+; Unbounded recursion surfaces as a JavaScript RangeError (Rule 90: never a
+; native crash), catchable at the top level.
+.module overflow
+.global @print
+.const @KN = "name"
+.entry @main
+
+.function @boom 0 4
+  NewClosure r1, @boom
+  LoadConstS r2, 0
+  Call r1, r2, 1, r3      ; recurse forever
+  Return r3
+.end
+
+.function @main 0 8
+  LoadGlobal r7, @print
+  .catch r4, .Ltry, .LtryEnd, .Lhandler
+  Jmp .Ltry
+.Ltry:
+  NewClosure r1, @boom
+  Call r1, r2, 0, r3      ; depth explodes
+.LtryEnd:
+  Jmp .Ldone
+.Lhandler:
+  LoadConst r5, @KN
+  GetProperty r6, r4, r5
+  Call r7, r6, 1, r0      ; RangeError
+  Jmp .Ldone
+.Ldone:
+  Return r0
+.end

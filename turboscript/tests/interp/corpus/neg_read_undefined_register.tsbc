@@ -1,0 +1,10 @@
+; VERIFIER NEGATIVE: r2 is read before any definition (dataflow, spec 9.4).
+.module neg1
+.global @print
+.entry @main
+.function @main 0 4
+  LoadGlobal r1, @print
+  Mov r2, r3
+  Call r1, r2, 1, r0
+  Return r0
+.end

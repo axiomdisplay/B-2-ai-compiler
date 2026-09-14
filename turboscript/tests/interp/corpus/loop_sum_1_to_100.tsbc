@@ -1,0 +1,21 @@
+; Loop machinery: short backward Jmp + forward JmpFalse; sum 1..100 = 5050.
+.module loop
+.global @print
+.entry @main
+
+.function @main 0 8
+  LoadGlobal r7, @print
+  LoadConstS r1, 1      ; i
+  LoadConstS r2, 0      ; sum
+  LoadConstS r3, 100    ; limit
+.Lloop:
+  Mov r4, r1            ; condition must not clobber i (in-place ops!)
+  Le r4, r3             ; i <= 100 ?
+  JmpFalse r4, .Lend
+  Add r2, r1            ; sum += i
+  Inc r1                ; ++i
+  Jmp .Lloop
+.Lend:
+  Call r7, r2, 1, r0    ; 5050
+  Return r0
+.end

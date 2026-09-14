@@ -1,0 +1,26 @@
+; Global bindings: define, store, load, missing-read -> undefined,
+; store-creates-binding (script semantics).
+.module globals
+.global @print
+.global @x
+.global @y
+.entry @main
+
+.function @main 0 8
+  LoadGlobal r7, @print
+
+  LoadGlobal r1, @x
+  Call r7, r1, 1, r0    ; undefined (declared, never stored)
+
+  LoadConstS r1, 42
+  StoreGlobal r1, @x
+  LoadGlobal r2, @x
+  Call r7, r2, 1, r0    ; 42
+
+  LoadConstS r2, 7
+  StoreGlobal r2, @y    ; store creates the binding
+  LoadGlobal r2, @y
+  Call r7, r2, 1, r0    ; 7
+
+  Return r0
+.end

@@ -1,0 +1,27 @@
+; BigInt division / modulo by 0n -> RangeError, caught (Rule 72).
+.module bigint_divzero
+.global @print
+.const @B7 = 7n
+.const @B0 = 0n
+.const @KN = "name"
+.entry @main
+
+.function @main 0 8
+  LoadGlobal r7, @print
+  LoadConst r1, @B7
+  LoadConst r2, @B0
+  .catch r4, .Ltry, .LtryEnd, .Lhandler
+  LoadConstS r5, 0
+  Jmp .Ltry
+.Ltry:
+  BigIntDiv r1, r2      ; 7n / 0n -> RangeError
+.LtryEnd:
+  Jmp .Ldone
+.Lhandler:
+  LoadConst r5, @KN
+  GetProperty r6, r4, r5
+  Call r7, r6, 1, r0    ; RangeError
+  Jmp .Ldone
+.Ldone:
+  Return r0
+.end

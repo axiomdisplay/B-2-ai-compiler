@@ -1,0 +1,37 @@
+; Closures capture independent context cells (NewContext second effect +
+; NewClosure capture + GetContext readback).
+.module closures
+.global @print
+.entry @main
+
+.function @makeCounter 0 6
+  LoadNull r1
+  NewContext r2, r1, 1    ; ctx{count=0}; becomes this frame's context
+  LoadConstS r3, 0
+  StoreContext r2, 0, r3
+  NewClosure r4, @step
+  Return r4
+.end
+
+.function @step 0 5
+  GetContext r1           ; the captured context
+  LoadContext r2, r1, 0
+  LoadConstS r3, 1
+  Add r2, r3
+  StoreContext r1, 0, r2
+  Return r2
+.end
+
+.function @main 0 8
+  LoadGlobal r7, @print
+  NewClosure r1, @makeCounter
+  Call r1, r2, 0, r3      ; c1
+  Call r1, r2, 0, r4      ; c2 (fresh context)
+  Call r3, r2, 0, r5      ; c1() -> 1
+  Call r7, r5, 1, r0
+  Call r3, r2, 0, r5      ; c1() -> 2
+  Call r7, r5, 1, r0
+  Call r4, r2, 0, r5      ; c2() -> 1 (independent)
+  Call r7, r5, 1, r0
+  Return r0
+.end

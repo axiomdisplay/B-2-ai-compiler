@@ -1,0 +1,42 @@
+; Prototype machinery: func.prototype auto-object, chain reads through
+; GetProperty, SetPrototype relinking, and instanceof.
+.module construct
+.global @print
+.const @KPROTO = "prototype"
+.const @KGREET = "greet"
+.const @SMSG = "hello from proto"
+.entry @main
+
+.function @make 0 3
+  NewObject r1
+  Return r1             ; factory: Construct returns this object as-is
+.end
+
+.function @greetFn 0 3
+  LoadConst r1, @SMSG
+  Return r1
+.end
+
+.function @main 0 12
+  LoadGlobal r11, @print
+
+  NewClosure r1, @greetFn
+  LoadConst r2, @KPROTO
+  GetProperty r3, r1, r2      ; r3 = greetFn.prototype (auto-created object)
+  LoadConst r4, @KGREET
+  NewClosure r5, @greetFn
+  SetProperty r3, r4, r5      ; greetFn.prototype.greet = function
+
+  NewClosure r6, @make
+  Construct r6, r7, 0, r8     ; instance (factory returns explicit object)
+  SetPrototype r9, r8, r3     ; instance.[[Prototype]] = greetFn.prototype
+
+  GetProperty r10, r8, r4     ; instance.greet -> found on the prototype
+  Call r10, r7, 0, r10
+  Call r11, r10, 1, r0        ; "hello from proto"
+
+  Instanceof r10, r8, r1      ; instance instanceof greetFn
+  Call r11, r10, 1, r0        ; true
+
+  Return r0
+.end

@@ -1,0 +1,60 @@
+; Smi arithmetic + IEEE edge cases (Rule 96: Tier 0 is the semantic baseline).
+.module arith_smi
+.global @print
+.entry @main
+
+.function @main 0 12
+  LoadGlobal r11, @print
+
+  LoadConstS r1, 40
+  LoadConstS r2, 2
+  Add r1, r2            ; 42
+  Call r11, r1, 1, r0   ; 42
+
+  LoadConstS r1, 10
+  LoadConstS r2, 3
+  Div r1, r2            ; 3.3333333333333335 (JS division is always double)
+  Call r11, r1, 1, r0
+
+  LoadConstS r1, 1
+  LoadConstS r2, 0
+  Div r1, r2            ; Infinity
+  Call r11, r1, 1, r0
+
+  LoadConstS r1, 0
+  LoadConstS r2, 0
+  Div r1, r2            ; NaN
+  Call r11, r1, 1, r0
+
+  LoadConstS r1, 7
+  LoadConstS r2, 3
+  Mod r1, r2            ; 1
+  Call r11, r1, 1, r0
+
+  LoadConstS r1, 2
+  LoadConstS r2, 10
+  Pow r1, r2            ; 1024
+  Call r11, r1, 1, r0
+
+  LoadConstS r1, 5
+  Neg r1                ; -5
+  Call r11, r1, 1, r0
+
+  LoadConstS r1, 9
+  Inc r1
+  Inc r1
+  Dec r1                ; 10
+  Call r11, r1, 1, r0
+
+  LoadConstS r1, 6
+  LoadConstS r2, 7
+  Mul r1, r2            ; 42
+  Call r11, r1, 1, r0
+
+  LoadConstS r1, 1
+  LoadConstS r2, 2
+  Sub r1, r2            ; -1
+  Call r11, r1, 1, r0
+
+  Return r0
+.end

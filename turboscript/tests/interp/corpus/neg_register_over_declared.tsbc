@@ -1,0 +1,8 @@
+; ASSEMBLER NEGATIVE: register beyond declared registerCount.
+.module neg5
+.global @print
+.entry @main
+.function @main 0 2
+  LoadConstS r5, 5
+  Return r0
+.end

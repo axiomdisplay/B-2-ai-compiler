@@ -1,0 +1,33 @@
+; Mixed BigInt + Number arithmetic throws TypeError (Rule 72, Part 0).
+; The error is caught and its name/message are printed.
+.module bigint_mixed
+.global @print
+.const @B1 = 1n
+.const @ONE = 1
+.const @KN = "name"
+.const @KM = "message"
+.entry @main
+
+.function @main 0 10
+  LoadGlobal r9, @print
+  LoadConst r1, @B1
+  LoadConst r2, @ONE
+  .catch r4, .Ltry, .LtryEnd, .Lhandler
+  LoadConstS r7, 0
+  Jmp .Ltry
+.Ltry:
+  Add r1, r2            ; 1n + 1 -> TypeError
+.LtryEnd:
+  Jmp .Lafter
+.Lhandler:
+  ; r4 holds the thrown error object
+  LoadConst r5, @KN
+  GetProperty r6, r4, r5
+  Call r9, r6, 1, r0    ; TypeError
+  LoadConst r5, @KM
+  GetProperty r6, r4, r5
+  Call r9, r6, 1, r0    ; Cannot mix BigInt and other types, use explicit conversions
+  Jmp .Lafter
+.Lafter:
+  Return r0
+.end

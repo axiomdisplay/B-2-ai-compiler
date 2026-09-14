@@ -1,0 +1,40 @@
+; Objects: NewObject, own properties via shapes, HasProperty/In/DeleteProperty,
+; GetPrototype of fresh objects (null; Object.prototype is a v0.2 builtin).
+.module objects
+.global @print
+.const @KX = "x"
+.const @KY = "y"
+.entry @main
+
+.function @main 0 12
+  LoadGlobal r11, @print
+
+  NewObject r1
+  LoadConstS r2, 42
+  LoadConst r3, @KX
+  SetProperty r1, r3, r2      ; obj.x = 42
+  GetProperty r4, r1, r3
+  Call r11, r4, 1, r0         ; 42
+
+  HasProperty r4, r1, r3      ; "x" in obj (own)
+  Call r11, r4, 1, r0         ; true
+
+  DeleteProperty r4, r1, r3   ; delete obj.x
+  HasProperty r4, r1, r3
+  Call r11, r4, 1, r0         ; false
+
+  GetProperty r4, r1, r3      ; read after delete -> undefined
+  Call r11, r4, 1, r0         ; undefined
+
+  NewObject r5
+  LoadConstS r2, 7
+  LoadConst r3, @KY
+  SetProperty r5, r3, r2      ; second object, different transition chain
+  GetProperty r4, r5, r3
+  Call r11, r4, 1, r0         ; 7
+
+  GetPrototype r4, r1         ; fresh object prototype is null in v0.1
+  Call r11, r4, 1, r0         ; null
+
+  Return r0
+.end

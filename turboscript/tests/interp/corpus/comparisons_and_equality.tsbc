@@ -1,0 +1,77 @@
+; Equality family: AbstractEq coercions, StrictEq, SameValue, SameValueZero.
+.module equality
+.global @print
+.const @S1 = "1"
+.const @S_EMPTY = ""
+.const @ONE_D = 1.0
+.entry @main
+
+.function @main 0 14
+  LoadGlobal r13, @print
+
+  ; NaN === NaN -> false
+  LoadConstS r1, 0
+  LoadConstS r2, 0
+  Div r1, r2
+  Mov r3, r1
+  StrictEq r1, r3
+  Call r13, r1, 1, r0
+
+  ; NaN == NaN -> false
+  LoadConstS r1, 0
+  LoadConstS r2, 0
+  Div r1, r2
+  Mov r3, r1
+  AbstractEq r1, r3
+  Call r13, r1, 1, r0
+
+  ; "1" == 1 -> true (string coerced to number)
+  LoadConst r1, @S1
+  LoadConstS r2, 1
+  AbstractEq r1, r2
+  Call r13, r1, 1, r0
+
+  ; "1" === 1 -> false (different types)
+  LoadConst r1, @S1
+  LoadConstS r2, 1
+  StrictEq r1, r2
+  Call r13, r1, 1, r0
+
+  ; null == undefined -> true
+  LoadNull r1
+  LoadUndefined r2
+  AbstractEq r1, r2
+  Call r13, r1, 1, r0
+
+  ; null == 0 -> false (null only equals undefined/null)
+  LoadNull r1
+  LoadConstS r2, 0
+  AbstractEq r1, r2
+  Call r13, r1, 1, r0
+
+  ; undefined == 0 -> false
+  LoadUndefined r1
+  LoadConstS r2, 0
+  AbstractEq r1, r2
+  Call r13, r1, 1, r0
+
+  ; true == 1 -> true (boolean coerced)
+  LoadTrue r1
+  LoadConstS r2, 1
+  AbstractEq r1, r2
+  Call r13, r1, 1, r0
+
+  ; "" == 0 -> true (empty string coerces to 0)
+  LoadConst r1, @S_EMPTY
+  LoadConstS r2, 0
+  AbstractEq r1, r2
+  Call r13, r1, 1, r0
+
+  ; 1 === 1.0 -> true (same double)
+  LoadConstS r1, 1
+  LoadConst r2, @ONE_D
+  StrictEq r1, r2
+  Call r13, r1, 1, r0
+
+  Return r0
+.end

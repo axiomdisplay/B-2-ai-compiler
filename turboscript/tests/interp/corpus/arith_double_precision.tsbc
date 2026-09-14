@@ -1,0 +1,60 @@
+; Double precision + shortest round-trip formatting + -0 observability (Rule 72).
+.module arith_double
+.global @print
+.const @A = 0.1
+.const @B = 0.2
+.const @BIG = 1e21
+.const @HALF = 0.5
+.entry @main
+
+.function @main 0 12
+  LoadGlobal r11, @print
+
+  LoadConst r1, @A
+  LoadConst r2, @B
+  Add r1, r2            ; 0.30000000000000004
+  Call r11, r1, 1, r0
+
+  LoadConst r1, @BIG
+  Call r11, r1, 1, r0   ; 1e+21
+
+  LoadConstS r1, 0
+  LoadConstS r2, 0
+  Mul r1, r2
+  Neg r1                ; -0 (stringifies as "0")
+  Call r11, r1, 1, r0   ; 0
+
+  LoadConstS r3, 0
+  LoadConstS r4, 0
+  SameValue r3, r4      ; SameValue(+0, +0) -> true
+  Call r11, r3, 1, r0
+
+  LoadConstS r3, 0
+  Neg r3                ; -0
+  LoadConstS r4, 0
+  SameValue r3, r4      ; false: SameValue distinguishes -0 from +0
+  Call r11, r3, 1, r0
+
+  LoadConstS r3, 0
+  Neg r3                ; fresh -0
+  LoadConstS r4, 0
+  SameValueZero r3, r4  ; true: SameValueZero treats -0 == +0
+  Call r11, r3, 1, r0
+
+  LoadConstS r3, 0
+  Neg r3                ; fresh -0
+  StrictEq r3, r4       ; true: -0 === +0
+  Call r11, r3, 1, r0
+
+  LoadConst r1, @HALF
+  LoadConstS r2, 0
+  Div r1, r2            ; Infinity
+  Call r11, r1, 1, r0
+
+  LoadConstS r1, 1
+  LoadConstS r2, 3
+  Div r1, r2            ; 0.3333333333333333
+  Call r11, r1, 1, r0
+
+  Return r0
+.end

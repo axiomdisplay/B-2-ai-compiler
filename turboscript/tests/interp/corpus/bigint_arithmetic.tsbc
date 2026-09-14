@@ -1,0 +1,50 @@
+; BigInt family: arithmetic, truncating division, dividend-sign remainder,
+; negation, and ToString (Rule 72: BigInt semantics are exact).
+.module bigint
+.global @print
+.const @B7 = 7n
+.const @B2 = 2n
+.const @BNEG = -7n
+.const @BMUL = 123456789n
+.const @BBIG = 987654321n
+.entry @main
+
+.function @main 0 10
+  LoadGlobal r9, @print
+
+  LoadConst r1, @B7
+  LoadConst r2, @B2
+  BigIntAdd r1, r2      ; 9n
+  Call r9, r1, 1, r0
+
+  LoadConst r1, @B7
+  LoadConst r2, @B2
+  BigIntSub r1, r2      ; 5n
+  Call r9, r1, 1, r0
+
+  LoadConst r1, @B7
+  LoadConst r2, @B2
+  BigIntDiv r1, r2      ; 3n (truncates toward zero)
+  Call r9, r1, 1, r0
+
+  LoadConst r1, @BNEG
+  LoadConst r2, @B2
+  BigIntDiv r1, r2      ; -3n
+  Call r9, r1, 1, r0
+
+  LoadConst r1, @BNEG
+  LoadConst r2, @B2
+  BigIntMod r1, r2      ; -1n (remainder takes dividend sign)
+  Call r9, r1, 1, r0
+
+  LoadConst r1, @BMUL
+  LoadConst r2, @BBIG
+  BigIntMul r1, r2      ; 121932631112635269n (arbitrary precision)
+  Call r9, r1, 1, r0
+
+  LoadConst r1, @B7
+  BigIntNeg r1          ; -7n
+  Call r9, r1, 1, r0
+
+  Return r0
+.end

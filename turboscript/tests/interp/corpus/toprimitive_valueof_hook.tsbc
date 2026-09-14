@@ -1,0 +1,40 @@
+; ToPrimitive user-code hooks: valueOf invoked by Add (number hint) and
+; toString by ToString (string hint) — the Invoke effect in action.
+.module hooks
+.global @print
+.const @KVO = "valueOf"
+.const @KTS = "toString"
+.const @SRET = "obj!"
+.entry @main
+
+.function @ret42 0 3
+  LoadConstS r1, 42
+  Return r1
+.end
+
+.function @retStr 0 3
+  LoadConst r1, @SRET
+  Return r1
+.end
+
+.function @main 0 10
+  LoadGlobal r9, @print
+
+  NewObject r1
+  NewClosure r2, @ret42
+  LoadConst r3, @KVO
+  SetProperty r1, r3, r2      ; obj.valueOf = () => 42
+
+  LoadConstS r4, 1
+  Add r4, r1                  ; 1 + obj -> ToPrimitive(obj) -> 42 -> 43
+  Call r9, r4, 1, r0          ; 43
+
+  NewObject r5
+  NewClosure r2, @retStr
+  LoadConst r3, @KTS
+  SetProperty r5, r3, r2      ; obj.toString = () => "obj!"
+  ToString r5
+  Call r9, r5, 1, r0          ; obj!
+
+  Return r0
+.end

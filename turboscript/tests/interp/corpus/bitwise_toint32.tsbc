@@ -1,0 +1,65 @@
+; Bitwise ops under ToInt32/ToUint32 (Rule 72), including wrap-around edges.
+.module bitwise
+.global @print
+.const @TWO31 = 2147483648
+.const @S3 = "3"
+.entry @main
+
+.function @main 0 10
+  LoadGlobal r9, @print
+
+  LoadConst r1, @TWO31
+  LoadConstS r2, 0
+  BitOr r1, r2          ; ToInt32(2^31)|0 = -2147483648
+  Call r9, r1, 1, r0
+
+  LoadConstS r1, -1
+  LoadConstS r2, 1
+  UShr r1, r2           ; -1 >>> 1 = 2147483647
+  Call r9, r1, 1, r0
+
+  LoadConstS r1, -1
+  LoadConstS r2, 0
+  UShr r1, r2           ; -1 >>> 0 = 4294967295
+  Call r9, r1, 1, r0
+
+  LoadConstS r1, 1
+  LoadConstS r2, 33
+  Shl r1, r2            ; 1 << (33 & 31) = 2
+  Call r9, r1, 1, r0
+
+  LoadConstS r1, -2
+  LoadConstS r2, 1
+  Shr r1, r2            ; sign-propagating: -2 >> 1 = -1
+  Call r9, r1, 1, r0
+
+  LoadConstS r1, 12
+  LoadConstS r2, 10
+  BitAnd r1, r2         ; 8
+  Call r9, r1, 1, r0
+
+  LoadConstS r1, 12
+  LoadConstS r2, 10
+  BitXor r1, r2         ; 6
+  Call r9, r1, 1, r0
+
+  LoadConstS r1, 0
+  BitNot r1             ; -1
+  Call r9, r1, 1, r0
+
+  ; NaN | 0 -> 0
+  LoadConstS r1, 0
+  LoadConstS r2, 0
+  Div r1, r2
+  LoadConstS r2, 0
+  BitOr r1, r2
+  Call r9, r1, 1, r0
+
+  ; "3" | 0 -> 3 (ToNumber on strings)
+  LoadConst r1, @S3
+  LoadConstS r2, 0
+  BitOr r1, r2
+  Call r9, r1, 1, r0
+
+  Return r0
+.end

@@ -1,0 +1,48 @@
+; BigInt vs double relational/equality semantics (x < y iff x <= floor(y) for
+; non-integral y; NaN unordered; mixed StrictEq false; AbstractEq true).
+.module bigint_cmp
+.global @print
+.const @B5 = 5n
+.const @D5 = 5.0
+.const @D5_5 = 5.5
+.const @D4_5 = 4.5
+.entry @main
+
+.function @main 0 12
+  LoadGlobal r11, @print
+
+  LoadConst r1, @B5
+  LoadConst r2, @D5
+  StrictEq r1, r2       ; 5n === 5.0 -> false (different types)
+  Call r11, r1, 1, r0
+
+  LoadConst r1, @B5
+  LoadConst r2, @D5
+  AbstractEq r1, r2     ; 5n == 5.0 -> true
+  Call r11, r1, 1, r0
+
+  LoadConst r1, @B5
+  LoadConst r2, @D5_5
+  Lt r1, r2             ; 5n < 5.5 -> true (5 < 5)
+  Call r11, r1, 1, r0
+
+  LoadConst r1, @B5
+  LoadConst r2, @D4_5
+  Lt r1, r2             ; 5n < 4.5 -> false
+  Call r11, r1, 1, r0
+
+  LoadConst r1, @B5
+  LoadConst r2, @D5_5
+  Ge r1, r2             ; 5n >= 5.5 -> false
+  Call r11, r1, 1, r0
+
+  ; NaN is unordered: 5n < NaN -> false
+  LoadConst r1, @B5
+  LoadConstS r2, 0
+  LoadConstS r3, 0
+  Div r2, r3            ; NaN
+  Lt r1, r2
+  Call r11, r1, 1, r0
+
+  Return r0
+.end

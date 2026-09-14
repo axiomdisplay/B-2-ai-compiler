@@ -1,0 +1,35 @@
+; Recursion through the call machinery with an args window: fib(15) = 610.
+.module fib
+.global @print
+.entry @main
+
+.function @fib 1 8
+  ; r0 = n (params are never clobbered by in-place ops on other registers)
+  LoadConstS r1, 2
+  Mov r2, r0
+  Ge r2, r1             ; n >= 2 ?
+  JmpFalse r2, .Lbase
+  Mov r3, r0
+  LoadConstS r1, 1
+  Sub r3, r1            ; n-1
+  NewClosure r4, @fib
+  Call r4, r3, 1, r5    ; r5 = fib(n-1)
+  Mov r6, r5
+  Mov r3, r0
+  LoadConstS r5, 2
+  Sub r3, r5            ; n-2
+  Call r4, r3, 1, r5    ; r5 = fib(n-2)
+  Add r6, r5
+  Return r6
+.Lbase:
+  Return r0
+.end
+
+.function @main 0 6
+  LoadGlobal r5, @print
+  LoadConstS r1, 15
+  NewClosure r2, @fib
+  Call r2, r1, 1, r3
+  Call r5, r3, 1, r0
+  Return r0
+.end

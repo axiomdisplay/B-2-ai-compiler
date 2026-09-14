@@ -1,0 +1,7 @@
+; VERIFIER NEGATIVE: execution falls off the end without Return (spec 9.4).
+.module neg3
+.global @print
+.entry @main
+.function @main 0 2
+  LoadConstS r1, 1
+.end

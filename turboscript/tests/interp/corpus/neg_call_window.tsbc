@@ -1,0 +1,10 @@
+; ASSEMBLER NEGATIVE: argsBase + argc exceeds registerCount.
+.module neg4
+.global @print
+.entry @main
+.function @main 0 3
+  LoadGlobal r1, @print
+  LoadConstS r2, 1
+  Call r1, r2, 9, r0
+  Return r0
+.end

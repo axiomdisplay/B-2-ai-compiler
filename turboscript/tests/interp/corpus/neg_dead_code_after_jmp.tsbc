@@ -1,0 +1,11 @@
+; VERIFIER NEGATIVE: instruction after unconditional Jmp is unreachable (Rule 60).
+.module neg2
+.global @print
+.entry @main
+.function @main 0 3
+  LoadConstS r1, 1
+  Jmp .Lend
+  LoadConstS r1, 2
+.Lend:
+  Return r1
+.end

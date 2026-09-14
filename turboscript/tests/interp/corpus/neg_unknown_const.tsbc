@@ -1,0 +1,8 @@
+; ASSEMBLER NEGATIVE: LoadConst references an undeclared constant label.
+.module neg6
+.global @print
+.entry @main
+.function @main 0 3
+  LoadConst r1, @MISSING
+  Return r1
+.end

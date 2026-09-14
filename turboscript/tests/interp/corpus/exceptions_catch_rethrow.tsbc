@@ -1,0 +1,34 @@
+; Exception machinery: value Throw, innermost-handler-first, Rethrow across
+; frames, and nested/overlapping handler ranges (Rule 74; bytecode_spec 7).
+.module exceptions
+.global @print
+.const @SINNER = "inner"
+.entry @main
+
+.function @thrower 0 3
+  LoadConst r1, @SINNER
+  Throw r1              ; string exception (Throw is terminal; no dead Return)
+.end
+
+.function @main 0 10
+  LoadGlobal r9, @print
+  .catch r6, .Ltry1, .Ltry1end, .Lhandler1   ; outer (covers inner + its handler)
+  .catch r7, .Ltry2, .Ltry2end, .Lhandler2   ; inner (covers only the call)
+  NewClosure r1, @thrower
+  Jmp .Ltry1
+.Ltry1:
+  Jmp .Ltry2
+.Ltry2:
+  Call r1, r2, 0, r3    ; throws "inner"
+.Ltry2end:
+  Jmp .Ldone            ; happy path (not taken at runtime)
+.Lhandler2:
+  Call r9, r7, 1, r0    ; innermost handler: print("inner")
+  Rethrow               ; re-delivered to the OUTER handler (in try1 range)
+.Ltry1end:
+.Lhandler1:
+  Call r9, r6, 1, r0    ; outer handler: print("inner")
+  Jmp .Ldone
+.Ldone:
+  Return r0
+.end
