@@ -1,5 +1,5 @@
 ; Objects: NewObject, own properties via shapes, HasProperty/In/DeleteProperty,
-; GetPrototype of fresh objects (null; Object.prototype is a v0.2 builtin).
+; GetPrototype of fresh objects (v0.3: wired to Object.prototype).
 .module objects
 .global @print
 .const @KX = "x"
@@ -33,7 +33,7 @@
   GetProperty r4, r5, r3
   Call r11, r4, 1, r0         ; 7
 
-  GetPrototype r4, r1         ; fresh object prototype is null in v0.1
+  GetPrototype r4, r1         ; fresh object prototype: Object.prototype (v0.3 wiring)
   Call r11, r4, 1, r0         ; null
 
   Return r0

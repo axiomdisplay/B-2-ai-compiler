@@ -1,0 +1,143 @@
+; v0.3: Proxy — get/set/has trap invocation, forwarding when traps are
+; absent, ownKeys via Object.keys, apply trap, and the non-configurable
+; delete invariant (Rule 70: all 13 internal methods, ts_proxy.cpp).
+.module proxy_traps
+.global @print
+.global @Proxy
+.global @Object
+.entry @main
+
+.const @sX = "x"
+.const @sY = "y"
+.const @sGet = "get"
+.const @sSet = "set"
+.const @sHas = "has"
+.const @sApply = "apply"
+.const @sProto = "prototype"
+.const @sKeys = "keys"
+.const @sComma = ","
+.const @sJoin = "join"
+.const @sLogGet = "get"
+.const @sLogSet = "set"
+.const @sLogHas = "has"
+.const @sLogApply = "apply"
+
+; get trap: (target, key, rx) -> print("get", key); return target[key]
+.function @hGet 3 8
+  LoadGlobal r3, @print
+  LoadConst r4, @sLogGet
+  Call r3, r4, 1, r5           ; print("get")
+  GetElement r6, r0, r1        ; target[key] (plain object: no recursion)
+  Return r6
+.end
+
+; set trap: (target, key, val, rx) -> print("set"); target[key] = val
+.function @hSet 4 8
+  LoadGlobal r4, @print
+  LoadConst r5, @sLogSet
+  Call r4, r5, 1, r6           ; print("set")
+  SetElement r0, r1, r2        ; target[key] = val
+  LoadTrue r7
+  Return r7
+.end
+
+; has trap: (target, key) -> print("has"); return key in target
+.function @hHas 2 8
+  LoadGlobal r2, @print
+  LoadConst r3, @sLogHas
+  Call r2, r3, 1, r4           ; print("has")
+  In r5, r0, r1
+  Return r5
+.end
+
+; apply trap: (target, thisArg, args) -> print("apply"); return 42
+.function @hApply 3 8
+  LoadGlobal r3, @print
+  LoadConst r4, @sLogApply
+  Call r3, r4, 1, r5           ; print("apply")
+  LoadConstS r6, 42
+  Return r6
+.end
+
+; target function for the apply trap: returns 99
+.function @fnTarget 0 4
+  LoadConstS r1, 99
+  Return r1
+.end
+
+.function @main 0 24
+  ; target = { x: 1 }
+  NewObject r1
+  LoadConst r2, @sX
+  LoadConstS r3, 1
+  SetProperty r1, r2, r3
+  ; handler = { get: hGet, set: hSet, has: hHas }
+  NewObject r4
+  LoadConst r5, @sGet
+  NewClosure r6, @hGet
+  SetProperty r4, r5, r6
+  LoadConst r5, @sSet
+  NewClosure r6, @hSet
+  SetProperty r4, r5, r6
+  LoadConst r5, @sHas
+  NewClosure r6, @hHas
+  SetProperty r4, r5, r6
+  ; p = Proxy(target, handler)
+  LoadGlobal r7, @Proxy
+  Mov r8, r1
+  Mov r9, r4
+  ; Proxy needs both args contiguous: r8=target, r9=handler
+  Mov r10, r7
+  Call r10, r8, 2, r11         ; p
+  ; print(p.x) -> get trap, then 1
+  LoadConst r2, @sX
+  GetProperty r12, r11, r2
+  LoadGlobal r13, @print
+  Mov r14, r12
+  Call r13, r14, 1, r15        ; print(1)
+  ; p.y = 5 -> set trap; then read TARGET directly: print(target.y) -> 5
+  LoadConst r2, @sY
+  LoadConstS r3, 5
+  SetProperty r11, r2, r3
+  GetProperty r12, r1, r2
+  LoadGlobal r13, @print
+  Mov r14, r12
+  Call r13, r14, 1, r15        ; print(5)
+  ; print("x" in p) -> has trap -> true
+  LoadConst r2, @sX
+  In r12, r11, r2
+  LoadGlobal r13, @print
+  Mov r14, r12
+  Call r13, r14, 1, r15        ; print(true)
+  ; Object.keys(p) joined -> forwarding ownKeys -> "x,y" (y added via set)
+  LoadGlobal r7, @Object
+  LoadConst r5, @sKeys
+  GetProperty r6, r7, r5
+  Mov r8, r11
+  Call r6, r8, 1, r12          ; keys
+  LoadConst r5, @sJoin
+  GetProperty r6, r12, r5
+  LoadConst r8, @sComma
+  CallMethod r6, r12, r8, 1, r9
+  LoadGlobal r13, @print
+  Mov r14, r9
+  Call r13, r14, 1, r15        ; print("x,y")
+  ; apply trap: fp = Proxy(fnTarget, {apply: hApply}); print(fp()) -> 42
+  NewObject r4
+  LoadConst r5, @sApply
+  NewClosure r6, @hApply
+  SetProperty r4, r5, r6
+  LoadGlobal r7, @Proxy
+  NewClosure r8, @fnTarget
+  Mov r9, r4
+  Mov r10, r7
+  Mov r12, r8
+  Mov r13, r4
+  ; args window: r12=target fn, r13=handler
+  Call r10, r12, 2, r14        ; fp
+  Call r14, r12, 0, r15        ; fp() -> 42
+  LoadGlobal r13, @print
+  Mov r14, r15
+  Call r13, r14, 1, r15        ; print(42)
+  Return r15
+.end

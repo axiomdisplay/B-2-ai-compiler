@@ -1,6 +1,6 @@
 # TurboScript Tier 0 Interpreter Contract
 
-**Status:** Draft v0.2
+**Status:** Draft v0.3
 **Owner:** TurboScript Interp Team
 **Last Updated:** 2026-09-14
 **Governing Laws:** `docs/laws/turboscript_compiler_laws.md`
@@ -43,19 +43,35 @@ exactly (Rules 4 and 83 — implemented as the `enterAt` entry API, Section 6).
 | Rule 32 (bitmasked orthogonal state) | Object/property attribute state is `Flags<P propAttrs>` bitmasks; raw int flags are forbidden. |
 | Rule 48 (`[[nodiscard]]`) | All `TsResult` returns are `[[nodiscard]]`. |
 
-## 3. Value Model (strict-mode semantics, v0.2)
+## 3. Value Model (strict-mode semantics, v0.3)
 
 - Tagged values: Undefined, Null, Boolean, Smi (int32), HeapNumber (double),
-  String (UTF-16), Object (incl. arrays), BigInt. (Symbol reserved; not
-  user-visible yet.)
+  String (UTF-16), Object (incl. arrays), BigInt, **Symbol (v0.3)**,
+  **Proxy (v0.3)**.
+- **v0.3 prototype wiring:** fresh plain objects chain to Object.prototype,
+  arrays to Array.prototype, closures' function objects to
+  Function.prototype; every function's fresh `.prototype` instance chains
+  to Object.prototype. The builtin layer is ordinary, monkey-patchable data
+  properties (Rule 70) installed at Isolate construction (ts_builtins.cpp).
+- **v0.3 user symbols:** `Symbol(desc)` creates unique-identity symbols;
+  symbol keys live in a dedicated SymbolId range (ts_core.h
+  `kUserSymbolBase`) and flow through shapes/lookup unchanged;
+  `Symbol.for`/`keyFor` keep the registry. typeof symbol, ToString
+  (`Symbol(desc)`), and SameValue identity are oracle-verified.
+- **v0.3 Proxy:** all 13 internal methods (ES ch. 10.5) route through the
+  trap protocol (ts_proxy.cpp) with target-side invariant checks;
+  `Proxy(target, handler)` is exposed as a native. Traps absent on the
+  handler forward to the target; handler traps must be functions or
+  undefined (TypeError otherwise).
 - Smi normalization: integral, in [-2^31, 2^31-1], and not negative zero.
   Negative zero is always a HeapNumber (Rule 72: `Object.is(-0, +0) = false`
   must be observable; `SameValue`/`SameValueZero` opcodes cover it).
 - Numbers print via shortest round-trip formatting with ECMAScript
   decimal/exponential selection rules.
 - `ToPrimitive`, `ToNumber`, `ToString`, `ToPropertyKey` implement the
-  ECMAScript algorithms including user-code hooks (valueOf/toString/
-  Symbol.toPrimitive when present), invoked through the call machinery.
+  ECMAScript algorithms including user-code hooks (valueOf/toString),
+  invoked through the call machinery. Well-known symbols (@@toPrimitive,
+  @@iterator) are v0.4 (bytecode_spec.md Section 11).
 - Objects: shape-based property storage (transition tree per isolate),
   prototype chains, accessor (getter/setter) properties, strict-mode store
   semantics (TypeError on frozen/non-writable stores). Dictionary mode is
@@ -159,18 +175,19 @@ TsResult<Value> enterAt(const Closure*, uint32_t pc,
 - Both dispatch paths (computed goto and switch fallback) run the full
   corpus in `make test`; `make test` must exit 0 from a clean checkout.
 
-## 9. Out of Scope for v0.2 (tracked in bytecode_spec.md Section 11)
+## 9. Out of Scope for v0.3 (tracked in bytecode_spec.md Section 11)
 
-Proxy, generators/async, sloppy mode, GC, user symbols, eval,
-Array.prototype builtins. Each is owned and expiry-dated there per Rule
-143. Nothing in this list is silently degradable: opcodes or semantics that
-depend on them do not exist in v0.2 bytecode.
+Generators/async, sloppy mode, GC, well-known symbols, eval. Each is owned
+and expiry-dated there per Rule 143 (generators/sloppy moved from v0.3 to
+v0.4 with reasons — both need frontend-level opcodes that do not exist in
+TSBC yet). Nothing in this list is silently degradable: opcodes or
+semantics that depend on them do not exist in v0.3 bytecode.
 
 ## 10. Driver CLI (tsrun)
 
 ```text
 tsrun <file.tsbc> [--verify-only] [--dump] [--dump-feedback] [--stats]
-                  [--time] [--check <expected.out>]
+                  [--time] [--no-record] [--check <expected.out>]
 ```
 
 - `--time` measures the `run()` execution phase only — assembly, verification
@@ -182,3 +199,7 @@ tsrun <file.tsbc> [--verify-only] [--dump] [--dump-feedback] [--stats]
   kernel-execution-only. Feedback collection stays ON during timed runs —
   the numbers include the spec-mandated Tier 0 profiling cost
   (Section 5 / Part I Tier 0), and that is deliberate.
+- `--no-record` (v0.3) disables feedback recording for the recording-tax
+  measurement (benchmarks_v0.3.md Section 4). Measurement toggle only —
+  NOT an operating mode: disabling feedback also disables the IC layer,
+  which the same measurement shows is net-positive (object_fields).

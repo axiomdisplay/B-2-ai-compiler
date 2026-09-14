@@ -30,6 +30,7 @@ quickjs-ng `qjs` (path overridable with `--qjs`).
 | `string_concat` | string allocation, concat, number→string, StringLength |
 | `object_fields` | NewObject, shape-transition stores, monomorphic IC loads |
 | `array_loop` | NewArray fill + repeated packed-Smi element loads |
+| `array_builtins` | v0.3 builtins layer: 100k push + map/reduce/filter (300k callback invocations) |
 
 ## Protocol
 

@@ -419,8 +419,10 @@ std::string kindName(const Value& v) {
     case ValueKind::HeapNumber: return "number";
     case ValueKind::String: return "string";
     case ValueKind::BigInt: return "bigint";
+    case ValueKind::Symbol: return "symbol";
     case ValueKind::Closure: return "function";
-    case ValueKind::Object: return "object";
+    case ValueKind::Object:
+    case ValueKind::Proxy: return "object";
     default: return "object";
   }
 }
@@ -617,9 +619,10 @@ bool strictEquals(const Value& a, const Value& b) {
       const BigInt* y = b.asBigInt();
       return BigInt::compare(*x, *y) == 0;
     }
+    case ValueKind::Symbol:
     case ValueKind::Object:
     case ValueKind::Closure:
-    case ValueKind::Context:
+    case ValueKind::Proxy:
       return a.ptr == b.ptr;
     default:
       return false;

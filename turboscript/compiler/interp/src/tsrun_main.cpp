@@ -1,9 +1,11 @@
 // tsrun — TurboScript Tier 0 driver.
 // Usage: tsrun <file.tsbc> [--verify-only] [--dump] [--dump-feedback]
-//               [--stats] [--time] [--check <expected.out>]
+//               [--stats] [--time] [--no-record] [--check <expected.out>]
 // Exit codes: 0 ok; 1 runtime failure / check mismatch; 2 usage/compile error.
 // --time measures the run() execution phase only (assembly, verification and
 // module load are excluded) and prints "elapsed_ms=<x.xx>" on stderr.
+// --no-record disables feedback recording (measurement mode for the
+// recording-tax study, benchmarks_v0.2.md Section 5 #2; NOT a semantic mode).
 // Host environment: the native global `print` (ToString of args joined with
 // a single space, newline-terminated) — driver contract,
 // docs/interp_contract.md. Program output is buffered and flushed once, so
@@ -71,12 +73,13 @@ int main(int argc, char** argv) {
   if (argc < 2) {
     std::fprintf(stderr,
                  "usage: tsrun <file.tsbc> [--verify-only] [--dump] "
-                 "[--dump-feedback] [--stats] [--time] [--check <expected.out>]\n");
+                 "[--dump-feedback] [--stats] [--time] [--no-record] "
+                 "[--check <expected.out>]\n");
     return 2;
   }
   std::string path = argv[1];
   bool verifyOnly = false, dump = false, dumpFeedback = false, stats = false;
-  bool timing = false;
+  bool timing = false, noRecord = false;
   std::string checkPath;
   for (int i = 2; i < argc; i++) {
     if (std::strcmp(argv[i], "--verify-only") == 0) {
@@ -89,6 +92,8 @@ int main(int argc, char** argv) {
       stats = true;
     } else if (std::strcmp(argv[i], "--time") == 0) {
       timing = true;
+    } else if (std::strcmp(argv[i], "--no-record") == 0) {
+      noRecord = true;
     } else if (std::strcmp(argv[i], "--check") == 0 && i + 1 < argc) {
       checkPath = argv[++i];
     } else {
@@ -126,6 +131,7 @@ int main(int argc, char** argv) {
 
   ts::Isolate isolate;
   if (stats) isolate.setCountOpcodes(true);
+  if (noRecord) isolate.setRecordFeedback(false);
   if (ts::TsResult<bool> loaded = isolate.loadModule(**module, symbols); !loaded) {
     printDiag(loaded.error());
     return 2;

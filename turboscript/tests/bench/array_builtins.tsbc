@@ -1,0 +1,91 @@
+; bench: array_builtins — builtin-layer pipeline (JS twin pair, Rule 96).
+; 100k push + map/reduce/filter (300k callback invocations). The push
+; method reference is hoisted out of the loop in this twin (engines cache
+; the same lookup internally; per-call operation order is identical).
+.module array_builtins
+.global @print
+.global @Array
+.entry @main
+
+.const @sLabel = "array_builtins"
+.const @sProto = "prototype"
+.const @sPush = "push"
+.const @sMap = "map"
+.const @sReduce = "reduce"
+.const @sFilter = "filter"
+.const @sLen = "length"
+.const @sN = 100000
+
+.function @dbl 1 4
+  LoadConstS r1, 2
+  Mul r0, r1
+  Return r0
+.end
+
+.function @addAcc 2 4
+  Add r0, r1
+  Return r0
+.end
+
+.function @isOdd 1 8
+  Mov r1, r0
+  LoadConstS r2, 2
+  Mod r1, r2
+  LoadConstS r3, 1
+  StrictEq r1, r3
+  Return r1
+.end
+
+.function @main 0 32
+  NewArray r1                     ; a
+  ; push = Array.prototype.push (hoisted)
+  LoadGlobal r14, @Array
+  LoadConst r15, @sProto
+  GetProperty r14, r14, r15
+  LoadConst r15, @sPush
+  GetProperty r14, r14, r15
+  ; for (i = 0; i < 100000; i++) a.push(i % 7)
+  LoadConstS r2, 0
+.Lloop:
+  Mov r4, r2
+  LoadConst r5, @sN
+  Lt r4, r5
+  JmpFalse r4, .Ldone
+  Mov r5, r2
+  LoadConstS r6, 7
+  Mod r5, r6
+  Mov r13, r1                     ; this = a
+  CallMethod r14, r13, r5, 1, r15 ; a.push(i % 7)
+  Inc r2
+  Jmp .Lloop
+.Ldone:
+  ; doubled = a.map(dbl)
+  LoadConst r16, @sMap
+  GetProperty r16, r1, r16
+  NewClosure r17, @dbl
+  Mov r13, r1
+  CallMethod r16, r13, r17, 1, r18
+  ; sum = doubled.reduce(addAcc, 0)
+  LoadConst r19, @sReduce
+  GetProperty r19, r18, r19
+  NewClosure r20, @addAcc
+  LoadConstS r21, 0
+  Mov r13, r18
+  CallMethod r19, r13, r20, 2, r22
+  ; odds = doubled.filter(isOdd)
+  LoadConst r23, @sFilter
+  GetProperty r23, r18, r23
+  NewClosure r24, @isOdd
+  Mov r13, r18
+  CallMethod r23, r13, r24, 1, r25
+  ; result = sum + odds.length
+  LoadConst r26, @sLen
+  GetProperty r26, r25, r26
+  Mov r27, r22
+  Add r27, r26
+  LoadGlobal r28, @print
+  LoadConst r29, @sLabel
+  Mov r30, r27
+  Call r28, r29, 2, r31           ; print("array_builtins", result)
+  Return r31
+.end

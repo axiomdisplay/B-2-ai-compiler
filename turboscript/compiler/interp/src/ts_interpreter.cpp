@@ -74,24 +74,18 @@ Isolate::Isolate() : shapes_(heap_) {
   sym_valueOf_ = symbols_.intern(u"valueOf");
   sym_toString_ = symbols_.intern(u"toString");
   sym_length_ = symbols_.intern(u"length");
+  // v0.3 builtin layer: standard prototypes + Object/Array namespaces
+  // (ts_builtins.cpp). Runs before any module load; driver natives
+  // (print) register on top afterwards.
+  installStandardPrototypes();
+  global_->proto = Value::raw(ValueKind::Object, objectPrototype_);
   opcodeCounts_.assign(kOpcodeSpace, 0);
 }
 
 void Isolate::registerNative(const char* name, NativeFn fn) {
-  natives_.push_back(NativeEntry{name, fn});
-  SymbolId sym = symbols_.intern(
-      std::u16string(name, name + std::strlen(name)));
-  Closure* cl = heap_.makeClosure();
-  cl->funcIndex = kNativeFuncIndexBase + static_cast<uint32_t>(natives_.size()) - 1;
-  cl->context = nullptr;
-  cl->asObject = heap_.makeObject();
-  // Give the native a name property for diagnostics.
-  std::u16string wide(name, name + std::strlen(name));
-  Value nameVal = Value::string(heap_.makeString(wide));
-  (void)defineProperty(cl->asObject, sym_name_, nameVal, kDefaultDataAttrs);
-  nativeClosures_.push_back(cl);
-  (void)defineProperty(global_, sym, Value::raw(ValueKind::Closure, cl),
-                       kDefaultDataAttrs);
+  // v0.3: delegates to the shared definition path (the closure object gets
+  // a .name property and Function.prototype as its [[Prototype]]).
+  defineNativeOn(global_, name, fn);
 }
 
 TsResult<bool> Isolate::loadModule(const Module& module,
@@ -159,6 +153,31 @@ JsResult<Value> Isolate::run() {
   return callClosure(entry, Value::undefined(), nullptr, 0);
 }
 
+Closure* Isolate::defineNativeOn(Object* holder, const char* name,
+                                 NativeFn fn) {
+  natives_.push_back(NativeEntry{name, fn});
+  SymbolId sym = symbols_.intern(
+      std::u16string(name, name + std::strlen(name)));
+  Closure* cl = heap_.makeClosure();
+  cl->funcIndex = kNativeFuncIndexBase + static_cast<uint32_t>(natives_.size()) - 1;
+  cl->context = nullptr;
+  cl->asObject = heap_.makeObject();
+  cl->asObject->proto = Value::raw(ValueKind::Object, functionPrototype_);
+  std::u16string wide(name, name + std::strlen(name));
+  (void)defineProperty(cl->asObject, sym_name_,
+                       Value::string(heap_.makeString(wide)),
+                       kDefaultDataAttrs);
+  (void)defineProperty(holder, sym, Value::raw(ValueKind::Closure, cl),
+                       kDefaultDataAttrs);
+  return cl;
+}
+
+Object* Isolate::newPlainObject() {
+  Object* obj = heap_.makeObject();
+  obj->proto = Value::raw(ValueKind::Object, objectPrototype_);
+  return obj;
+}
+
 Closure* Isolate::makeClosureFor(uint32_t funcIndex, Context* context) {
   if (module_ == nullptr || funcIndex >= module_->functions.size()) {
     return nullptr;
@@ -166,12 +185,12 @@ Closure* Isolate::makeClosureFor(uint32_t funcIndex, Context* context) {
   Closure* cl = heap_.makeClosure();
   cl->funcIndex = funcIndex;
   cl->context = context;
-  cl->asObject = heap_.makeObject();
-  // Each closure gets a fresh .prototype object (ECMAScript semantics);
-  // prototype.constructor points back at the closure (v0.1: enumerable,
-  // data; non-enumerable attrs arrive with define-property semantics).
-  Object* protoObj = heap_.makeObject();
-  protoObj->proto = Value::null();  // builtins deferred (bytecode_spec 11)
+  cl->asObject = newPlainObject();
+  // v0.3: function objects chain to Function.prototype; each closure's
+  // fresh .prototype instance chains to Object.prototype (ECMAScript
+  // semantics); prototype.constructor points back at the closure.
+  cl->asObject->proto = Value::raw(ValueKind::Object, functionPrototype_);
+  Object* protoObj = newPlainObject();
   Value closureVal = Value::raw(ValueKind::Closure, cl);
   (void)defineProperty(protoObj, sym_constructor_, closureVal,
                        kDefaultDataAttrs);
@@ -186,6 +205,10 @@ Closure* Isolate::makeClosureFor(uint32_t funcIndex, Context* context) {
 // ---------------------------------------------------------------------------
 JsResult<Value> Isolate::callValue(const Value& callee, Value thisVal,
                                    const Value* args, uint32_t argc) {
+  if (callee.isProxy()) {
+    // Proxy [[Call]] (v0.3).
+    return proxyApply(callee, thisVal, args, argc);
+  }
   if (callee.kind == ValueKind::Closure) {
     const Closure* cl = static_cast<const Closure*>(callee.ptr);
     if (cl->funcIndex >= kNativeFuncIndexBase) {
@@ -244,7 +267,7 @@ std::vector<std::string> Isolate::currentTrace() const {
 }
 
 JsException Isolate::makeError(const char* name, const std::string& message) {
-  Object* err = heap_.makeObject();
+  Object* err = newPlainObject();  // v0.3: chains to Object.prototype
   std::u16string wideName(name, name + std::strlen(name));
   std::u16string wideMsg(message.begin(), message.end());
   (void)defineProperty(err, sym_name_,
@@ -442,10 +465,17 @@ JsResult<bool> Isolate::setAlongChain(Object* start, const Value& recv,
       if (!r) return std::unexpected(r.error());
       return true;
     }
-    // Data property found on the chain: v0.2 data attrs are always writable,
-    // so the write succeeds (own) or shadows (inherited,
-    // OrdinarySetWithOwnDescriptor).
+    // Data property found on the chain: v0.3 honors the writable attribute
+    // (descriptor-defined read-only data props are real now); default attrs
+    // are all writable, so ordinary stores are unaffected.
     if (cur == start) {
+      PropertyAttrs attrs;
+      if (ownDataSlotAttrs(cur, key, &attrs) >= 0 &&
+          !attrs.has(PropAttr::Writable)) {
+        return std::unexpected(typeError(
+            "Cannot assign to read only property '" +
+            utf16ToUtf8(symbols_.text(key)) + "'"));
+      }
       *own.dataSlot = val;
     } else {
       return defineProperty(start, key, val, kDefaultDataAttrs);
@@ -490,6 +520,10 @@ JsResult<bool> Isolate::defineProperty(Object* obj, SymbolId key,
 }
 
 JsResult<Value> Isolate::getProperty(const Value& recv, SymbolId key) {
+  if (recv.isProxy()) {
+    // Proxy [[Get]]: route through the trap protocol with the key VALUE.
+    return proxyGet(recv, keyToValue(key));
+  }
   if (!recv.isObjectLike()) {
     // v0.2: no primitive wrappers (bytecode_spec.md Section 11).
     return Value::undefined();
@@ -497,16 +531,19 @@ JsResult<Value> Isolate::getProperty(const Value& recv, SymbolId key) {
   Object* obj = objectOfValue(recv);
   uint32_t idx = 0;
   const bool isIndex =
-      arrayIndexFromKey(symbols_.text(key), &idx);
+      !isUserSymbolId(key) && arrayIndexFromKey(symbols_.text(key), &idx);
   return getAlongChain(obj, recv, key, isIndex, idx);
 }
 
 JsResult<bool> Isolate::setProperty(const Value& recv, SymbolId key,
                                     const Value& val) {
+  if (recv.isProxy()) {
+    return proxySet(recv, keyToValue(key), val);
+  }
   if (!recv.isObjectLike()) {
     // Strict-mode store on a primitive receiver.
     return std::unexpected(typeError(
-        "Cannot create property '" + utf16ToUtf8(symbols_.text(key)) +
+        "Cannot create property '" + utf16ToUtf8(keyText(key)) +
         "' on " + pure::kindName(recv)));
   }
   Object* obj = objectOfValue(recv);
@@ -515,14 +552,110 @@ JsResult<bool> Isolate::setProperty(const Value& recv, SymbolId key,
   if (obj->isArray) {
     if (key == sym_length_) return arraySetLength(obj, val);
     uint32_t idx = 0;
-    if (arrayIndexFromKey(symbols_.text(key), &idx)) {
+    if (!isUserSymbolId(key) && arrayIndexFromKey(symbols_.text(key), &idx)) {
       return setArrayElement(obj, idx, val);
     }
   }
   return setAlongChain(obj, recv, key, val);
 }
 
+// ---------------------------------------------------------------------------
+// Element access keyed by VALUE (v0.3, benchmarks_v0.2.md Section 5 #1).
+// The v0.2 GetElement/SetElement path ran toPropertyKey on EVERY access,
+// materializing + interning a fresh decimal string per element read (900k
+// allocations for array_loop) and then re-parsing that text back into an
+// index. The fast path below performs the identical semantic walk for
+// canonical Smi keys with ZERO interning on element hits: per chain node it
+// consults element storage first (array nodes) and named slots second, with
+// the named key's symbol resolved lazily and cached (cachedIndexSymbol).
+// Rule 96: one semantic source — the slow path (below) is unchanged and any
+// key/receiver combination not matching the fast-path guard routes to it.
+// ---------------------------------------------------------------------------
+SymbolId Isolate::cachedIndexSymbol(uint32_t idx) {
+  if (idx < kIndexSymbolCacheMax) {
+    if (idx >= indexSymbolCache_.size()) {
+      indexSymbolCache_.resize(static_cast<size_t>(idx) + 1, kInvalidSymbol);
+    }
+    SymbolId& cached = indexSymbolCache_[idx];
+    if (cached == kInvalidSymbol) cached = internIndexKey(idx);
+    return cached;
+  }
+  return internIndexKey(idx);
+}
+
+JsResult<Value> Isolate::getElementValue(const Value& recv, const Value& key) {
+  if (key.isSmi() && key.i32 >= 0 && recv.isObjectLike()) {
+    const uint32_t idx = static_cast<uint32_t>(key.i32);
+    SymbolId keySym = kInvalidSymbol;  // resolved lazily, only on named probe
+    for (Object* cur = objectOfValue(recv); cur != nullptr;
+         cur = protoOfObject(cur)) {
+      if (cur->isArray) {
+        Value v = ownElementValue(cur, idx);
+        if (!v.isHole()) return v;
+        // Numeric keys never reach the exotic "length" property.
+      }
+      if (keySym == kInvalidSymbol) keySym = cachedIndexSymbol(idx);
+      LookupResult own = lookupOwnProperty(cur, keySym);
+      if (!own.found) continue;
+      if (own.accessor != nullptr) {
+        if (own.accessor->getter.isUndefined()) return Value::undefined();
+        return callValue(own.accessor->getter, recv, nullptr, 0);
+      }
+      return *own.dataSlot;
+    }
+    return Value::undefined();
+  }
+  // Slow path: full ToPropertyKey routing (objects with hooks, doubles,
+  // strings, BigInt keys, ...). Identical to the v0.2 semantics.
+  JsResult<SymbolId> k = toPropertyKey(key);
+  if (!k) return std::unexpected(k.error());
+  return getProperty(recv, *k);
+}
+
+JsResult<bool> Isolate::setElementValue(const Value& recv, const Value& key,
+                                        const Value& val) {
+  if (key.isSmi() && key.i32 >= 0 && recv.isObjectLike()) {
+    const uint32_t idx = static_cast<uint32_t>(key.i32);
+    Object* obj = objectOfValue(recv);
+    // Own array receiver: mirrors setProperty's array pre-routing — the
+    // element/length machinery runs before any chain walk.
+    if (obj->isArray) return setArrayElement(obj, idx, val);
+    // Non-array receiver: identical walk to setAlongChain with a lazily
+    // interned numeric key (a numeric-key accessor on the chain must run).
+    SymbolId keySym = kInvalidSymbol;
+    for (Object* cur = obj; cur != nullptr; cur = protoOfObject(cur)) {
+      if (keySym == kInvalidSymbol) keySym = cachedIndexSymbol(idx);
+      LookupResult own = lookupOwnProperty(cur, keySym);
+      if (!own.found) continue;
+      if (own.accessor != nullptr) {
+        if (own.accessor->setter.isUndefined()) {
+          return std::unexpected(typeError(
+              "Cannot set property '" + utf16ToUtf8(symbols_.text(keySym)) +
+              "': no setter"));
+        }
+        JsResult<Value> r = callValue(own.accessor->setter, recv, &val, 1);
+        if (!r) return std::unexpected(r.error());
+        return true;
+      }
+      if (cur == obj) {
+        *own.dataSlot = val;
+      } else {
+        return defineProperty(obj, keySym, val, kDefaultDataAttrs);
+      }
+      return true;
+    }
+    if (keySym == kInvalidSymbol) keySym = cachedIndexSymbol(idx);
+    return defineProperty(obj, keySym, val, kDefaultDataAttrs);
+  }
+  JsResult<SymbolId> k = toPropertyKey(key);
+  if (!k) return std::unexpected(k.error());
+  return setProperty(recv, *k, val);
+}
+
 JsResult<bool> Isolate::deletePropertyImpl(const Value& recv, SymbolId key) {
+  if (recv.isProxy()) {
+    return proxyDelete(recv, keyToValue(key));
+  }
   if (!recv.isObjectLike()) return true;  // ToObject(prim) has no such own.
   Object* obj = objectOfValue(recv);
   // Array exotic behavior: "length" is non-configurable (delete -> false);
@@ -531,7 +664,7 @@ JsResult<bool> Isolate::deletePropertyImpl(const Value& recv, SymbolId key) {
   if (obj->isArray) {
     if (key == sym_length_) return false;
     uint32_t idx = 0;
-    if (arrayIndexFromKey(symbols_.text(key), &idx)) {
+    if (!isUserSymbolId(key) && arrayIndexFromKey(symbols_.text(key), &idx)) {
       if (idx < obj->elements.size()) {
         if (obj->elements[idx].isHole()) return true;
         obj->elements[idx] = Value::hole();
@@ -555,10 +688,14 @@ JsResult<bool> Isolate::deletePropertyImpl(const Value& recv, SymbolId key) {
 }
 
 JsResult<bool> Isolate::hasPropertyImpl(const Value& recv, SymbolId key) {
+  if (recv.isProxy()) {
+    return proxyHas(recv, keyToValue(key));
+  }
   if (!recv.isObjectLike()) return false;
   Object* obj = objectOfValue(recv);
   uint32_t idx = 0;
-  const bool isIndex = arrayIndexFromKey(symbols_.text(key), &idx);
+  const bool isIndex =
+      !isUserSymbolId(key) && arrayIndexFromKey(symbols_.text(key), &idx);
   return hasAlongChain(obj, key, isIndex, idx);
 }
 
@@ -566,7 +703,24 @@ JsResult<bool> Isolate::hasPropertyImpl(const Value& recv, SymbolId key) {
 // Conversions with hooks (oracle-verified semantics)
 // ---------------------------------------------------------------------------
 JsResult<Value> Isolate::toPrimitive(const Value& v, bool hintString) {
-  if (!v.isObjectLike()) return v;  // primitives: no hooks, identity.
+  if (!v.isObjectLike() && !v.isProxy()) return v;  // primitives: identity.
+  if (v.isProxy()) {
+    // v0.3: @@toPrimitive is deferred (no well-known symbols yet); the
+    // toString/valueOf lookups run THROUGH the proxy's get trap.
+    SymbolId first = hintString ? sym_toString_ : sym_valueOf_;
+    SymbolId second = hintString ? sym_valueOf_ : sym_toString_;
+    for (SymbolId method : {first, second}) {
+      JsResult<Value> m = proxyGet(v, Value::string(
+          heap_.makeString(symbols_.text(method))));
+      if (!m) return std::unexpected(m.error());
+      if (!m->isClosure()) continue;
+      JsResult<Value> r = callValue(*m, v, nullptr, 0);
+      if (!r) return std::unexpected(r.error());
+      if (!r->isObjectLike() && !r->isProxy()) return *r;
+    }
+    return std::unexpected(typeError(
+        "Cannot convert object to primitive value"));
+  }
   // Well-known @@toPrimitive is deferred (no user Symbols in v0.1).
   SymbolId first = hintString ? sym_toString_ : sym_valueOf_;
   SymbolId second = hintString ? sym_valueOf_ : sym_toString_;
@@ -634,6 +788,13 @@ JsResult<Value> Isolate::toStringValue(const Value& v) {
       std::u16string s = v.asBigInt()->toString();
       return Value::string(heap_.makeString(s));
     }
+    case ValueKind::Symbol: {
+      // ToString(Symbol) = "Symbol(desc)" (desc may be empty).
+      std::u16string s = u"Symbol(";
+      s += v.asSymbol()->desc;
+      s += u")";
+      return Value::string(heap_.makeString(std::move(s)));
+    }
     default: {
       // ToString(Object) = ToString(ToPrimitive(value, hint string)).
       JsResult<Value> prim = toPrimitive(v, true);
@@ -691,7 +852,16 @@ JsResult<Value> Isolate::toBigIntValue(const Value& v) {
 JsResult<SymbolId> Isolate::toPropertyKey(const Value& v) {
   // Oracle-verified: property keys use ToPrimitive with hint string.
   if (v.isString()) {
-    return symbols_.intern(v.str->data);
+    // v0.3: const-pool strings carry their interned id after first use;
+    // repeated string-keyed access skips the intern hash entirely.
+    if (v.str->cachedSymbol != kInvalidSymbol) return v.str->cachedSymbol;
+    SymbolId s = symbols_.intern(v.str->data);
+    v.str->cachedSymbol = s;
+    return s;
+  }
+  if (v.isSymbol()) {
+    // v0.3: user symbols key properties directly (unique id range).
+    return v.symbolKeyId();
   }
   if (v.isObjectLike()) {
     JsResult<Value> prim = toPrimitive(v, true);
@@ -718,8 +888,8 @@ JsResult<SymbolId> Isolate::toPropertyKey(const Value& v) {
 // Arithmetic / comparison (oracle-verified edge cases)
 // ---------------------------------------------------------------------------
 JsResult<Value> Isolate::addValues(const Value& l, const Value& r,
-                                   uint32_t slot) {
-  recordBinarySite(slot, l, r);
+                                   FeedbackSlot* fs) {
+  recordBinarySite(fs, l, r);
   // BigInt + BigInt only when both are BigInt (mixing -> TypeError, Rule 72).
   if (l.isBigInt() && r.isBigInt()) {
     BigInt sum = BigInt::add(*l.asBigInt(), *r.asBigInt());
@@ -976,12 +1146,13 @@ JsResult<bool> Isolate::abstractEquals(const Value& l, const Value& r) {
     return BigInt::compare(big, *r.asBigInt()) == 0;
   }
   // Object vs primitive: ToPrimitive(object, default), then retry.
-  if (l.isObjectLike() && !r.isObjectLike()) {
+  // (v0.3: proxies participate as objects.)
+  if ((l.isObjectLike() || l.isProxy()) && !r.isObjectLike() && !r.isProxy()) {
     JsResult<Value> prim = toPrimitive(l, false);
     if (!prim) return std::unexpected(prim.error());
     return abstractEquals(*prim, r);
   }
-  if (r.isObjectLike() && !l.isObjectLike()) {
+  if ((r.isObjectLike() || r.isProxy()) && !l.isObjectLike() && !l.isProxy()) {
     JsResult<Value> prim = toPrimitive(r, false);
     if (!prim) return std::unexpected(prim.error());
     return abstractEquals(l, *prim);
@@ -990,39 +1161,64 @@ JsResult<bool> Isolate::abstractEquals(const Value& l, const Value& r) {
 }
 
 JsResult<bool> Isolate::instanceofImpl(const Value& obj, const Value& ctor) {
-  if (!ctor.isClosure()) {
+  if (!ctor.isClosure() && !ctor.isProxy()) {
     return std::unexpected(typeError(
         "Right-hand side of 'instanceof' is not callable"));
   }
-  JsResult<Value> protoVal = getProperty(ctor, sym_prototype_);
+  // v0.3: proxy constructors resolve .prototype through the get trap.
+  JsResult<Value> protoVal;
+  if (ctor.isProxy()) {
+    protoVal = proxyGet(ctor, Value::string(
+        heap_.makeString(symbols_.text(sym_prototype_))));
+  } else {
+    protoVal = getProperty(ctor, sym_prototype_);
+  }
   if (!protoVal) return std::unexpected(protoVal.error());
   if (!protoVal->isObjectLike()) {
     return std::unexpected(typeError(
         "Function has non-object prototype in instanceof check"));
   }
   Object* protoObj = objectOfValue(*protoVal);
-  if (!obj.isObjectLike()) return false;
-  Object* cur = objectOfValue(obj);
-  while (cur != nullptr) {
-    if (cur == protoObj) return true;
-    cur = protoOfObject(cur);
+  if (!obj.isObjectLike() && !obj.isProxy()) return false;
+  Value curVal = obj;
+  while (true) {
+    if (curVal.isProxy()) {
+      // [[GetPrototypeOf]] on the proxy node.
+      JsResult<Value> p = proxyGetPrototype(curVal);
+      if (!p) return std::unexpected(p.error());
+      if (p->isNull()) return false;
+      if (p->isObjectLike() && objectOfValue(*p) == protoObj) return true;
+      if (!p->isObjectLike()) return false;
+      curVal = *p;
+      continue;
+    }
+    Object* cur = objectOfValue(curVal);
+    while (cur != nullptr) {
+      if (cur == protoObj) return true;
+      cur = protoOfObject(cur);
+    }
+    return false;
   }
-  return false;
 }
 
 JsResult<Value> Isolate::constructImpl(const Value& ctor, const Value* args,
                                        uint32_t argc) {
+  if (ctor.isProxy()) {
+    // Proxy [[Construct]] (v0.3).
+    return proxyConstruct(ctor, args, argc);
+  }
   if (!ctor.isClosure()) {
     return std::unexpected(
         typeError("Class constructor is not callable"));
   }
   JsResult<Value> protoVal = getProperty(ctor, sym_prototype_);
   if (!protoVal) return std::unexpected(protoVal.error());
-  Object* obj = heap_.makeObject();
+  Object* obj = newPlainObject();
   if (protoVal->isObjectLike()) {
     obj->proto = *protoVal;
   } else {
-    obj->proto = Value::null();  // builtins deferred (bytecode_spec 11)
+    // ES: non-object constructor .prototype falls back to Object.prototype.
+    obj->proto = Value::raw(ValueKind::Object, objectPrototype_);
   }
   JsResult<Value> result =
       callValue(ctor, Value::raw(ValueKind::Object, obj), args, argc);
@@ -1032,13 +1228,155 @@ JsResult<Value> Isolate::constructImpl(const Value& ctor, const Value* args,
 }
 
 // ---------------------------------------------------------------------------
-// Feedback recording (always on; saturating — Rule 114)
+// Property descriptors (v0.3: Object builtins; reused by Proxy traps)
 // ---------------------------------------------------------------------------
-void Isolate::recordPropertySite(uint32_t slot, const Value& recv) {
-  if (slot == kNoFeedbackSlot) return;
-  FeedbackSlot& s = feedback_[module_->functions.empty()
-                                  ? 0
-                                  : frameStack_.back()->fn->index][slot];
+JsResult<bool> Isolate::definePropertyDescriptor(Object* obj, SymbolId key,
+                                                 const PropertyDescriptor& d) {
+  LookupResult existing = lookupOwnProperty(obj, key);
+  if (!obj->extensible && !existing.found) {
+    return std::unexpected(typeError(
+        "Cannot define property '" + utf16ToUtf8(symbols_.text(key)) +
+        "': object is not extensible"));
+  }
+  // Array exotica first (length / element keys never reach the shape tree).
+  if (obj->isArray) {
+    if (key == sym_length_) {
+      if (d.isAccessor()) {
+        return std::unexpected(
+            typeError("Array length must be a data property"));
+      }
+      return arraySetLength(obj, d.hasValue ? d.value : Value::undefined());
+    }
+    uint32_t idx = 0;
+    if (arrayIndexFromKey(symbols_.text(key), &idx)) {
+      if (d.isAccessor()) {
+        return std::unexpected(typeError(
+            "Cannot define an accessor property for an array index"));
+      }
+      if (!obj->extensible && !arrayHasOwnElement(obj, idx)) {
+        return std::unexpected(typeError(
+            "Cannot add element '" + utf16ToUtf8(symbols_.text(key)) +
+            "': array is not extensible"));
+      }
+      if (d.hasValue) return setArrayElement(obj, idx, d.value);
+      return true;
+    }
+  }
+  // Named property. Attribute mapping per ES defaults (absent -> false).
+  PropertyAttrs attrs;
+  if (d.enumerable) attrs.add(PropAttr::Enumerable);
+  if (d.configurable) attrs.add(PropAttr::Configurable);
+  if (d.isAccessor()) {
+    attrs.add(PropAttr::IsAccessor);
+    AccessorPair* pair = heap_.makeAccessor();
+    pair->getter = d.getter;
+    pair->setter = d.setter;
+    // Replace-in-place when an accessor already occupies the slot with the
+    // same enumerability/configurability (no shape change needed).
+    if (existing.found && existing.accessor != nullptr) {
+      PropertyAttrs oldAttrs;
+      int32_t slot = ownDataSlotAttrs(obj, key, &oldAttrs);
+      (void)slot;
+      // Accessor slots cannot be probed via ownDataSlotAttrs (it rejects
+      // accessors); the pair is overwritten through the existing slot.
+      if (existing.dataSlot == nullptr && existing.accessor != nullptr) {
+        Shape* s = obj->shape;
+        while (s != nullptr && s->key != key) s = s->parent;
+        if (s != nullptr &&
+            (s->attrs.raw() & ~static_cast<uint8_t>(PropAttr::IsAccessor)) ==
+                (attrs.raw() & ~static_cast<uint8_t>(PropAttr::IsAccessor))) {
+          *existing.accessor = *pair;
+          return true;
+        }
+      }
+    }
+    Shape* from = obj->shape != nullptr ? obj->shape : shapes_.root();
+    obj->shape = shapes_.transition(from, key, attrs);
+    obj->slots.push_back(Value::raw(ValueKind::Accessor, pair));
+    return true;
+  }
+  // Data property.
+  if (d.writable) attrs.add(PropAttr::Writable);
+  if (existing.found && existing.dataSlot != nullptr) {
+    PropertyAttrs oldAttrs;
+    int32_t slot = ownDataSlotAttrs(obj, key, &oldAttrs);
+    if (slot >= 0 && oldAttrs.raw() == attrs.raw()) {
+      if (!attrs.has(PropAttr::Writable) && d.hasValue &&
+          !pure::sameValue(*existing.dataSlot, d.value)) {
+        return std::unexpected(typeError(
+            "Cannot redefine non-writable property '" +
+            utf16ToUtf8(symbols_.text(key)) + "' with a different value"));
+      }
+      if (attrs.has(PropAttr::Writable)) {
+        *existing.dataSlot = d.hasValue ? d.value : Value::undefined();
+        return true;
+      }
+    }
+  }
+  if (!attrs.has(PropAttr::Writable)) {
+    // v0.3 store model: non-writable data properties are supported only via
+    // the setAlongChain TypeError path; defining them fresh is allowed and
+    // stores through ICs are guarded by installPropertyIc's writable check.
+  }
+  Shape* from = obj->shape != nullptr ? obj->shape : shapes_.root();
+  obj->shape = shapes_.transition(from, key, attrs);
+  obj->slots.push_back(d.hasValue ? d.value : Value::undefined());
+  return true;
+}
+
+JsResult<Value> Isolate::getOwnPropertyDescriptorValue(Object* obj,
+                                                       SymbolId key) {
+  if (obj->isArray) {
+    if (key == sym_length_) {
+      PropertyDescriptor d;
+      d.hasValue = d.hasWritable = d.hasEnumerable = d.hasConfigurable = true;
+      d.value = arrayLengthValue(obj);
+      d.writable = true;
+      d.enumerable = false;
+      d.configurable = false;  // exotic length (never deletable)
+      return Value::raw(ValueKind::Object, makeDescriptorObject(*this, d));
+    }
+    uint32_t idx = 0;
+    if (arrayIndexFromKey(symbols_.text(key), &idx)) {
+      Value v = ownElementValue(obj, idx);
+      if (v.isHole()) return Value::undefined();
+      PropertyDescriptor d;
+      d.hasValue = d.hasWritable = d.hasEnumerable = d.hasConfigurable = true;
+      d.value = v;
+      d.writable = d.enumerable = d.configurable = true;
+      return Value::raw(ValueKind::Object, makeDescriptorObject(*this, d));
+    }
+  }
+  LookupResult own = lookupOwnProperty(obj, key);
+  if (!own.found) return Value::undefined();
+  Shape* s = obj->shape;
+  while (s != nullptr && s->key != key) s = s->parent;
+  PropertyAttrs a = s != nullptr ? s->attrs : PropertyAttrs();
+  PropertyDescriptor d;
+  d.hasEnumerable = d.hasConfigurable = true;
+  d.enumerable = a.has(PropAttr::Enumerable);
+  d.configurable = a.has(PropAttr::Configurable);
+  if (own.accessor != nullptr) {
+    d.hasGet = d.hasSet = true;
+    d.getter = own.accessor->getter;
+    d.setter = own.accessor->setter;
+  } else {
+    d.hasValue = d.hasWritable = true;
+    d.value = *own.dataSlot;
+    d.writable = a.has(PropAttr::Writable);
+  }
+  return Value::raw(ValueKind::Object, makeDescriptorObject(*this, d));
+}
+
+// ---------------------------------------------------------------------------
+// Feedback recording (saturating — Rule 114). v0.3: recording operates on
+// resolved FeedbackSlot pointers provided by the dispatch handlers (no
+// per-op frameStack/vector re-derivation); a site is skipped entirely when
+// the slot pointer is null (no feedback vector, or --no-record measurement
+// mode, benchmarks_v0.2.md Section 5 #2).
+// ---------------------------------------------------------------------------
+void Isolate::recordPropertySite(FeedbackSlot* s, const Value& recv) {
+  if (s == nullptr) return;
   uint32_t shapeId = 0;  // 0 reserved for non-object receivers
   if (recv.isObjectLike()) {
     Shape* sh = objectOfValue(recv)->shape;
@@ -1046,27 +1384,24 @@ void Isolate::recordPropertySite(uint32_t slot, const Value& recv) {
     // they share the reserved 0 bucket with primitives (deterministic).
     shapeId = sh != nullptr ? sh->id : 0;
   }
-  s.propertyHits++;
-  for (uint32_t i = 0; i < s.distinctShapes; i++) {
-    if (s.shapeIds[i] == shapeId) {
-      if (s.shapeCounts[i] < UINT32_MAX) s.shapeCounts[i]++;
+  s->propertyHits++;
+  for (uint32_t i = 0; i < s->distinctShapes; i++) {
+    if (s->shapeIds[i] == shapeId) {
+      if (s->shapeCounts[i] < UINT32_MAX) s->shapeCounts[i]++;
       return;
     }
   }
-  if (s.distinctShapes < kMegamorphicThreshold) {
-    s.shapeIds[s.distinctShapes] = shapeId;
-    s.shapeCounts[s.distinctShapes] = 1;
-    s.distinctShapes++;
+  if (s->distinctShapes < kMegamorphicThreshold) {
+    s->shapeIds[s->distinctShapes] = shapeId;
+    s->shapeCounts[s->distinctShapes] = 1;
+    s->distinctShapes++;
   } else {
-    s.distinctShapes = kMegamorphicThreshold;  // stays megamorphic
+    s->distinctShapes = kMegamorphicThreshold;  // stays megamorphic
   }
 }
 
-void Isolate::recordElementSite(uint32_t slot, const Value& recv) {
-  if (slot == kNoFeedbackSlot) return;
-  FeedbackSlot& s = feedback_[module_->functions.empty()
-                                  ? 0
-                                  : frameStack_.back()->fn->index][slot];
+void Isolate::recordElementSite(FeedbackSlot* s, const Value& recv) {
+  if (s == nullptr) return;
   // Element-kind identity: 0 = non-array receiver; 1..6 = ElementsKind+1 of
   // an array receiver (deterministic; saturating buckets as Property sites).
   uint32_t kindId = 0;
@@ -1076,25 +1411,24 @@ void Isolate::recordElementSite(uint32_t slot, const Value& recv) {
       kindId = static_cast<uint32_t>(obj->elementsKind) + 1;
     }
   }
-  s.propertyHits++;
-  for (uint32_t i = 0; i < s.distinctShapes; i++) {
-    if (s.shapeIds[i] == kindId) {
-      if (s.shapeCounts[i] < UINT32_MAX) s.shapeCounts[i]++;
+  s->propertyHits++;
+  for (uint32_t i = 0; i < s->distinctShapes; i++) {
+    if (s->shapeIds[i] == kindId) {
+      if (s->shapeCounts[i] < UINT32_MAX) s->shapeCounts[i]++;
       return;
     }
   }
-  if (s.distinctShapes < kMegamorphicThreshold) {
-    s.shapeIds[s.distinctShapes] = kindId;
-    s.shapeCounts[s.distinctShapes] = 1;
-    s.distinctShapes++;
+  if (s->distinctShapes < kMegamorphicThreshold) {
+    s->shapeIds[s->distinctShapes] = kindId;
+    s->shapeCounts[s->distinctShapes] = 1;
+    s->distinctShapes++;
   } else {
-    s.distinctShapes = kMegamorphicThreshold;  // stays megamorphic
+    s->distinctShapes = kMegamorphicThreshold;  // stays megamorphic
   }
 }
 
-void Isolate::recordBinarySite(uint32_t slot, const Value& l, const Value& r) {
-  if (slot == kNoFeedbackSlot) return;
-  FeedbackSlot& s = feedback_[frameStack_.back()->fn->index][slot];
+void Isolate::recordBinarySite(FeedbackSlot* s, const Value& l, const Value& r) {
+  if (s == nullptr) return;
   auto classify = [](const Value& v) -> uint32_t {
     switch (v.kind) {
       case ValueKind::Smi: return static_cast<uint32_t>(ValueClass::Smi);
@@ -1111,50 +1445,116 @@ void Isolate::recordBinarySite(uint32_t slot, const Value& l, const Value& r) {
         return static_cast<uint32_t>(ValueClass::Other);
     }
   };
-  if (s.classCounts[0] < UINT32_MAX) {
-    s.classCounts[classify(l)]++;
-    s.classCounts[classify(r)]++;
+  if (s->classCounts[0] < UINT32_MAX) {
+    s->classCounts[classify(l)]++;
+    s->classCounts[classify(r)]++;
   }
 }
 
-void Isolate::recordBranchSite(uint32_t slot, bool taken) {
-  if (slot == kNoFeedbackSlot) return;
-  FeedbackSlot& s = feedback_[frameStack_.back()->fn->index][slot];
+void Isolate::recordBranchSite(FeedbackSlot* s, bool taken) {
+  if (s == nullptr) return;
   if (taken) {
-    if (s.takenCount < UINT32_MAX) s.takenCount++;
+    if (s->takenCount < UINT32_MAX) s->takenCount++;
   } else {
-    if (s.notTakenCount < UINT32_MAX) s.notTakenCount++;
+    if (s->notTakenCount < UINT32_MAX) s->notTakenCount++;
   }
 }
 
-void Isolate::recordCallSite(uint32_t slot, const Value& callee) {
-  if (slot == kNoFeedbackSlot) return;
-  FeedbackSlot& s = feedback_[frameStack_.back()->fn->index][slot];
-  if (s.callCount < UINT32_MAX) s.callCount++;
+void Isolate::recordCallSite(FeedbackSlot* s, const Value& callee) {
+  if (s == nullptr) return;
+  if (s->callCount < UINT32_MAX) s->callCount++;
   int32_t funcIdx = -1;
   if (callee.isClosure()) {
     const Closure* cl = static_cast<const Closure*>(callee.ptr);
     if (cl->funcIndex < kNativeFuncIndexBase) funcIdx = static_cast<int32_t>(cl->funcIndex);
   }
   if (funcIdx < 0) {
-    if (s.unknownCallees < UINT32_MAX) s.unknownCallees++;
+    if (s->unknownCallees < UINT32_MAX) s->unknownCallees++;
     return;
   }
   for (uint32_t i = 0; i < kCallProfileRing; i++) {
-    if (s.callees[i] == funcIdx) {
-      if (s.calleeCounts[i] < UINT32_MAX) s.calleeCounts[i]++;
+    if (s->callees[i] == funcIdx) {
+      if (s->calleeCounts[i] < UINT32_MAX) s->calleeCounts[i]++;
       return;
     }
   }
   for (uint32_t i = 0; i < kCallProfileRing; i++) {
-    if (s.callees[i] == -1) {
-      s.callees[i] = funcIdx;
-      s.calleeCounts[i] = 1;
+    if (s->callees[i] == -1) {
+      s->callees[i] = funcIdx;
+      s->calleeCounts[i] = 1;
       return;
     }
   }
   // Ring full: fold into unknown (least-significant signal).
-  if (s.unknownCallees < UINT32_MAX) s.unknownCallees++;
+  if (s->unknownCallees < UINT32_MAX) s->unknownCallees++;
+}
+
+void Isolate::installPropertyIc(FeedbackSlot* s, Object* obj, SymbolId key) {
+  if (s == nullptr || obj == nullptr || obj->shape == nullptr) return;
+  PropertyAttrs attrs;
+  int32_t slot = ownDataSlotAttrs(obj, key, &attrs);
+  if (slot < 0) return;  // accessor, deleted, or absent: no IC
+  if (!attrs.has(PropAttr::Writable)) return;  // read-only: never IC-store
+  s->icShape = obj->shape->id;
+  s->icSlot = static_cast<uint32_t>(slot);
+  s->icAttrs = attrs.raw();
+}
+
+bool Isolate::chainHasAccessor(Object* obj, SymbolId key) const {
+  for (Object* p = protoOfObject(obj); p != nullptr; p = protoOfObject(p)) {
+    LookupResult r = lookupOwnProperty(p, key);
+    if (r.found && r.accessor != nullptr) return true;
+  }
+  return false;
+}
+
+// Own string/symbol keys as VALUES, ES order (indices ascending, then named
+// insertion order); user symbols come back as Symbol values. Used by the
+// Object builtins and the Proxy ownKeys forwarding/invariants.
+std::vector<Value> Isolate::ownKeysValues(Object* obj, bool includeLength) {
+  std::vector<Value> out;
+  auto pushKey = [&](SymbolId id) {
+    if (isUserSymbolId(id)) {
+      size_t idx = static_cast<size_t>(id - kUserSymbolBase);
+      if (idx < userSymbols_.size()) {
+        out.push_back(Value::raw(ValueKind::Symbol, userSymbols_[idx]));
+        return;
+      }
+    }
+    out.push_back(Value::string(heap_.makeString(symbols_.text(id))));
+  };
+  if (obj->isArray) {
+    const uint32_t len = obj->length;
+    for (uint32_t i = 0; i < len && i < obj->elements.size(); i++) {
+      if (!obj->elements[i].isHole()) pushKey(internIndexKey(i));
+    }
+    for (const auto& kv : obj->sparse) {
+      if (kv.first < len) pushKey(internIndexKey(kv.first));
+    }
+    if (includeLength) pushKey(sym_length_);
+  }
+  std::vector<SymbolId> named;
+  for (Shape* s = obj->shape; s != nullptr && s->key != kInvalidSymbol;
+       s = s->parent) {
+    if (!obj->slots[s->slot].isHole()) named.push_back(s->key);
+  }
+  for (size_t i = named.size(); i-- > 0;) {
+    bool dup = false;
+    for (const Value& already : out) {
+      if (already.isString() && !isUserSymbolId(named[i]) &&
+          already.str->data == symbols_.text(named[i])) {
+        dup = true;
+        break;
+      }
+      if (already.isSymbol() && isUserSymbolId(named[i]) &&
+          already.asSymbol()->uniqueId + kUserSymbolBase == named[i]) {
+        dup = true;
+        break;
+      }
+    }
+    if (!dup) pushKey(named[i]);
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------

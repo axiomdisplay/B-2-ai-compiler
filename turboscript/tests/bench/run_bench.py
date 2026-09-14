@@ -35,6 +35,7 @@ BENCHES = [
     ("string_concat", "20k x (40-char build + number->string concat)"),
     ("object_fields", "1M x (new object, 3 shape stores, 3 IC loads)"),
     ("array_loop",    "300-elem smi array, 3k sum passes (900k loads)"),
+    ("array_builtins","100k push + map/reduce/filter (300k callbacks)"),
 ]
 
 

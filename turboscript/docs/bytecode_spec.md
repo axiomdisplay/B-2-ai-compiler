@@ -1,14 +1,24 @@
-# TurboScript Bytecode Specification (TSBC v0.2)
+# TurboScript Bytecode Specification (TSBC v0.3)
 
-**Status:** Draft v0.2 — implemented by the T0 interpreter (`compiler/interp/`)
+**Status:** Draft v0.3 — implemented by the T0 interpreter (`compiler/interp/`)
 **Owner:** TurboScript Interp Team
 **Last Updated:** 2026-09-14
-**Governing Laws:** `docs/laws/turboscript_compiler_laws.md` (Part 0, Part I Tier 0, Rules 15, 16, 23, 32, 33, 47, 90, 96, 105, 124)
+**Governing Laws:** `docs/laws/turboscript_compiler_laws.md` (Part 0, Part I Tier 0, Rules 15, 16, 23, 32, 33, 47, 70, 90, 96, 105, 124)
 **Related:** `docs/laws/turboscript_master_architecture_spec.md` (Section 2 node taxonomy), `interp_contract.md`
 
 **v0.2 changes:** arrays are first-class (Section 5.12: `NewArray`,
 `GetElement`, `SetElement`), the feedback vector gains the Element slot kind
 (Section 8), and the Section 11 register marks arrays implemented.
+
+**v0.3 changes:** (1) `LoadGlobal`/`StoreGlobal` own Property-kind feedback
+slots and the runtime gains the monomorphic IC layer (Section 8.1: shape IC
++ shape-transition IC); (2) the builtins layer ships — standard prototype
+wiring (Object/Function/Array.prototype), Array.prototype methods, and the
+Object/Array/Symbol/Proxy namespaces (Section 11 register); (3) the value
+model gains user Symbols (unique-id property keys) and the Proxy exotic
+object with all 13 trap internal methods (interp_contract.md 3); (4) the
+section 11 register moves builtins/Proxy/symbols to "implemented" and
+dates generators/sloppy mode to v0.4 with reasons.
 
 This document defines the TurboScript Bytecode (TSBC) format: a typed,
 register-based, effect-carrying bytecode that can be validated (this spec +
@@ -327,7 +337,7 @@ Slots are typed:
 
 | Slot kind | Owner opcodes | Recorded data |
 |---|---|---|
-| Property | GetProperty, SetProperty | Up to 4 seen shapes with hit counts; megamorphic flag after the 5th distinct shape. |
+| Property | GetProperty, SetProperty, LoadGlobal (v0.3), StoreGlobal (v0.3) | Up to 4 seen shapes with hit counts; megamorphic flag after the 5th distinct shape. |
 | Element | GetElement, SetElement | Up to 4 seen element-kind identities (0 = non-array receiver, 1..6 = elements kind + 1) with hit counts; megamorphic flag after the 5th. |
 | Binary | All arithmetic/bitwise/comparison IC ops | Type histogram: Smi / HeapNumber / String / BigInt / Object / Other counts (8 counters). |
 | Branch | JmpTrue, JmpFalse | Taken / not-taken counts (branch probabilities). |
@@ -336,6 +346,32 @@ Slots are typed:
 Feedback is deterministic given the same input program (Rule 124) and is
 dumpable via `tsrun --dump-feedback`. Counters are saturating (Rule 114
 applied: no overflow UB).
+
+### 8.1 Inline Caches (v0.3)
+
+Each Property/Element feedback slot carries, alongside the profile
+counters, monomorphic IC state consumed by the dispatch handlers:
+
+- **Shape IC** (load/store sites): `(icShape, icSlot, icAttrs)`. When the
+  receiver's shape id matches `icShape`, the property is a receiver-own,
+  non-hole, non-accessor DATA property, and the store path's attribute is
+  writable, the handler reads/writes `holder->slots[icSlot]` directly.
+  Guards re-verified per hit; any mismatch falls to the semantic path
+  (Rule 96: the IC can only accelerate, never change, semantics).
+- **Shape-transition IC** (SetProperty): `(icTransFrom, icTransTo,
+  icTransKey)`. When the receiver's shape is exactly `icTransFrom` and the
+  key matches, the store is a fresh own property appending slot
+  `icTransTo->slot`; installed only after a genuine single transition and
+  re-guarded per hit by extensibility and a prototype-chain accessor scan
+  (Rule 81: proto mutation must not be observable through a stale IC).
+- **Global IC**: LoadGlobal/StoreGlobal IC on the global object's shape.
+  Shape identity changes (DefineGlobalVar, delete) invalidate by id
+  mismatch; a deleted (hole) slot falls through to the semantic path.
+
+The recording tax of this layer was measured (benchmarks_v0.3.md Section
+4): below 15% everywhere, net negative where ICs compensate; recording is
+always-on per Part I Tier 0. `tsrun --no-record` is a measurement toggle
+only, not an operating mode.
 
 ## 9. Validation Rules (the Verifier)
 
@@ -398,13 +434,13 @@ hint)`.
 | Feature | State | Owner | Target |
 |---|---|---|---|
 | Arrays (elements kinds, length exotic behavior) | **Implemented v0.2** (Section 5.12; dense tagged backend with enforced kind invariants + sparse map beyond 2^20) | Interp team | done |
-| Array.prototype builtins (join/push/pop/slice/...) | Deferred; arrays exist but carry no methods | Interp team | v0.3 |
-| Proxy (13 traps) | Deferred; semantics ordinary-object | Interp team | v0.3 |
-| Generators / async (suspension) | Deferred; no suspend opcodes yet | Interp team | v0.3 |
-| Sloppy mode (mapped arguments, with) | Strict-mode semantics only | Interp team | v0.3 |
+| Prototype layer + builtins | **Implemented v0.3** (ts_builtins.cpp): Object/Function/Array.prototype wiring; 13 Array.prototype methods (push/pop/shift/unshift/join/indexOf/includes/slice/concat/forEach/map/filter/reduce); Object.prototype toString/valueOf/hasOwnProperty; Object namespace (keys, getOwnPropertyNames, getOwnPropertyDescriptor, defineProperty, isExtensible, preventExtensions); Array.isArray. Object/Array namespaces are plain objects, not callable (registered divergence) | Interp team | done |
+| Proxy (13 traps) | **Implemented v0.3** (ts_proxy.cpp): all 13 internal methods per ES ch. 10.5 with target-side invariants (get/set/has/deleteProperty/gOPD/ownKeys/getPrototypeOf/setPrototypeOf/isExtensible/preventExtensions/defineProperty/apply/construct); exposed via `Proxy(target, handler)` native. Well-known-symbol integration (@@toPrimitive on proxies) deferred with symbols below | Interp team | done |
+| User symbols | **Implemented v0.3**: `Symbol(desc)`, `Symbol.for`, `keyFor`, symbol-keyed properties via the unique-id key range (ts_core.h kUserSymbolBase), typeof/ToString integration. Well-known symbols (@@iterator/@@toPrimitive/@@species/@@hasInstance) deferred with the iterator protocol | Interp team | done (well-known: v0.4) |
+| Generators / async (suspension) | Deferred v0.3 -> v0.4: suspension requires new opcodes (Suspend/Resume + generator object kind) designed together with the frontend and Tier 2 FrameState integration; shipping a partial protocol would violate Rule 70/96 | Interp team + Frontend team | v0.4 |
+| Sloppy mode (mapped arguments, with) | Deferred v0.3 -> v0.4: requires frontend-level constructs (with-scope opcode, arguments materialization opcode) that do not exist in TSBC; the Function-level sloppy flag lands with them | Frontend team | v0.4 |
 | GC (heap is arena-owned, non-collecting) | Deferred | GC team | v0.4 |
-| Symbol literals / well-known symbols from user code | Deferred | Frontend team | v0.3 |
-| eval / Function constructor | Not representable in v0.2 bytecode | Frontend team | v0.4 |
+| eval / Function constructor | Not representable in v0.2/v0.3 bytecode | Frontend team | v0.4 |
 
 Every divergence above is tracked, owned, and expiry-dated per Rule 143;
 none silently changes observable semantics of the features that ARE

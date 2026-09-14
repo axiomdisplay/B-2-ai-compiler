@@ -24,6 +24,21 @@ struct FeedbackSlot {
   uint32_t shapeCounts[kMegamorphicThreshold] = {0, 0, 0, 0};
   uint32_t distinctShapes = 0;
   uint32_t propertyHits = 0;
+  // Monomorphic IC (v0.3, bytecode_spec.md 8.1): valid when icShape is a
+  // concrete shape id (shape ids start at 1; 0 = no IC installed) and the
+  // receiver's shape id matches. icSlot indexes holder->slots; icAttrs is
+  // the cached property's attribute byte (accessor sites never install).
+  uint32_t icShape = 0;
+  uint32_t icSlot = 0;
+  uint8_t icAttrs = 0;
+  // Shape-transition IC (v0.3, store sites): when the receiver's shape is
+  // exactly icTransFrom and the key matches, the store is a fresh own
+  // property whose transition result is icTransTo (verified when installed:
+  // no accessor anywhere on the prototype chain claims the key). Shape
+  // pointers are stable (deque-backed, ts_object.h).
+  Shape* icTransFrom = nullptr;
+  Shape* icTransTo = nullptr;
+  uint32_t icTransKey = 0;  // SymbolId of the transition key
   // Binary: per-class histogram (left and right operands both counted).
   uint32_t classCounts[8] = {0, 0, 0, 0, 0, 0, 0, 0};
   // Branch.
@@ -45,6 +60,31 @@ enum class ValueClass : uint8_t {
   Object = 4,  // includes closures
   Other = 5,   // undefined/null/bool
 };
+
+// Property descriptor (v0.3: Object.defineProperty /
+// getOwnPropertyDescriptor; reused by the Proxy trap protocol). Field
+// presence flags follow ES: absent fields take their default (value
+// undefined; writable/enumerable/configurable false).
+struct PropertyDescriptor {
+  bool hasValue = false;
+  bool hasWritable = false;
+  bool hasEnumerable = false;
+  bool hasConfigurable = false;
+  bool hasGet = false;
+  bool hasSet = false;
+  Value value;
+  bool writable = false;
+  bool enumerable = false;
+  bool configurable = false;
+  Value getter = Value::undefined();
+  Value setter = Value::undefined();
+  [[nodiscard]] bool isAccessor() const { return hasGet || hasSet; }
+};
+
+// Descriptor materializer (ts_builtins.cpp): fresh plain object with the
+// ES descriptor fields.
+[[nodiscard]] Object* makeDescriptorObject(Isolate& iso,
+                                           const PropertyDescriptor& d);
 
 struct Frame {
   const Function* fn = nullptr;
@@ -107,6 +147,19 @@ class Isolate {
   [[nodiscard]] JsResult<bool> hasPropertyImpl(const Value& recv,
                                                SymbolId key);
 
+  // ---- Element access keyed by VALUE (v0.3 fast path, Rule 96). ----
+  // Identical semantics to toPropertyKey(key) + getProperty/setProperty;
+  // canonical Smi keys on array-index receivers hit element storage without
+  // interning a fresh key string per access.
+  [[nodiscard]] JsResult<Value> getElementValue(const Value& recv,
+                                                const Value& key);
+  [[nodiscard]] JsResult<bool> setElementValue(const Value& recv,
+                                               const Value& key,
+                                               const Value& val);
+  // Interned canonical decimal text of an index, cached for hot indices
+  // (Rule 16: one interned symbol per distinct text; Rule 23: bounded).
+  [[nodiscard]] SymbolId cachedIndexSymbol(uint32_t idx);
+
   // ---- Array operations (v0.2: bytecode_spec.md Section 5.12). ----
   // Exotic "length" as a Number (Smi when it fits, HeapNumber above 2^31-1).
   [[nodiscard]] Value arrayLengthValue(const Object* arr) const;
@@ -120,6 +173,78 @@ class Isolate {
   [[nodiscard]] SymbolId internIndexKey(uint32_t idx);
   [[nodiscard]] SymbolId lengthSymbol() const { return sym_length_; }
 
+  // ---- Builtins (v0.3: bytecode_spec.md Section 11 — prototype layer). ----
+  // Standard prototype objects, wired at Isolate construction:
+  //   Object.prototype  <- Function.prototype, Array.prototype
+  // Fresh plain objects chain to Object.prototype; arrays to Array.prototype;
+  // closures' function objects to Function.prototype (and their .prototype
+  // instances to Object.prototype).
+  [[nodiscard]] Object* objectPrototype() const { return objectPrototype_; }
+  [[nodiscard]] Object* functionPrototype() const { return functionPrototype_; }
+  [[nodiscard]] Object* arrayPrototype() const { return arrayPrototype_; }
+  // Attach a native builtin as a data property of `holder` (used for the
+  // prototype objects and the Object/Array global namespaces). Returns the
+  // native's closure (namespaces like Symbol attach sub-natives to it).
+  Closure* defineNativeOn(Object* holder, const char* name, NativeFn fn);
+  // Construct-time wiring (called by the Isolate constructor).
+  void installStandardPrototypes();
+  // Fresh plain object with the standard prototype (NewObject/Construct).
+  [[nodiscard]] Object* newPlainObject();
+  // ---- Descriptors (v0.3: Object builtins; Proxy trap protocol). ----
+  [[nodiscard]] JsResult<bool> definePropertyDescriptor(
+      Object* obj, SymbolId key, const PropertyDescriptor& d);
+  // Own-property descriptor value (a fresh descriptor object, or undefined
+  // when absent). Arrays consult the exotic length/element machinery.
+  [[nodiscard]] JsResult<Value> getOwnPropertyDescriptorValue(
+      Object* obj, SymbolId key);
+  // Own string/symbol keys as VALUES in ES order (indices ascending, then
+  // named insertion order); user symbols come back as Symbol values.
+  [[nodiscard]] std::vector<Value> ownKeysValues(Object* obj,
+                                                 bool includeLength);
+
+  // ---- Symbols (v0.3). ----
+  // Create a fresh unique symbol; registry for Symbol.for / keyFor.
+  [[nodiscard]] Value makeSymbolValue(std::u16string desc);
+  [[nodiscard]] SymbolObj* symbolForRegistry(const std::u16string& key) const;
+  void symbolForRegister(const std::u16string& key, SymbolObj* sym);
+  // Key text (error messages): interned text for string keys, the symbol
+  // description for user-symbol keys (never touches symbols_.text OOB).
+  [[nodiscard]] std::u16string keyText(SymbolId key) const;
+  // Re-widen an interned key id to its KEY VALUE (string or Symbol) for
+  // the trap argument tuples.
+  [[nodiscard]] Value keyToValue(SymbolId key);
+
+  // ---- Proxy: the 13 internal methods (ES ch. 10.5), ts_proxy.cpp. ----
+  [[nodiscard]] JsResult<Value> proxyGet(Value proxy, const Value& key);
+  [[nodiscard]] JsResult<bool> proxySet(Value proxy, const Value& key,
+                                        const Value& val);
+  [[nodiscard]] JsResult<bool> proxyHas(Value proxy, const Value& key);
+  [[nodiscard]] JsResult<bool> proxyDelete(Value proxy, const Value& key);
+  [[nodiscard]] JsResult<Value> proxyGetPrototype(Value proxy);
+  [[nodiscard]] JsResult<bool> proxySetPrototype(Value proxy,
+                                                 const Value& proto);
+  [[nodiscard]] JsResult<Value> proxyGetOwnPropertyDescriptor(
+      Value proxy, const Value& key);
+  [[nodiscard]] JsResult<bool> proxyDefineOwnProperty(
+      Value proxy, const Value& key, const PropertyDescriptor& d);
+  [[nodiscard]] JsResult<bool> proxyIsExtensible(Value proxy);
+  [[nodiscard]] JsResult<bool> proxyPreventExtensions(Value proxy);
+  [[nodiscard]] JsResult<std::vector<Value>> proxyOwnKeys(Value proxy);
+  [[nodiscard]] JsResult<Value> proxyApply(Value proxy, Value thisVal,
+                                           const Value* args, uint32_t argc);
+  [[nodiscard]] JsResult<Value> proxyConstruct(Value proxy, const Value* args,
+                                               uint32_t argc);
+  // Trap resolution shared by the methods above (GetMethod semantics).
+  [[nodiscard]] JsResult<Value> proxyTrap(Object* handler, const char* name);
+  // ---- Array element helpers (public in v0.3: the builtins layer
+  // (ts_builtins.cpp) composes them). ----
+  [[nodiscard]] bool arrayHasOwnElement(const Object* arr, uint32_t idx) const;
+  // Own element value or Hole when absent (never walks the chain).
+  [[nodiscard]] Value ownElementValue(const Object* arr, uint32_t idx) const;
+  // Raise the storage kind so `val` satisfies the kind invariant; creates no
+  // holes (widenFor layout contract in ts_object.h).
+  void widenElementsFor(Object* arr, const Value& val) const;
+
   // ---- Call machinery. ----
   [[nodiscard]] JsResult<Value> callValue(const Value& callee, Value thisVal,
                                           const Value* args, uint32_t argc);
@@ -129,7 +254,7 @@ class Isolate {
 
   // ---- Semantic helpers used by opcode handlers (ts_dispatch.cpp). ----
   [[nodiscard]] JsResult<Value> addValues(const Value& l, const Value& r,
-                                          uint32_t slot);
+                                          FeedbackSlot* fs);
   [[nodiscard]] JsResult<Value> arithValues(const Value& l, const Value& r,
                                             Opcode op);
   // Bitwise family under ToInt32/ToUint32 (Rule 72); BigInt -> TypeError.
@@ -162,8 +287,15 @@ class Isolate {
   [[nodiscard]] std::u16string formatUncaught(const Value& thrown) const;
 
   void setCountOpcodes(bool on) { countOpcodes_ = on; }
+  // Measurement toggle (benchmarks_v0.2.md Section 5 #2): disables feedback
+  // recording to quantify the recording tax. Not a semantic mode (Rule 124:
+  // deterministic either way); driver flag `--no-record`.
+  void setRecordFeedback(bool on) { recordFeedback_ = on; }
 
   [[nodiscard]] SymbolTable& symbols() { return symbols_; }
+  // Access the current top frame's function index (used by error paths that
+  // must attribute diagnostics; dispatch uses resolved pointers instead).
+  [[nodiscard]] bool recordFeedbackEnabled() const { return recordFeedback_; }
   [[nodiscard]] Heap& heap() { return heap_; }
   [[nodiscard]] ShapeTree& shapes() { return shapes_; }
   [[nodiscard]] Object* globalObject() { return global_; }
@@ -193,13 +325,6 @@ class Isolate {
   [[nodiscard]] JsException makeError(const char* name,
                                       const std::string& message);
 
-  // Array element helpers (ts_interpreter.cpp).
-  [[nodiscard]] bool arrayHasOwnElement(const Object* arr, uint32_t idx) const;
-  // Own element value or Hole when absent (never walks the chain).
-  [[nodiscard]] Value ownElementValue(const Object* arr, uint32_t idx) const;
-  // Raise the storage kind so `val` satisfies the kind invariant; creates no
-  // holes (widenFor layout contract in ts_object.h).
-  void widenElementsFor(Object* arr, const Value& val) const;
   [[nodiscard]] JsResult<Value> getAlongChain(Object* start,
                                               const Value& recv,
                                               SymbolId key, bool isIndex,
@@ -210,16 +335,30 @@ class Isolate {
   [[nodiscard]] bool hasAlongChain(Object* start, SymbolId key, bool isIndex,
                                    uint32_t idx);
 
-  void recordPropertySite(uint32_t slot, const Value& recv);
-  void recordElementSite(uint32_t slot, const Value& recv);
-  void recordBinarySite(uint32_t slot, const Value& l, const Value& r);
-  void recordBranchSite(uint32_t slot, bool taken);
-  void recordCallSite(uint32_t slot, const Value& callee);
+  // Feedback recording takes the resolved slot pointer directly (v0.3: the
+  // dispatch handlers hold `fb` + slotOfPc; re-deriving frameStack_.back()
+  // per recorded op is measurable overhead).
+  static void recordPropertySite(FeedbackSlot* s, const Value& recv);
+  static void recordElementSite(FeedbackSlot* s, const Value& recv);
+  static void recordBinarySite(FeedbackSlot* s, const Value& l,
+                               const Value& r);
+  static void recordBranchSite(FeedbackSlot* s, bool taken);
+  static void recordCallSite(FeedbackSlot* s, const Value& callee);
+  // Monomorphic IC installation (v0.3). Installs only when the property is
+  // an own DATA property of `obj` with a published shape; accessors, holes
+  // and shapeless fresh objects never install (conservative).
+  static void installPropertyIc(FeedbackSlot* s, Object* obj, SymbolId key);
+  // True when a prototype-chain node of `obj` exposes an ACCESSOR named
+  // `key` (data properties do not block define-fresh-own; accessors do).
+  [[nodiscard]] bool chainHasAccessor(Object* obj, SymbolId key) const;
 
   SymbolTable symbols_;
   Heap heap_;
   ShapeTree shapes_;
   Object* global_ = nullptr;
+  Object* objectPrototype_ = nullptr;
+  Object* functionPrototype_ = nullptr;
+  Object* arrayPrototype_ = nullptr;
   std::vector<NativeEntry> natives_;
   std::vector<Closure*> nativeClosures_;
   // Module global names resolved into `symbols_` at loadModule time.
@@ -241,6 +380,13 @@ class Isolate {
   std::vector<std::vector<FeedbackSlot>> feedback_;
   std::vector<uint64_t> opcodeCounts_;
   bool countOpcodes_ = false;
+  bool recordFeedback_ = true;
+  // Cache of interned decimal index-key symbols (index == value).
+  std::vector<SymbolId> indexSymbolCache_;
+  // User symbols: index == uniqueId; registry for Symbol.for (Rule 124:
+  // insertion-ordered vector, unordered_map only for registry lookup).
+  std::vector<SymbolObj*> userSymbols_;
+  std::unordered_map<std::u16string, SymbolObj*> symbolRegistry_;
 
   std::vector<Frame*> frameStack_;  // for stack traces (Rule 75)
   uint32_t callDepth_ = 0;

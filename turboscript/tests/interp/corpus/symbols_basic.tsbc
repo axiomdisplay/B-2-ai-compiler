@@ -1,0 +1,72 @@
+; v0.3: user symbols — unique identity, property keys, typeof, ToString,
+; Symbol.for / keyFor registry (bytecode_spec.md Section 11).
+.module symbols_basic
+.global @print
+.global @Symbol
+.entry @main
+
+.const @sK = "k"
+.const @sKK = "kk"
+.const @sFor = "for"
+.const @sKeyFor = "keyFor"
+
+.function @main 0 16
+  LoadGlobal r0, @Symbol
+  LoadConst r1, @sK
+  Call r0, r1, 1, r2           ; sym = Symbol("k")
+  ; obj[sym] = "v"; print(obj[sym])
+  NewObject r3
+  LoadConst r4, @sKK
+  SetProperty r3, r2, r4       ; value: string "kk"
+  GetProperty r5, r3, r2       ; symbol-keyed read
+  LoadGlobal r6, @print
+  Mov r7, r5
+  Call r6, r7, 1, r8           ; print("kk")
+  ; typeof sym -> "symbol"
+  Mov r9, r2
+  TypeOf r9
+  LoadGlobal r6, @print
+  Mov r7, r9
+  Call r6, r7, 1, r8           ; print("symbol")
+  ; String(sym) -> "Symbol(k)"
+  Mov r10, r2
+  ToString r10
+  LoadGlobal r6, @print
+  Mov r7, r10
+  Call r6, r7, 1, r8           ; print("Symbol(k)")
+  ; a = Symbol.for("kk"); b = Symbol.for("kk"); print(a === b)
+  LoadGlobal r0, @Symbol
+  LoadConst r1, @sFor
+  GetProperty r11, r0, r1      ; Symbol.for
+  LoadConst r12, @sKK
+  Call r11, r12, 1, r13        ; a
+  GetProperty r11, r0, r1
+  Call r11, r12, 1, r14        ; b
+  Mov r15, r13
+  StrictEq r15, r14
+  LoadGlobal r6, @print
+  Mov r7, r15
+  Call r6, r7, 1, r8           ; print(true)
+  ; Symbol.keyFor(a) -> "kk"
+  LoadGlobal r0, @Symbol
+  LoadConst r1, @sKeyFor
+  GetProperty r11, r0, r1
+  Mov r12, r13
+  Call r11, r12, 1, r13        ; keyFor(a)
+  LoadGlobal r6, @print
+  Mov r7, r13
+  Call r6, r7, 1, r8           ; print("kk")
+  ; fresh symbols are unique: print(Symbol("k") !== Symbol("k"))
+  LoadGlobal r0, @Symbol
+  LoadConst r1, @sK
+  Call r0, r1, 1, r2           ; fresh
+  LoadGlobal r0, @Symbol
+  Call r0, r1, 1, r3           ; fresh
+  Mov r4, r2
+  StrictEq r4, r3              ; false
+  LogicalNot r4                ; true
+  LoadGlobal r6, @print
+  Mov r7, r4
+  Call r6, r7, 1, r8           ; print(true)
+  Return r8
+.end

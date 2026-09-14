@@ -18,8 +18,7 @@
 
 namespace ts {
 
-using SymbolId = uint32_t;
-constexpr SymbolId kInvalidSymbol = 0xFFFFFFFFu;
+// SymbolId/kInvalidSymbol now live in ts_core.h (shared with ts_value.h).
 
 // ---------------------------------------------------------------------------
 // SymbolTable — Rule 16: every identifier/property key is interned once.
@@ -87,6 +86,22 @@ struct Context {
 struct Object;
 
 // ---------------------------------------------------------------------------
+// Proxy — v0.3 exotic object (ES ch. 10.5: Proxy Object Internal Methods).
+// `target` is any value (object, closure, or another proxy — nested proxies
+// recurse); `handler` must be a plain Object. Every one of the 13 internal
+// methods routes through the trap protocol in ts_proxy.cpp.
+// ---------------------------------------------------------------------------
+struct ProxyObj {
+  Value target;
+  Object* handler = nullptr;
+};
+
+// Out-of-line member (ProxyObj lives here; Value lives in ts_value.h).
+inline ProxyObj* Value::asProxy() const {
+  return static_cast<ProxyObj*>(ptr);
+}
+
+// ---------------------------------------------------------------------------
 // Closure — a function value. A closure IS an object for property purposes:
 // its `asObject` carries .prototype (fresh object per closure) etc.
 // ---------------------------------------------------------------------------
@@ -129,6 +144,7 @@ struct Object {
   Shape* shape = nullptr;       // root shape => empty instance
   Value proto = Value::null();  // object value (Object or Closure) or Null
   std::vector<Value> slots;     // size == shape->slotCount (Hole = deleted)
+  bool extensible = true;       // [[Extensible]] (v0.3: Proxy/preventExtensions)
 
   // --- Array state (meaningful iff isArray) ---
   bool isArray = false;
@@ -180,10 +196,23 @@ class Heap {
     accessors_.emplace_back();
     return &accessors_.back();
   }
+  [[nodiscard]] SymbolObj* makeSymbol(std::u16string desc, uint32_t uniqueId) {
+    symbols_.emplace_back();
+    symbols_.back().desc = std::move(desc);
+    symbols_.back().uniqueId = uniqueId;
+    return &symbols_.back();
+  }
+  [[nodiscard]] ProxyObj* makeProxy(Value target, Object* handler) {
+    proxies_.emplace_back();
+    proxies_.back().target = target;
+    proxies_.back().handler = handler;
+    return &proxies_.back();
+  }
 
   [[nodiscard]] uint64_t allocationCount() const {
     return strings_.size() + bigints_.size() + objects_.size() +
-           contexts_.size() + closures_.size() + accessors_.size();
+           contexts_.size() + closures_.size() + accessors_.size() +
+           symbols_.size() + proxies_.size();
   }
 
  private:
@@ -193,6 +222,8 @@ class Heap {
   std::deque<Context> contexts_;
   std::deque<Closure> closures_;
   std::deque<AccessorPair> accessors_;
+  std::deque<SymbolObj> symbols_;
+  std::deque<ProxyObj> proxies_;
 };
 
 // ---------------------------------------------------------------------------
@@ -249,6 +280,11 @@ struct LookupResult {
 // Own-property lookup on a single object (named properties only; no chain
 // walk, no array exotic behavior).
 [[nodiscard]] LookupResult lookupOwnProperty(Object* obj, SymbolId key);
+
+// IC helper (v0.3): slot index of an own, present, DATA property named
+// `key`, with its attribute byte; -1 when absent, deleted, or an accessor.
+[[nodiscard]] int32_t ownDataSlotAttrs(Object* obj, SymbolId key,
+                                       PropertyAttrs* attrsOut);
 
 // Canonical array-index test (ECMA-262: canonical numeric strings, values
 // 0..2^32-2; "00" and "4294967295" are NOT array indices).

@@ -1,7 +1,15 @@
 ; bench: fib — naive double recursion through the full call machinery.
 ; fib(27) = 196418. JS twin: fib.js (Rule 96 differential pair).
+; v0.3 kernel correction: the JS twin's `function fib` is a DECLARATION —
+; the closure is created once and reached via the global binding on every
+; recursive call. The v0.2 twin wrongly re-ran NewClosure per call (a fresh
+; closure + function object + prototype object per call), which modeled a
+; function-expression-per-call pattern the twin does not contain. The
+; closure is now created once in @main and stored into the @fib global
+; binding; the recursive site does LoadGlobal (IC-accelerated, spec 8.1).
 .module fib
 .global @print
+.global @fib
 .entry @main
 
 .const @sLabel = "fib"
@@ -14,7 +22,7 @@
   Mov r3, r0
   LoadConstS r1, 1
   Sub r3, r1                  ; n - 1
-  NewClosure r4, @fib
+  LoadGlobal r4, @fib
   Call r4, r3, 1, r5          ; fib(n-1)
   Mov r6, r5
   Mov r3, r0
@@ -31,6 +39,7 @@
   LoadGlobal r0, @print
   LoadConstS r1, 27
   NewClosure r2, @fib
+  StoreGlobal r2, @fib        ; single closure, global binding (declaration)
   Call r2, r1, 1, r3
   LoadConst r4, @sLabel
   Mov r5, r3

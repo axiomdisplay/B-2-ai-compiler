@@ -10,6 +10,17 @@
 
 namespace ts {
 
+// Interned property-key symbols (Rule 16). Declared here (core) because the
+// value layer (StringObj) caches its interned id after first key use.
+using SymbolId = uint32_t;
+constexpr SymbolId kInvalidSymbol = 0xFFFFFFFFu;
+// v0.3: user symbols (Symbol("...")) live in a range above every interned
+// text id (realistic corpora stay far below 2^30 interned strings).
+constexpr SymbolId kUserSymbolBase = 0x40000000u;
+[[nodiscard]] inline bool isUserSymbolId(SymbolId id) {
+  return id >= kUserSymbolBase && id != kInvalidSymbol;
+}
+
 // ---------------------------------------------------------------------------
 // Limits (Rule 23: every threshold is a named constant).
 // ---------------------------------------------------------------------------
@@ -34,6 +45,9 @@ constexpr uint32_t kMaxArrayLength = 0xFFFFFFFFu;  // 2^32-1 (excluded as index)
 constexpr uint32_t kMaxDenseElements = 1u << 20;   // beyond this: sparse map
 constexpr uint32_t kMegamorphicThreshold = 4;    // >4 distinct shapes => mega.
 constexpr uint32_t kCallProfileRing = 4;
+// Bounded cache of interned decimal index-key symbols (Rule 23: every
+// threshold is a named constant). Indices above it intern on demand.
+constexpr uint32_t kIndexSymbolCacheMax = 1u << 12;
 constexpr int32_t  kSmiMin = INT32_MIN;
 constexpr int32_t  kSmiMax = INT32_MAX;
 
@@ -53,6 +67,8 @@ enum class ValueKind : uint8_t {
   Context,     // internal: closure context cell holder.
   Closure,     // internal: function object (also an Object kind to JS).
   Accessor,    // internal: accessor pair stored in a property slot.
+  Symbol,      // v0.3: user symbol (unique identity, property-key capable).
+  Proxy,       // v0.3: exotic object routing through the 13-trap protocol.
 };
 
 // ---------------------------------------------------------------------------

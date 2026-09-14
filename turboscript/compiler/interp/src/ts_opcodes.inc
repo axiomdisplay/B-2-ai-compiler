@@ -30,8 +30,10 @@ TS_OP(LoadFalse,      W1_R,    Pure,  false, roles(0, {0,0,0,0}, 1, {kPosA}))
 
 // --- Globals ---------------------------------------------------------------
 TS_OP(DefineGlobalVar, W2_I24,  Write, false, roles(0, {0,0,0,0}, 0, {0,0}))
-TS_OP(LoadGlobal,      W2_I24D, Read,  false, roles(0, {0,0,0,0}, 1, {kPosA}))
-TS_OP(StoreGlobal,     W2_I24S, Write, false, roles(1, {kPosA}, 0, {0,0}))
+// v0.3: LoadGlobal/StoreGlobal own Property-kind feedback slots (the global
+// object's shape is the IC key; bytecode_spec.md 8.1).
+TS_OP(LoadGlobal,      W2_I24D, Read,  true,  roles(0, {0,0,0,0}, 1, {kPosA}))
+TS_OP(StoreGlobal,     W2_I24S, Write, true,  roles(1, {kPosA}, 0, {0,0}))
 
 // --- Property access (IC sites) --------------------------------------------
 TS_OP(GetProperty,    W2_RR_D, Invoke, true,  roles(2, {kPosB, kPosC}, 1, {kPosA}))

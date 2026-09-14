@@ -23,6 +23,10 @@
     {
       "name": "array_loop",
       "desc": "300-elem smi array, 3k sum passes (900k loads)"
+    },
+    {
+      "name": "array_builtins",
+      "desc": "100k push + map/reduce/filter (300k callbacks)"
     }
   ],
   "engines": {
@@ -32,35 +36,39 @@
     "node-jit(ref)": "V8 full JIT (reference, not interp)"
   },
   "median_ms": {
-    "int_loop|turbo": 783.57,
-    "int_loop|node-jitless": 160.2,
-    "int_loop|qjs": 441.49,
-    "int_loop|node-jit(ref)": 28.41,
-    "fib|turbo": 133.63,
-    "fib|node-jitless": 21.57,
-    "fib|qjs": 40.22,
-    "fib|node-jit(ref)": 2.13,
-    "float_loop|turbo": 181.12,
-    "float_loop|node-jitless": 72.63,
-    "float_loop|qjs": 78.95,
-    "float_loop|node-jit(ref)": 3.54,
-    "string_concat|turbo": 100.32,
-    "string_concat|node-jitless": 25.38,
-    "string_concat|qjs": 74.1,
-    "string_concat|node-jit(ref)": 8.04,
-    "object_fields|turbo": 467.79,
-    "object_fields|node-jitless": 97.13,
-    "object_fields|qjs": 405.86,
-    "object_fields|node-jit(ref)": 10.45,
-    "array_loop|turbo": 623.44,
-    "array_loop|node-jitless": 17.76,
-    "array_loop|qjs": 55.37,
-    "array_loop|node-jit(ref)": 2.27
+    "int_loop|turbo": 807.85,
+    "int_loop|node-jitless": 158.38,
+    "int_loop|qjs": 442.46,
+    "int_loop|node-jit(ref)": 28.76,
+    "fib|turbo": 67.53,
+    "fib|node-jitless": 21.72,
+    "fib|qjs": 40.17,
+    "fib|node-jit(ref)": 2.21,
+    "float_loop|turbo": 180.35,
+    "float_loop|node-jitless": 73.63,
+    "float_loop|qjs": 79.76,
+    "float_loop|node-jit(ref)": 3.63,
+    "string_concat|turbo": 102.93,
+    "string_concat|node-jitless": 25.76,
+    "string_concat|qjs": 74.57,
+    "string_concat|node-jit(ref)": 8.47,
+    "object_fields|turbo": 411.47,
+    "object_fields|node-jitless": 96.53,
+    "object_fields|qjs": 404.65,
+    "object_fields|node-jit(ref)": 9.8,
+    "array_loop|turbo": 84.77,
+    "array_loop|node-jitless": 17.86,
+    "array_loop|qjs": 54.69,
+    "array_loop|node-jit(ref)": 2.44,
+    "array_builtins|turbo": 32.38,
+    "array_builtins|node-jitless": 11.76,
+    "array_builtins|qjs": 32.2,
+    "array_builtins|node-jit(ref)": 6.3
   },
   "geomean_slowdown_vs_turbo": {
     "turbo": null,
-    "node-jitless": 0.16448358450287523,
-    "qjs": 0.4017912357714552,
-    "node-jit(ref)": 0.02047285919574581
+    "node-jitless": 0.2739022409697027,
+    "qjs": 0.6780039731970298,
+    "node-jit(ref)": 0.042666159102749755
   }
 }

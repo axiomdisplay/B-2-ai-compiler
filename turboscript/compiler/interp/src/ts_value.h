@@ -14,6 +14,7 @@
 namespace ts {
 
 class Isolate;  // conversions that may invoke user code live there.
+struct ProxyObj;  // defined in ts_object.h (heap proxy object, v0.3).
 
 // ---------------------------------------------------------------------------
 // BigInt — sign + 32-bit limbs, little-endian magnitude. Zero has no limbs
@@ -51,9 +52,23 @@ struct BigInt {
 
 // ---------------------------------------------------------------------------
 // String — UTF-16 code units (Rule: StringLength counts UTF-16 code units).
+// cachedSymbol (v0.3): the interned property-key SymbolId of this exact
+// string, after its first use as a key (kInvalidSymbol until then). Const-
+// pool strings are shared, so one intern per literal serves every site.
 // ---------------------------------------------------------------------------
 struct StringObj {
   std::u16string data;
+  mutable SymbolId cachedSymbol = kInvalidSymbol;
+};
+
+// ---------------------------------------------------------------------------
+// Symbol — v0.3 user symbol. Identity is the SymbolObj pointer; property-
+// key capability comes from a stable SymbolId in the user-symbol range
+// (kUserSymbolBase + uniqueId).
+// ---------------------------------------------------------------------------
+struct SymbolObj {
+  std::u16string desc;
+  uint32_t uniqueId = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -128,6 +143,18 @@ struct Value {
   [[nodiscard]] bool isClosure() const { return kind == ValueKind::Closure; }
   [[nodiscard]] bool isContext() const { return kind == ValueKind::Context; }
   [[nodiscard]] bool isHole() const { return kind == ValueKind::Hole; }
+  [[nodiscard]] bool isSymbol() const { return kind == ValueKind::Symbol; }
+  [[nodiscard]] bool isProxy() const { return kind == ValueKind::Proxy; }
+  [[nodiscard]] const SymbolObj* asSymbol() const {
+    return static_cast<const SymbolObj*>(ptr);
+  }
+  [[nodiscard]] SymbolObj* asSymbol() {
+    return static_cast<SymbolObj*>(ptr);
+  }
+  [[nodiscard]] ProxyObj* asProxy() const;
+  [[nodiscard]] SymbolId symbolKeyId() const {
+    return static_cast<SymbolId>(kUserSymbolBase + asSymbol()->uniqueId);
+  }
 
   [[nodiscard]] double asDouble() const {
     return isSmi() ? static_cast<double>(i32) : num;

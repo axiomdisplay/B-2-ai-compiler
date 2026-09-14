@@ -70,9 +70,10 @@ JsResult<Value> Isolate::runFrame(Frame& frame) {
   // fence on the hot path (Rule 7).
   Value* regs = frame.regs.data();
   const uint32_t fnIndex = fn->index;
-  FeedbackSlot* fb = feedback_[fnIndex].empty()
-                         ? nullptr
-                         : feedback_[fnIndex].data();
+  FeedbackSlot* fb =
+      (recordFeedback_ && !feedback_[fnIndex].empty())
+          ? feedback_[fnIndex].data()
+          : nullptr;
   const Value* consts = constants_.data();
   const uint64_t codeHashIgnored = 0;  // (Rule 124: no hidden state)
   (void)codeHashIgnored;
@@ -228,8 +229,27 @@ L_LoadGlobal : {
   TS_FIELDS();
   {
     SymbolId nameSym = globalNames_[c_ | (d_ << 8) | (e_ << 16)];
-    TS_GET(getProperty(Value::raw(ValueKind::Object, global_), nameSym),
-           regs[a_]);
+    FeedbackSlot* fs = fb != nullptr ? &fb[fn->slotOfPc[pc]] : nullptr;
+    // Monomorphic global IC (v0.3): own data property of the global object
+    // with a stable shape. Same guard/invariants as the property ICs.
+    if (fs != nullptr) {
+      Shape* gshape = global_->shape;
+      if (gshape != nullptr && fs->icShape == gshape->id &&
+          (fs->icAttrs & static_cast<uint8_t>(PropAttr::IsAccessor)) == 0) {
+        Value& cached = global_->slots[fs->icSlot];
+        if (!cached.isHole()) {
+          regs[a_] = cached;
+          pc += 2;
+          TS_DISPATCH();
+        }
+      }
+      TS_GET(getProperty(Value::raw(ValueKind::Object, global_), nameSym),
+             regs[a_]);
+      installPropertyIc(fs, global_, nameSym);
+    } else {
+      TS_GET(getProperty(Value::raw(ValueKind::Object, global_), nameSym),
+             regs[a_]);
+    }
   }
   pc += 2;
   TS_DISPATCH();
@@ -238,8 +258,24 @@ L_StoreGlobal : {
   TS_FIELDS();
   {
     SymbolId nameSym = globalNames_[c_ | (d_ << 8) | (e_ << 16)];
-    TS_TAKE(setProperty(Value::raw(ValueKind::Object, global_), nameSym,
-                        regs[a_]));
+    FeedbackSlot* fs = fb != nullptr ? &fb[fn->slotOfPc[pc]] : nullptr;
+    Value recv = Value::raw(ValueKind::Object, global_);
+    if (fs != nullptr) {
+      Shape* gshape = global_->shape;
+      if (gshape != nullptr && fs->icShape == gshape->id &&
+          (fs->icAttrs & static_cast<uint8_t>(PropAttr::IsAccessor)) == 0) {
+        Value& cached = global_->slots[fs->icSlot];
+        if (!cached.isHole()) {
+          cached = regs[a_];
+          pc += 2;
+          TS_DISPATCH();
+        }
+      }
+      TS_TAKE(setProperty(recv, nameSym, regs[a_]));
+      installPropertyIc(fs, global_, nameSym);
+    } else {
+      TS_TAKE(setProperty(recv, nameSym, regs[a_]));
+    }
   }
   pc += 2;
   TS_DISPATCH();
@@ -249,10 +285,27 @@ L_GetProperty : {
   {
     // W2_RR_D layout: a_=dst, b_=receiver, c_=key.
     Value recv = regs[b_];
+    FeedbackSlot* fs = fb != nullptr ? &fb[fn->slotOfPc[pc]] : nullptr;
     SymbolId keySym;
     TS_GET(toPropertyKey(regs[c_]), keySym);
-    if (fb != nullptr) recordPropertySite(fn->slotOfPc[pc], recv);
+    recordPropertySite(fs, recv);
+    // Monomorphic IC (v0.3, bytecode_spec.md 8.1): own data property on a
+    // stable shape. Guard: shape match, non-accessor, non-hole slot.
+    if (fs != nullptr && recv.isObjectLike()) {
+      Object* obj = objectOfValue(recv);
+      if (obj->shape != nullptr && fs->icShape == obj->shape->id &&
+          (fs->icAttrs & static_cast<uint8_t>(PropAttr::IsAccessor)) == 0) {
+        Value& cached = obj->slots[fs->icSlot];
+        if (!cached.isHole()) {
+          regs[a_] = cached;
+          pc += 2;
+          TS_DISPATCH();
+        }
+      }
+    }
     TS_GET(getProperty(recv, keySym), regs[a_]);
+    installPropertyIc(fs, recv.isObjectLike() ? objectOfValue(recv) : nullptr,
+                      keySym);
   }
   pc += 2;
   TS_DISPATCH();
@@ -261,10 +314,52 @@ L_SetProperty : {
   TS_FIELDS();
   {
     Value recv = regs[a_];
+    FeedbackSlot* fs = fb != nullptr ? &fb[fn->slotOfPc[pc]] : nullptr;
     SymbolId keySym;
     TS_GET(toPropertyKey(regs[b_]), keySym);
-    if (fb != nullptr) recordPropertySite(fn->slotOfPc[pc], recv);
+    recordPropertySite(fs, recv);
+    if (recv.isObjectLike()) {
+      Object* obj = objectOfValue(recv);
+      // Store IC (v0.3): receiver-own data property (matches setAlongChain's
+      // own-data fast write; inherited accessors keep the slow path).
+      if (fs != nullptr && obj->shape != nullptr &&
+          fs->icShape == obj->shape->id &&
+          (fs->icAttrs & static_cast<uint8_t>(PropAttr::IsAccessor)) == 0) {
+        Value& cached = obj->slots[fs->icSlot];
+        if (!cached.isHole()) {
+          cached = regs[c_];
+          pc += 2;
+          TS_DISPATCH();
+        }
+      }
+      // Transition IC (v0.3): fresh own property on a known prior shape.
+      // Guards re-verified per hit (Rule 81: proto mutation must not be
+      // observed through a stale IC): extensibility + no chain accessor.
+      if (fs != nullptr && fs->icTransTo != nullptr &&
+          obj->shape == fs->icTransFrom && keySym == fs->icTransKey &&
+          obj->extensible && !chainHasAccessor(obj, keySym)) {
+        obj->shape = fs->icTransTo;
+        obj->slots.push_back(regs[c_]);
+        pc += 2;
+        TS_DISPATCH();
+      }
+    }
+    Shape* beforeShape =
+        recv.isObjectLike() ? objectOfValue(recv)->shape : nullptr;
     TS_TAKE(setProperty(recv, keySym, regs[c_]));
+    if (fs != nullptr && recv.isObjectLike()) {
+      Object* obj = objectOfValue(recv);
+      installPropertyIc(fs, obj, keySym);
+      // Transition install: the slow path performed exactly one shape
+      // transition from the receiver's prior shape (its occurrence already
+      // proves no chain accessor intercepted the store).
+      if (obj->shape != nullptr && obj->shape->parent == beforeShape &&
+          obj->shape != beforeShape) {
+        fs->icTransFrom = beforeShape;
+        fs->icTransTo = obj->shape;
+        fs->icTransKey = keySym;
+      }
+    }
   }
   pc += 2;
   TS_DISPATCH();
@@ -296,7 +391,10 @@ L_HasProperty : {
 L_GetPrototype : {
   TS_FIELDS();
   {
-    if (!regs[b_].isObjectLike()) {
+    if (regs[b_].isProxy()) {
+      // Proxy [[GetPrototypeOf]] (v0.3).
+      TS_GET(proxyGetPrototype(regs[b_]), regs[a_]);
+    } else if (!regs[b_].isObjectLike()) {
       regs[a_] = Value::undefined();
     } else {
       regs[a_] = objectOfValue(regs[b_])->proto;
@@ -310,10 +408,15 @@ L_SetPrototype : {
   {
     Value obj = regs[b_];
     Value proto = regs[c_];
-    if (!obj.isObjectLike()) {
+    if (!obj.isObjectLike() && !obj.isProxy()) {
       regs[a_] = Value::boolean(false);
     } else if (!proto.isObjectLike() && !proto.isNull()) {
       regs[a_] = Value::boolean(false);
+    } else if (obj.isProxy()) {
+      // Proxy [[SetPrototypeOf]] (v0.3).
+      bool ok = false;
+      TS_GET(proxySetPrototype(obj, proto), ok);
+      regs[a_] = Value::boolean(ok);
     } else {
       Object* objPtr = objectOfValue(obj);
       // [[SetPrototypeOf]]: reject cycles.
@@ -362,7 +465,7 @@ L_In : {
 L_Call : {
   TS_FIELDS();
   {
-    if (fb != nullptr) recordCallSite(fn->slotOfPc[pc], regs[a_]);
+    if (fb != nullptr) recordCallSite(&fb[fn->slotOfPc[pc]], regs[a_]);
     TS_GET(callValue(regs[a_], Value::undefined(), &regs[b_], c_),
            regs[e_]);
   }
@@ -372,7 +475,7 @@ L_Call : {
 L_CallMethod : {
   TS_FIELDS();
   {
-    if (fb != nullptr) recordCallSite(fn->slotOfPc[pc], regs[a_]);
+    if (fb != nullptr) recordCallSite(&fb[fn->slotOfPc[pc]], regs[a_]);
     TS_GET(callValue(regs[a_], regs[d_], &regs[b_], c_), regs[e_]);
   }
   pc += 2;
@@ -381,7 +484,7 @@ L_CallMethod : {
 L_Construct : {
   TS_FIELDS();
   {
-    if (fb != nullptr) recordCallSite(fn->slotOfPc[pc], regs[a_]);
+    if (fb != nullptr) recordCallSite(&fb[fn->slotOfPc[pc]], regs[a_]);
     TS_GET(constructImpl(regs[a_], &regs[b_], c_), regs[e_]);
   }
   pc += 2;
@@ -458,9 +561,9 @@ L_StoreContext : {
 L_NewObject : {
   TS_FIELDS();
   {
-    // Plain object with Object.prototype pending builtins (bytecode_spec 11);
-    // shape tree assignment happens on first store (interp_contract 3).
-    Object* obj = heap_.makeObject();
+    // v0.3: plain object chained to Object.prototype (builtins layer,
+    // bytecode_spec 11); shape assignment happens on first store.
+    Object* obj = newPlainObject();
     regs[a_] = Value::raw(ValueKind::Object, obj);
   }
   pc += 1;
@@ -469,10 +572,11 @@ L_NewObject : {
 L_NewArray : {
   TS_FIELDS();
   {
-    // v0.2 array: length 0, PackedSmi, no elements, proto null
-    // (Array.prototype is a builtin-layer feature, bytecode_spec 11).
+    // v0.3 array: length 0, PackedSmi, no elements, chained to
+    // Array.prototype (builtins layer, bytecode_spec 11).
     Object* arr = heap_.makeObject();
     arr->isArray = true;
+    arr->proto = Value::raw(ValueKind::Object, arrayPrototype_);
     regs[a_] = Value::raw(ValueKind::Object, arr);
   }
   pc += 1;
@@ -482,13 +586,15 @@ L_GetElement : {
   TS_FIELDS();
   {
     // W2_RR_D layout: a_=dst, b_=receiver, c_=key. Semantics are exactly
-    // GetProperty's (ToPropertyKey routing inside); only the feedback
-    // class differs (Element-kind sites, bytecode_spec Section 8).
+    // GetProperty's (Rule 96: one semantic source — getElementValue); only
+    // the feedback class differs (Element-kind sites, bytecode_spec 8).
+    // v0.3: canonical Smi keys hit element storage with no interning
+    // (benchmarks_v0.2.md Section 5 #1); all other keys take the full
+    // ToPropertyKey route inside getElementValue.
     Value recv = regs[b_];
-    SymbolId keySym;
-    TS_GET(toPropertyKey(regs[c_]), keySym);
-    if (fb != nullptr) recordElementSite(fn->slotOfPc[pc], recv);
-    TS_GET(getProperty(recv, keySym), regs[a_]);
+    FeedbackSlot* fs = fb != nullptr ? &fb[fn->slotOfPc[pc]] : nullptr;
+    recordElementSite(fs, recv);
+    TS_GET(getElementValue(recv, regs[c_]), regs[a_]);
   }
   pc += 2;
   TS_DISPATCH();
@@ -496,12 +602,11 @@ L_GetElement : {
 L_SetElement : {
   TS_FIELDS();
   {
-    // W2_RR_V layout: a_=obj, b_=key, c_=val.
+    // W2_RR_V layout: a_=obj, b_=key, c_=val. Same v0.3 fast path.
     Value recv = regs[a_];
-    SymbolId keySym;
-    TS_GET(toPropertyKey(regs[b_]), keySym);
-    if (fb != nullptr) recordElementSite(fn->slotOfPc[pc], recv);
-    TS_TAKE(setProperty(recv, keySym, regs[c_]));
+    FeedbackSlot* fs = fb != nullptr ? &fb[fn->slotOfPc[pc]] : nullptr;
+    recordElementSite(fs, recv);
+    TS_TAKE(setElementValue(recv, regs[b_], regs[c_]));
   }
   pc += 2;
   TS_DISPATCH();
@@ -520,7 +625,9 @@ L_GetContext : {
 }
 L_Add : {
   TS_FIELDS();
-  TS_GET(addValues(regs[a_], regs[b_], fn->slotOfPc[pc]), regs[a_]);
+  TS_GET(addValues(regs[a_], regs[b_],
+                   fb != nullptr ? &fb[fn->slotOfPc[pc]] : nullptr),
+         regs[a_]);
   pc += 1;
   TS_DISPATCH();
 }
@@ -657,21 +764,21 @@ L_AbstractEq : {
 }
 L_StrictEq : {
   TS_FIELDS();
-  if (fb != nullptr) recordBinarySite(fn->slotOfPc[pc], regs[a_], regs[b_]);
+  if (fb != nullptr) recordBinarySite(&fb[fn->slotOfPc[pc]], regs[a_], regs[b_]);
   regs[a_] = Value::boolean(pure::strictEquals(regs[a_], regs[b_]));
   pc += 1;
   TS_DISPATCH();
 }
 L_SameValue : {
   TS_FIELDS();
-  if (fb != nullptr) recordBinarySite(fn->slotOfPc[pc], regs[a_], regs[b_]);
+  if (fb != nullptr) recordBinarySite(&fb[fn->slotOfPc[pc]], regs[a_], regs[b_]);
   regs[a_] = Value::boolean(pure::sameValue(regs[a_], regs[b_]));
   pc += 1;
   TS_DISPATCH();
 }
 L_SameValueZero : {
   TS_FIELDS();
-  if (fb != nullptr) recordBinarySite(fn->slotOfPc[pc], regs[a_], regs[b_]);
+  if (fb != nullptr) recordBinarySite(&fb[fn->slotOfPc[pc]], regs[a_], regs[b_]);
   regs[a_] = Value::boolean(pure::sameValueZero(regs[a_], regs[b_]));
   pc += 1;
   TS_DISPATCH();
@@ -840,7 +947,8 @@ L_JmpFalseWide : {
     bool jumps = (op == Opcode::kJmpTrue || op == Opcode::kJmpTrueWide)
                      ? cond
                      : !cond;
-    if (fb != nullptr) recordBranchSite(fn->slotOfPc[pc], jumps);
+    if (fb != nullptr)
+      recordBranchSite(&fb[fn->slotOfPc[pc]], jumps);
     if (jumps) {
       if (op == Opcode::kJmpTrueWide || op == Opcode::kJmpFalseWide) {
         int32_t off = static_cast<int32_t>(c_ | (d_ << 8) | (e_ << 16));

@@ -14,11 +14,13 @@ CORPUS := tests/interp/corpus
 
 SRCS := $(SRC)/ts_value.cpp \
 	$(SRC)/ts_object.cpp \
+	$(SRC)/ts_builtins.cpp \
 	$(SRC)/ts_module.cpp \
 	$(SRC)/ts_assembler.cpp \
 	$(SRC)/ts_verifier.cpp \
 	$(SRC)/ts_interpreter.cpp \
 	$(SRC)/ts_dispatch.cpp \
+	$(SRC)/ts_proxy.cpp \
 	$(SRC)/tsrun_main.cpp
 
 HDRS := $(SRC)/ts_core.h $(SRC)/ts_value.h $(SRC)/ts_object.h \

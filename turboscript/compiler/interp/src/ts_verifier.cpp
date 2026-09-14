@@ -441,7 +441,11 @@ TsResult<bool> Verifier::verifyFunction(const Module& module, Function& fn,
                  info.format == OpFormat::W2_BR) {
         kind = FeedbackKind::Branch;
       } else if (opcode == Opcode::kGetProperty ||
-                 opcode == Opcode::kSetProperty) {
+                 opcode == Opcode::kSetProperty ||
+                 opcode == Opcode::kLoadGlobal ||
+                 opcode == Opcode::kStoreGlobal) {
+        // v0.3: global loads/stores are shape-IC sites on the global object
+        // (bytecode_spec.md 8.1) — Property-kind slots.
         kind = FeedbackKind::Property;
       } else if (opcode == Opcode::kGetElement ||
                  opcode == Opcode::kSetElement) {

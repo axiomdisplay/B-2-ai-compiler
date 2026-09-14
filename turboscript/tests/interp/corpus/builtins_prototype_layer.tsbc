@@ -1,0 +1,119 @@
+; v0.3 builtins: Array.prototype methods, Object namespace, prototype
+; wiring, and inherited method dispatch (bytecode_spec.md Section 11).
+.module builtins_prototype_layer
+.global @print
+.global @Object
+.global @Array
+.entry @main
+
+.const @sComma = ","
+.const @sX = "x"
+.const @sY = "y"
+.const @sLen = "length"
+.const @sKeys = "keys"
+.const @sProto = "prototype"
+.const @sPush = "push"
+.const @sJoin = "join"
+.const @sMap = "map"
+.const @sToString = "toString"
+.const @sHasOwn = "hasOwnProperty"
+
+.function @double 1 4
+  LoadConstS r1, 2
+  Mul r0, r1
+  Return r0
+.end
+
+.function @main 0 16
+  ; arr = [1, 2, 3]
+  NewArray r1
+  LoadConstS r12, 0
+  LoadConstS r2, 1
+  SetElement r1, r12, r2          ; arr[0] = 1
+  LoadConstS r12, 1
+  LoadConstS r3, 2
+  SetElement r1, r12, r3          ; arr[1] = 2
+  LoadConstS r12, 2
+  LoadConstS r4, 3
+  SetElement r1, r12, r4          ; arr[2] = 3
+
+  ; inherited push: Array.prototype.push.call via CallMethod (this = arr)
+  LoadGlobal r5, @Array
+  LoadConst r6, @sProto
+  GetProperty r7, r5, r6           ; Array.prototype
+  LoadConst r8, @sPush
+  GetProperty r9, r7, r8           ; Array.prototype.push
+  LoadConstS r10, 4
+  CallMethod r9, r1, r10, 1, r11   ; arr.push(4)
+
+  ; arr.length -> 4
+  LoadConst r2, @sLen
+  GetProperty r3, r1, r2
+  LoadGlobal r4, @print
+  Mov r5, r3
+  Call r4, r5, 1, r6               ; print(4)
+
+  ; arr.join(",") via inherited method
+  LoadConst r3, @sJoin
+  GetProperty r7, r1, r3
+  LoadConst r8, @sComma
+  CallMethod r7, r1, r8, 1, r9
+  LoadGlobal r4, @print
+  Mov r5, r9
+  Call r4, r5, 1, r6               ; print("1,2,3,4")
+
+  ; arr.map(double) -> [2,4,6,8]; print joined
+  LoadConst r3, @sMap
+  GetProperty r7, r1, r3
+  NewClosure r8, @double
+  CallMethod r7, r1, r8, 1, r9
+  LoadConst r3, @sJoin
+  GetProperty r10, r9, r3
+  LoadConst r11, @sComma
+  CallMethod r10, r9, r11, 1, r12
+  LoadGlobal r4, @print
+  Mov r5, r12
+  Call r4, r5, 1, r6               ; print("2,4,6,8")
+
+  ; Object.keys({x:1, y:2}) -> "x,y"
+  NewObject r1
+  LoadConst r2, @sX
+  LoadConstS r3, 1
+  SetProperty r1, r2, r3
+  LoadConst r2, @sY
+  LoadConstS r3, 2
+  SetProperty r1, r2, r3
+  LoadGlobal r5, @Object
+  LoadConst r6, @sKeys
+  GetProperty r7, r5, r6
+  Mov r8, r1
+  Call r7, r8, 1, r9
+  LoadConst r3, @sJoin
+  GetProperty r10, r9, r3
+  LoadConst r11, @sComma
+  CallMethod r10, r9, r11, 1, r12
+  LoadGlobal r4, @print
+  Mov r5, r12
+  Call r4, r5, 1, r6               ; print("x,y")
+
+  ; inherited toString: obj.toString() appended to a string
+  LoadConst r2, @sToString
+  GetProperty r7, r1, r2
+  CallMethod r7, r1, r2, 0, r9     ; obj.toString() (this = obj, 0 args)
+  LoadConst r8, @sX
+  Mov r10, r8
+  StringConcat r10, r9
+  LoadGlobal r4, @print
+  Mov r5, r10
+  Call r4, r5, 1, r6               ; print("x[object Object]")
+
+  ; inherited hasOwnProperty: obj.hasOwnProperty("x") -> true
+  LoadConst r2, @sHasOwn
+  GetProperty r7, r1, r2
+  LoadConst r3, @sX
+  CallMethod r7, r1, r3, 1, r8
+  LoadGlobal r4, @print
+  Mov r5, r8
+  Call r4, r5, 1, r6               ; print(true)
+  Return r6
+.end

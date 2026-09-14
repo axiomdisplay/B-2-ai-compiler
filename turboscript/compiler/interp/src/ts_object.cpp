@@ -93,6 +93,18 @@ LookupResult lookupOwnProperty(Object* obj, SymbolId key) {
   return result;
 }
 
+int32_t ownDataSlotAttrs(Object* obj, SymbolId key, PropertyAttrs* attrsOut) {
+  int32_t slot = obj->findOwnSlot(key);
+  if (slot < 0) return -1;
+  if (obj->slots[static_cast<size_t>(slot)].isHole()) return -1;  // deleted
+  Shape* s = obj->shape;
+  while (s != nullptr && s->key != key) s = s->parent;
+  if (s == nullptr) return -1;  // invariant break: slot without shape node
+  if (s->attrs.has(PropAttr::IsAccessor)) return -1;
+  if (attrsOut != nullptr) *attrsOut = s->attrs;
+  return slot;
+}
+
 LookupResult lookupProperty(Object* start, SymbolId key) {
   LookupResult result;
   Object* current = start;

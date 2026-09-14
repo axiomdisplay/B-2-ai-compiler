@@ -1,4 +1,4 @@
-# TurboScript Tier 0 — Interpreter-Only Benchmark Results (v0.2)
+# TurboScript Tier 0 — Interpreter-Only Benchmark Results (v0.2) [SUPERSEDED by benchmarks_v0.3.md]
 
 **Status:** v0.2 baseline
 **Owner:** TurboScript Interp Team
