@@ -1,0 +1,154 @@
+; v0.4 fast-path edge cases (benchmarks_v0.3.md Section 5 #1): every new
+; in-handler lane must agree with the semantic helper AND with the JS
+; oracles (Rule 36 differential, Rule 96). -0 cases are probed through
+; 1/x (Infinity vs -Infinity) because displayString renders -0 as "0".
+.module fastpath_smi_edges
+.global @print
+.entry @main
+
+.const @cMax = 2147483647
+.const @cMin = -2147483648
+.const @c64k = 65536
+.const @cTwo = 2.0
+.const @cStr2 = "2"
+.const @cOneHalf = 1.5
+.const @cSevenHalf = 7.5
+
+.function @main 0 14
+  LoadGlobal r11, @print
+
+  ; --- Smi overflow: fast lane declines, semantic double math answers ---
+  LoadConst r1, @cMax
+  LoadConstS r2, 1
+  Add r1, r2                  ; 2147483648
+  Call r11, r1, 1, r0
+
+  LoadConst r1, @cMin
+  LoadConstS r2, 1
+  Sub r1, r2                  ; -2147483649
+  Call r11, r1, 1, r0
+
+  LoadConst r1, @c64k
+  LoadConst r2, @c64k
+  Mul r1, r2                  ; 4294967296
+  Call r11, r1, 1, r0
+
+  LoadConst r1, @cMax
+  Inc r1                      ; 2147483648
+  Call r11, r1, 1, r0
+
+  LoadConst r1, @cMin
+  Dec r1                      ; -2147483649
+  Call r11, r1, 1, r0
+
+  LoadConst r1, @cMin
+  Neg r1                      ; 2147483648
+  Call r11, r1, 1, r0
+
+  ; --- Neg(0) is -0: 1/-0 must print -Infinity (Rule 72) ---
+  LoadConstS r1, 0
+  Neg r1
+  LoadConstS r2, 1
+  Div r2, r1                  ; 1 / -0
+  Call r11, r2, 1, r0
+
+  ; --- Mod: dividend sign, zero remainders carry the dividend's sign ---
+  LoadConstS r1, -7
+  LoadConstS r2, 3
+  Mod r1, r2                  ; -1
+  Call r11, r1, 1, r0
+
+  LoadConstS r1, 7
+  LoadConstS r2, -3
+  Mod r1, r2                  ; 1
+  Call r11, r1, 1, r0
+
+  LoadConstS r1, 6
+  LoadConstS r2, 3
+  Mod r1, r2                  ; +0 -> 1/+0 = Infinity
+  LoadConstS r3, 1
+  Div r3, r1
+  Call r11, r3, 1, r0
+
+  LoadConstS r1, -6
+  LoadConstS r2, 3
+  Mod r1, r2                  ; -0 -> 1/-0 = -Infinity
+  LoadConstS r3, 1
+  Div r3, r1
+  Call r11, r3, 1, r0
+
+  ; INT32_MIN % -1 is -0 (the number lane answers; int % would be UB)
+  LoadConst r1, @cMin
+  LoadConstS r2, -1
+  Mod r1, r2
+  LoadConstS r3, 1
+  Div r3, r1                  ; -Infinity
+  Call r11, r3, 1, r0
+
+  ; --- Shifts: int32 semantics on the Smi lane ---
+  LoadConstS r1, -1
+  LoadConstS r2, 0
+  UShr r1, r2                 ; 4294967295 (> kSmiMax -> HeapNumber)
+  Call r11, r1, 1, r0
+
+  LoadConstS r1, -1
+  LoadConstS r2, 1
+  UShr r1, r2                 ; 2147483647
+  Call r11, r1, 1, r0
+
+  LoadConstS r1, 1
+  LoadConstS r2, 31
+  Shl r1, r2                  ; -2147483648
+  Call r11, r1, 1, r0
+
+  LoadConstS r1, -8
+  LoadConstS r2, 1
+  Shr r1, r2                  ; -4
+  Call r11, r1, 1, r0
+
+  ; --- NaN relational lanes (v0.4 fix: Le/Ge were true for NaN) ---
+  LoadConstS r1, 0
+  LoadConstS r2, 0
+  Div r1, r2                  ; NaN
+  LoadConstS r3, 1
+  Mov r4, r1
+  Le r4, r3                   ; NaN <= 1 -> false
+  Call r11, r4, 1, r0
+  Mov r4, r3
+  Ge r4, r1                   ; 1 >= NaN -> false
+  Call r11, r4, 1, r0
+  Mov r4, r1
+  Lt r4, r3                   ; false
+  Call r11, r4, 1, r0
+  Mov r4, r3
+  Gt r4, r1                   ; false
+  Call r11, r4, 1, r0
+  Mov r4, r3
+  Le r4, r3                   ; 1 <= 1 -> true
+  Call r11, r4, 1, r0
+
+  ; --- StrictEq: Smi vs HeapNumber 2.0 is true; string "2" is false ---
+  LoadConstS r1, 2
+  LoadConst r2, @cTwo
+  StrictEq r1, r2
+  Call r11, r1, 1, r0
+  LoadConst r1, @cStr2
+  StrictEq r1, r2
+  Call r11, r1, 1, r0
+
+  ; --- Number-pair lanes (Smi/HeapNumber mixes) ---
+  LoadConst r1, @cOneHalf
+  LoadConstS r2, 2
+  Add r1, r2                  ; 3.5
+  Call r11, r1, 1, r0
+  LoadConst r1, @cSevenHalf
+  LoadConstS r2, 2
+  Mod r1, r2                  ; 1.5
+  Call r11, r1, 1, r0
+  LoadConstS r1, 0
+  LoadConstS r2, 0
+  Div r1, r2                  ; NaN via the number-pair Div lane
+  Call r11, r1, 1, r0
+
+  Return r0
+.end

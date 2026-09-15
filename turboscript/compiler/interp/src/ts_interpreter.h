@@ -390,6 +390,9 @@ class Isolate {
 
   std::vector<Frame*> frameStack_;  // for stack traces (Rule 75)
   uint32_t callDepth_ = 0;
+  // v0.4 (benchmarks_v0.3.md Section 5 #2): freed frame register files,
+  // reused LIFO by callClosure to avoid a heap allocation per call.
+  std::vector<std::vector<Value>> regPool_;
 
   // Stack traces for error objects (diagnostics; not JS-visible in v0.1).
   std::unordered_map<const Object*, std::vector<std::string>> stackTraces_;

@@ -239,15 +239,27 @@ JsResult<Value> Isolate::callClosure(const Closure* closure, Value thisVal,
   Frame frame;
   frame.fn = fn;
   frame.context = closure->context;
-  frame.regs.assign(fn->registerCount, Value::undefined());
+  // v0.4 (benchmarks_v0.3.md Section 5 #2): reuse a freed register file.
+  // assign() fills without reallocating once the pooled vector has the
+  // capacity; pool depth is bounded (kRegPoolMax, Rule 23).
+  std::vector<Value> regs;
+  if (!regPool_.empty()) {
+    regs = std::move(regPool_.back());
+    regPool_.pop_back();
+  }
+  regs.assign(fn->registerCount, Value::undefined());
   uint32_t bound = argc < fn->paramCount ? argc : fn->paramCount;
-  for (uint32_t i = 0; i < bound; i++) frame.regs[i] = args[i];
+  for (uint32_t i = 0; i < bound; i++) regs[i] = args[i];
+  frame.regs = std::move(regs);
 
   frameStack_.push_back(&frame);
   callDepth_++;
   JsResult<Value> result = runFrame(frame);
   callDepth_--;
   frameStack_.pop_back();
+  if (regPool_.size() < kRegPoolMax) {
+    regPool_.push_back(std::move(frame.regs));
+  }
   return result;
 }
 

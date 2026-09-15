@@ -50,6 +50,9 @@ constexpr uint32_t kCallProfileRing = 4;
 constexpr uint32_t kIndexSymbolCacheMax = 1u << 12;
 constexpr int32_t  kSmiMin = INT32_MIN;
 constexpr int32_t  kSmiMax = INT32_MAX;
+// v0.4: register-file pool depth (callClosure reuses freed frame register
+// vectors; single-threaded T0, Rule 119). Bounded per Rule 23.
+constexpr size_t kRegPoolMax = 128;
 
 // ---------------------------------------------------------------------------
 // Value kinds (Rule 8: no RTTI; the tag is the type).

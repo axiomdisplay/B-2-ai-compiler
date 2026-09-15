@@ -434,6 +434,42 @@ std::string doubleToString(double v) {
   std::string sign = v < 0 ? "-" : "";
   double mag = std::fabs(v);
 
+  // v0.4 fast path (benchmarks_v0.3.md Section 5 #4): integral doubles
+  // below 2^53 are exact uint64 values; emit their digits directly instead
+  // of up to 17 snprintf/strtod round-trips. For such values the shortest
+  // round-trip digit string is the exact integer itself (any shorter digit
+  // string would denote a different real), and after the k <= n zero-fill
+  // both paths render identical text (verified by the differential corpus
+  // and the cross-engine bench checksums, Rule 36).
+  if (mag < 9007199254740992.0) {  // 2^53
+    double ipart;
+    if (std::modf(mag, &ipart) == 0.0) {
+      uint64_t n64 = static_cast<uint64_t>(ipart);
+      char dig[24];
+      int len = 0;
+      do {
+        dig[len++] = static_cast<char>('0' + (n64 % 10));
+        n64 /= 10;
+      } while (n64 != 0);
+      // dig holds the digits reversed.
+      int k = len;      // digit count of the magnitude
+      int n = k;        // value = 0.<digits> * 10^n with n == k here
+      std::string out = sign;
+      if (n > 21) {
+        // Exponential form: d[.rest]e+(n-1) — matches the slow path.
+        out.push_back(dig[len - 1]);
+        if (k > 1) {
+          out.push_back('.');
+          for (int i = len - 2; i >= 0; i--) out.push_back(dig[i]);
+        }
+        out += "e+" + std::to_string(n - 1);
+      } else {
+        for (int i = len - 1; i >= 0; i--) out.push_back(dig[i]);
+      }
+      return out;
+    }
+  }
+
   // Shortest digits: smallest precision p in 1..17 whose %.{p-1}e form
   // round-trips through strtod.
   char buf[64];

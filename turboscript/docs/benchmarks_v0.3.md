@@ -1,6 +1,7 @@
 # TurboScript Tier 0 — Interpreter-Only Benchmark Results (v0.3)
 
-**Status:** v0.3 — element fast path + IC layer + builtins milestone
+**Status:** SUPERSEDED by `benchmarks_v0.4.md` (kept as the v0.3 history;
+its Section 5 register is closed out there).
 **Owner:** TurboScript Interp Team
 **Last Updated:** 2026-09-14
 **Governing Laws:** Rules 36 (differential testing), 55/64 (durable docs), 96

@@ -26,6 +26,56 @@ namespace ts {
 inline Value excValue(const Value& v) { return v; }
 inline Value excValue(const JsException& e) { return e.thrown; }
 
+// ---------------------------------------------------------------------------
+// v0.4 fast-path helpers (benchmarks_v0.3.md Section 5 #1/#3). The guards are
+// conservative: every input the fast path does not claim falls through to the
+// unchanged semantic helper (Rule 96: one semantic source — a fast path is a
+// guard in front of it, never a replacement).
+// ---------------------------------------------------------------------------
+inline bool tsBothSmi(const Value& l, const Value& r) {
+  return l.isSmi() && r.isSmi();
+}
+
+// Inline Smi normalization for fast paths: same contract as normalizeNumber
+// (integral, in Smi range, never -0 — Rule 72), without the call.
+inline Value tsSmiOrNumber(double v) {
+  if (v >= static_cast<double>(kSmiMin) && v <= static_cast<double>(kSmiMax)) {
+    if (static_cast<double>(static_cast<int32_t>(v)) == v &&
+        !(v == 0.0 && std::signbit(v))) {
+      return Value::smi(static_cast<int32_t>(v));
+    }
+  }
+  return Value::heapNumber(v);
+}
+
+// Inline ToBoolean fast lane for branch handlers; pure::toBoolean remains the
+// semantic source for every kind the fast lane does not cover.
+inline bool tsQuickTruthy(const Value& v) {
+  switch (v.kind) {
+    case ValueKind::Boolean:
+      return v.b;
+    case ValueKind::Smi:
+      return v.i32 != 0;
+    case ValueKind::Undefined:
+    case ValueKind::Null:
+      return false;
+    default:
+      return pure::toBoolean(v);
+  }
+}
+
+// String concatenation backend for the L_StringConcat fast lane: one exact
+// allocation, both operands appended (kept out of the handler so handler
+// scopes stay trivially destructible across computed-goto targets).
+inline StringObj* tsConcatStrings(const StringObj* l, const StringObj* r,
+                                  Heap& heap) {
+  std::u16string out;
+  out.reserve(l->data.size() + r->data.size());
+  out.append(l->data);
+  out.append(r->data);
+  return heap.makeString(std::move(out));
+}
+
 JsResult<Value> Isolate::enterAt(const Closure* closure, uint32_t pc,
                                  const std::vector<Value>& registers) {
   // Rule 105: untrusted entry inputs are validated before execution.
@@ -70,10 +120,16 @@ JsResult<Value> Isolate::runFrame(Frame& frame) {
   // fence on the hot path (Rule 7).
   Value* regs = frame.regs.data();
   const uint32_t fnIndex = fn->index;
+  // v0.4: pc -> slot map hoisted to a raw pointer (one dependent load per
+  // recorded op instead of two). slotMap is non-null exactly when fb is;
+  // both derive from the same verifier layout (1:1 with slotOfPc).
   FeedbackSlot* fb =
-      (recordFeedback_ && !feedback_[fnIndex].empty())
+      (recordFeedback_ && !feedback_[fnIndex].empty() &&
+       !fn->slotOfPc.empty())
           ? feedback_[fnIndex].data()
           : nullptr;
+  const uint32_t* slotMap =
+      fb != nullptr ? fn->slotOfPc.data() : nullptr;
   const Value* consts = constants_.data();
   const uint64_t codeHashIgnored = 0;  // (Rule 124: no hidden state)
   (void)codeHashIgnored;
@@ -117,15 +173,27 @@ JsResult<Value> Isolate::runFrame(Frame& frame) {
   } while (0)
 #endif
 
+  // v0.4: static format table (opcode byte -> word width), built once like
+  // the dispatch table. Replaces the per-instruction opcodeInfo() switch in
+  // TS_FIELDS (benchmarks_v0.3.md Section 5: dispatch overhead).
+  static uint8_t kFmtWords[kOpcodeSpace] = {0};
+  static bool kFmtWordsReady = false;
+  if (!kFmtWordsReady) {
+#define TS_OP(name, fmt, effect, ic, roles_expr)                        \
+    kFmtWords[static_cast<uint32_t>(Opcode::k##name)] =                 \
+        static_cast<uint8_t>(formatWordCount(OpFormat::fmt));
+#include "ts_opcodes.inc"
+#undef TS_OP
+    kFmtWordsReady = true;
+  }
+
   // Field decoders for the current word w (and suffix s).
   uint32_t s = 0;
 #define TS_FIELDS()                          \
   do {                                       \
     a_ = (w >> 8) & 0xFF;                    \
     b_ = (w >> 16) & 0xFF;                   \
-    if (formatWordCount(opcodeInfo(          \
-            static_cast<Opcode>(w & 0xFF))   \
-            .format) == 2) {                 \
+    if (kFmtWords[w & 0xFF] == 2) {          \
       s = code[pc + 1];                      \
       c_ = s & 0xFF;                         \
       d_ = (s >> 8) & 0xFF;                  \
@@ -229,7 +297,7 @@ L_LoadGlobal : {
   TS_FIELDS();
   {
     SymbolId nameSym = globalNames_[c_ | (d_ << 8) | (e_ << 16)];
-    FeedbackSlot* fs = fb != nullptr ? &fb[fn->slotOfPc[pc]] : nullptr;
+    FeedbackSlot* fs = fb != nullptr ? &fb[slotMap[pc]] : nullptr;
     // Monomorphic global IC (v0.3): own data property of the global object
     // with a stable shape. Same guard/invariants as the property ICs.
     if (fs != nullptr) {
@@ -258,7 +326,7 @@ L_StoreGlobal : {
   TS_FIELDS();
   {
     SymbolId nameSym = globalNames_[c_ | (d_ << 8) | (e_ << 16)];
-    FeedbackSlot* fs = fb != nullptr ? &fb[fn->slotOfPc[pc]] : nullptr;
+    FeedbackSlot* fs = fb != nullptr ? &fb[slotMap[pc]] : nullptr;
     Value recv = Value::raw(ValueKind::Object, global_);
     if (fs != nullptr) {
       Shape* gshape = global_->shape;
@@ -285,9 +353,16 @@ L_GetProperty : {
   {
     // W2_RR_D layout: a_=dst, b_=receiver, c_=key.
     Value recv = regs[b_];
-    FeedbackSlot* fs = fb != nullptr ? &fb[fn->slotOfPc[pc]] : nullptr;
+    FeedbackSlot* fs = fb != nullptr ? &fb[slotMap[pc]] : nullptr;
     SymbolId keySym;
-    TS_GET(toPropertyKey(regs[c_]), keySym);
+    const Value& kv = regs[c_];
+    // v0.4: const-pool strings cache their interned key id after first use
+    // (v0.3) — the hot lane reads it inline instead of calling toPropertyKey.
+    if (kv.isString() && kv.str->cachedSymbol != kInvalidSymbol) {
+      keySym = kv.str->cachedSymbol;
+    } else {
+      TS_GET(toPropertyKey(kv), keySym);
+    }
     recordPropertySite(fs, recv);
     // Monomorphic IC (v0.3, bytecode_spec.md 8.1): own data property on a
     // stable shape. Guard: shape match, non-accessor, non-hole slot.
@@ -314,9 +389,15 @@ L_SetProperty : {
   TS_FIELDS();
   {
     Value recv = regs[a_];
-    FeedbackSlot* fs = fb != nullptr ? &fb[fn->slotOfPc[pc]] : nullptr;
+    FeedbackSlot* fs = fb != nullptr ? &fb[slotMap[pc]] : nullptr;
     SymbolId keySym;
-    TS_GET(toPropertyKey(regs[b_]), keySym);
+    const Value& kv = regs[b_];
+    // v0.4: cached interned-key fast lane (same as GetProperty's).
+    if (kv.isString() && kv.str->cachedSymbol != kInvalidSymbol) {
+      keySym = kv.str->cachedSymbol;
+    } else {
+      TS_GET(toPropertyKey(kv), keySym);
+    }
     recordPropertySite(fs, recv);
     if (recv.isObjectLike()) {
       Object* obj = objectOfValue(recv);
@@ -465,9 +546,19 @@ L_In : {
 L_Call : {
   TS_FIELDS();
   {
-    if (fb != nullptr) recordCallSite(&fb[fn->slotOfPc[pc]], regs[a_]);
-    TS_GET(callValue(regs[a_], Value::undefined(), &regs[b_], c_),
-           regs[e_]);
+    if (fb != nullptr) recordCallSite(&fb[slotMap[pc]], regs[a_]);
+    // v0.4: direct closure hop — callValue's proxy/native routing only for
+    // non-closure callees (identical semantics, one frame less of C++ calls).
+    if (regs[a_].kind == ValueKind::Closure &&
+        static_cast<const Closure*>(regs[a_].ptr)->funcIndex <
+            kNativeFuncIndexBase) {
+      TS_GET(callClosure(static_cast<const Closure*>(regs[a_].ptr),
+                         Value::undefined(), &regs[b_], c_),
+             regs[e_]);
+    } else {
+      TS_GET(callValue(regs[a_], Value::undefined(), &regs[b_], c_),
+             regs[e_]);
+    }
   }
   pc += 2;
   TS_DISPATCH();
@@ -475,8 +566,16 @@ L_Call : {
 L_CallMethod : {
   TS_FIELDS();
   {
-    if (fb != nullptr) recordCallSite(&fb[fn->slotOfPc[pc]], regs[a_]);
-    TS_GET(callValue(regs[a_], regs[d_], &regs[b_], c_), regs[e_]);
+    if (fb != nullptr) recordCallSite(&fb[slotMap[pc]], regs[a_]);
+    if (regs[a_].kind == ValueKind::Closure &&
+        static_cast<const Closure*>(regs[a_].ptr)->funcIndex <
+            kNativeFuncIndexBase) {
+      TS_GET(callClosure(static_cast<const Closure*>(regs[a_].ptr),
+                         regs[d_], &regs[b_], c_),
+             regs[e_]);
+    } else {
+      TS_GET(callValue(regs[a_], regs[d_], &regs[b_], c_), regs[e_]);
+    }
   }
   pc += 2;
   TS_DISPATCH();
@@ -484,7 +583,7 @@ L_CallMethod : {
 L_Construct : {
   TS_FIELDS();
   {
-    if (fb != nullptr) recordCallSite(&fb[fn->slotOfPc[pc]], regs[a_]);
+    if (fb != nullptr) recordCallSite(&fb[slotMap[pc]], regs[a_]);
     TS_GET(constructImpl(regs[a_], &regs[b_], c_), regs[e_]);
   }
   pc += 2;
@@ -588,13 +687,29 @@ L_GetElement : {
     // W2_RR_D layout: a_=dst, b_=receiver, c_=key. Semantics are exactly
     // GetProperty's (Rule 96: one semantic source — getElementValue); only
     // the feedback class differs (Element-kind sites, bytecode_spec 8).
-    // v0.3: canonical Smi keys hit element storage with no interning
-    // (benchmarks_v0.2.md Section 5 #1); all other keys take the full
-    // ToPropertyKey route inside getElementValue.
+    // v0.4 in-handler element fast path (benchmarks_v0.3.md Section 5 #3):
+    // Smi key on an array receiver with dense storage — bounds-checked
+    // direct read; holes and every other shape of input fall through to
+    // getElementValue unchanged.
     Value recv = regs[b_];
-    FeedbackSlot* fs = fb != nullptr ? &fb[fn->slotOfPc[pc]] : nullptr;
+    FeedbackSlot* fs = fb != nullptr ? &fb[slotMap[pc]] : nullptr;
     recordElementSite(fs, recv);
-    TS_GET(getElementValue(recv, regs[c_]), regs[a_]);
+    const Value& key = regs[c_];
+    if (recv.kind == ValueKind::Object && key.isSmi() && key.i32 >= 0) {
+      Object* obj = static_cast<Object*>(recv.ptr);
+      if (obj->isArray) {
+        uint32_t idx = static_cast<uint32_t>(key.i32);
+        if (idx < obj->elements.size()) {
+          Value v = obj->elements[idx];
+          if (!v.isHole()) {
+            regs[a_] = v;
+            pc += 2;
+            TS_DISPATCH();
+          }
+        }
+      }
+    }
+    TS_GET(getElementValue(recv, key), regs[a_]);
   }
   pc += 2;
   TS_DISPATCH();
@@ -602,11 +717,28 @@ L_GetElement : {
 L_SetElement : {
   TS_FIELDS();
   {
-    // W2_RR_V layout: a_=obj, b_=key, c_=val. Same v0.3 fast path.
+    // W2_RR_V layout: a_=obj, b_=key, c_=val. v0.4 fast path: in-range
+    // dense store over a non-hole slot on an array receiver — the exact
+    // store setArrayElement performs (widen + store + length update), with
+    // no user code reachable (array element slots carry no accessors).
     Value recv = regs[a_];
-    FeedbackSlot* fs = fb != nullptr ? &fb[fn->slotOfPc[pc]] : nullptr;
+    FeedbackSlot* fs = fb != nullptr ? &fb[slotMap[pc]] : nullptr;
     recordElementSite(fs, recv);
-    TS_TAKE(setElementValue(recv, regs[b_], regs[c_]));
+    const Value& key = regs[b_];
+    if (recv.kind == ValueKind::Object && key.isSmi() && key.i32 >= 0) {
+      Object* obj = static_cast<Object*>(recv.ptr);
+      if (obj->isArray) {
+        uint32_t idx = static_cast<uint32_t>(key.i32);
+        if (idx < obj->elements.size() && !obj->elements[idx].isHole()) {
+          widenElementsFor(obj, regs[c_]);
+          obj->elements[idx] = regs[c_];
+          if (obj->length <= idx) obj->length = idx + 1;
+          pc += 2;
+          TS_DISPATCH();
+        }
+      }
+    }
+    TS_TAKE(setElementValue(recv, key, regs[c_]));
   }
   pc += 2;
   TS_DISPATCH();
@@ -625,38 +757,227 @@ L_GetContext : {
 }
 L_Add : {
   TS_FIELDS();
-  TS_GET(addValues(regs[a_], regs[b_],
-                   fb != nullptr ? &fb[fn->slotOfPc[pc]] : nullptr),
-         regs[a_]);
+  {
+    FeedbackSlot* fs = fb != nullptr ? &fb[slotMap[pc]] : nullptr;
+    if (fs != nullptr) recordBinarySite(fs, regs[a_], regs[b_]);
+    // v0.4 Smi fast path (benchmarks_v0.3.md Section 5 #1): Smi+Smi with an
+    // int64 range guard. Everything else — overflow, doubles, strings,
+    // BigInt, user hooks — falls through to addValues unchanged (Rule 96:
+    // the fast path is a guard in front of the semantic source).
+    if (tsBothSmi(regs[a_], regs[b_])) {
+      int64_t sum = static_cast<int64_t>(regs[a_].i32) + regs[b_].i32;
+      if (sum >= kSmiMin && sum <= kSmiMax) {
+        regs[a_] = Value::smi(static_cast<int32_t>(sum));
+        pc += 1;
+        TS_DISPATCH();
+      }
+    }
+    // v0.4 number-pair lane: two numbers add as IEEE doubles (the exact
+    // computation addValues performs after identity conversions).
+    if (regs[a_].isNumber() && regs[b_].isNumber()) {
+      regs[a_] = tsSmiOrNumber(regs[a_].asDouble() + regs[b_].asDouble());
+      pc += 1;
+      TS_DISPATCH();
+    }
+    TS_GET(addValues(regs[a_], regs[b_], nullptr), regs[a_]);
+  }
   pc += 1;
   TS_DISPATCH();
 }
-L_Sub :
-L_Mul :
-L_Div :
-L_Mod :
+L_Sub : {
+  TS_FIELDS();
+  {
+    if (tsBothSmi(regs[a_], regs[b_])) {
+      int64_t diff = static_cast<int64_t>(regs[a_].i32) - regs[b_].i32;
+      if (diff >= kSmiMin && diff <= kSmiMax) {
+        regs[a_] = Value::smi(static_cast<int32_t>(diff));
+        pc += 1;
+        TS_DISPATCH();
+      }
+    }
+    if (regs[a_].isNumber() && regs[b_].isNumber()) {
+      regs[a_] = tsSmiOrNumber(regs[a_].asDouble() - regs[b_].asDouble());
+      pc += 1;
+      TS_DISPATCH();
+    }
+    TS_GET(arithValues(regs[a_], regs[b_], Opcode::kSub), regs[a_]);
+  }
+  pc += 1;
+  TS_DISPATCH();
+}
+L_Mul : {
+  TS_FIELDS();
+  {
+    if (tsBothSmi(regs[a_], regs[b_])) {
+      int64_t prod = static_cast<int64_t>(regs[a_].i32) *
+                     static_cast<int64_t>(regs[b_].i32);
+      if (prod >= kSmiMin && prod <= kSmiMax) {
+        regs[a_] = Value::smi(static_cast<int32_t>(prod));
+        pc += 1;
+        TS_DISPATCH();
+      }
+    }
+    if (regs[a_].isNumber() && regs[b_].isNumber()) {
+      regs[a_] = tsSmiOrNumber(regs[a_].asDouble() * regs[b_].asDouble());
+      pc += 1;
+      TS_DISPATCH();
+    }
+    TS_GET(arithValues(regs[a_], regs[b_], Opcode::kMul), regs[a_]);
+  }
+  pc += 1;
+  TS_DISPATCH();
+}
+L_Div : {
+  TS_FIELDS();
+  {
+    // Smi/Smi and number-pair lanes: IEEE double arithmetic (exactly the
+    // computation arithValues performs after identity conversions),
+    // normalized inline. INT32_MIN / -1 is exact at 2^31 in double.
+    if (regs[a_].isNumber() && regs[b_].isNumber()) {
+      regs[a_] = tsSmiOrNumber(regs[a_].asDouble() / regs[b_].asDouble());
+      pc += 1;
+      TS_DISPATCH();
+    }
+    TS_GET(arithValues(regs[a_], regs[b_], Opcode::kDiv), regs[a_]);
+  }
+  pc += 1;
+  TS_DISPATCH();
+}
+L_Mod : {
+  TS_FIELDS();
+  {
+    // JS remainder: sign of the dividend; a zero result is -0 when the
+    // dividend is negative (normalizeNumber keeps -0 a HeapNumber, Rule 72;
+    // std::fmod's zero result already carries the dividend's sign).
+    // x % 0 is NaN. INT32_MIN % -1 is UB for int -> the number lane handles
+    // it as fmod(-2147483648.0, -1.0) = -0.
+    if (regs[a_].isNumber() && regs[b_].isNumber()) {
+      regs[a_] =
+          tsSmiOrNumber(std::fmod(regs[a_].asDouble(), regs[b_].asDouble()));
+      pc += 1;
+      TS_DISPATCH();
+    }
+    if (tsBothSmi(regs[a_], regs[b_])) {
+      int32_t l = regs[a_].i32;
+      int32_t r = regs[b_].i32;
+      if (!(l == kSmiMin && r == -1)) {
+        int32_t m = l % r;
+        if (m != 0) {
+          regs[a_] = Value::smi(m);
+        } else if (l < 0) {
+          regs[a_] = Value::heapNumber(-0.0);
+        } else {
+          regs[a_] = Value::smi(0);
+        }
+        pc += 1;
+        TS_DISPATCH();
+      }
+    }
+    TS_GET(arithValues(regs[a_], regs[b_], Opcode::kMod), regs[a_]);
+  }
+  pc += 1;
+  TS_DISPATCH();
+}
 L_Pow : {
   TS_FIELDS();
-  TS_GET(arithValues(regs[a_], regs[b_], static_cast<Opcode>(w & 0xFF)),
-         regs[a_]);
+  TS_GET(arithValues(regs[a_], regs[b_], Opcode::kPow), regs[a_]);
   pc += 1;
   TS_DISPATCH();
 }
-L_BitAnd :
-L_BitOr :
-L_BitXor :
-L_Shl :
-L_Shr :
+L_BitAnd : {
+  TS_FIELDS();
+  {
+    if (tsBothSmi(regs[a_], regs[b_])) {
+      regs[a_] = Value::smi(regs[a_].i32 & regs[b_].i32);
+      pc += 1;
+      TS_DISPATCH();
+    }
+    TS_GET(bitwiseValues(regs[a_], regs[b_], Opcode::kBitAnd), regs[a_]);
+  }
+  pc += 1;
+  TS_DISPATCH();
+}
+L_BitOr : {
+  TS_FIELDS();
+  {
+    if (tsBothSmi(regs[a_], regs[b_])) {
+      regs[a_] = Value::smi(regs[a_].i32 | regs[b_].i32);
+      pc += 1;
+      TS_DISPATCH();
+    }
+    TS_GET(bitwiseValues(regs[a_], regs[b_], Opcode::kBitOr), regs[a_]);
+  }
+  pc += 1;
+  TS_DISPATCH();
+}
+L_BitXor : {
+  TS_FIELDS();
+  {
+    if (tsBothSmi(regs[a_], regs[b_])) {
+      regs[a_] = Value::smi(regs[a_].i32 ^ regs[b_].i32);
+      pc += 1;
+      TS_DISPATCH();
+    }
+    TS_GET(bitwiseValues(regs[a_], regs[b_], Opcode::kBitXor), regs[a_]);
+  }
+  pc += 1;
+  TS_DISPATCH();
+}
+L_Shl : {
+  TS_FIELDS();
+  {
+    if (tsBothSmi(regs[a_], regs[b_])) {
+      // ToInt32(x) << (y & 31); Smis are already int32 (Rule 72).
+      regs[a_] = Value::smi(regs[a_].i32 << (regs[b_].i32 & 31));
+      pc += 1;
+      TS_DISPATCH();
+    }
+    TS_GET(bitwiseValues(regs[a_], regs[b_], Opcode::kShl), regs[a_]);
+  }
+  pc += 1;
+  TS_DISPATCH();
+}
+L_Shr : {
+  TS_FIELDS();
+  {
+    if (tsBothSmi(regs[a_], regs[b_])) {
+      // Arithmetic shift right of a negative value is value-defined for
+      // int32 in C++20 and later (matches ToInt32(x) >> (y & 31)).
+      regs[a_] = Value::smi(regs[a_].i32 >> (regs[b_].i32 & 31));
+      pc += 1;
+      TS_DISPATCH();
+    }
+    TS_GET(bitwiseValues(regs[a_], regs[b_], Opcode::kShr), regs[a_]);
+  }
+  pc += 1;
+  TS_DISPATCH();
+}
 L_UShr : {
   TS_FIELDS();
-  TS_GET(bitwiseValues(regs[a_], regs[b_], static_cast<Opcode>(w & 0xFF)),
-         regs[a_]);
+  {
+    if (tsBothSmi(regs[a_], regs[b_])) {
+      uint32_t u = static_cast<uint32_t>(regs[a_].i32) >>
+                   (regs[b_].i32 & 31);
+      regs[a_] = u <= static_cast<uint32_t>(kSmiMax)
+                     ? Value::smi(static_cast<int32_t>(u))
+                     : Value::heapNumber(static_cast<double>(u));
+      pc += 1;
+      TS_DISPATCH();
+    }
+    TS_GET(bitwiseValues(regs[a_], regs[b_], Opcode::kUShr), regs[a_]);
+  }
   pc += 1;
   TS_DISPATCH();
 }
 L_BitNot : {
   TS_FIELDS();
   {
+    if (regs[a_].isSmi()) {
+      // ~ on int32 is exact and stays in range.
+      regs[a_] = Value::smi(~regs[a_].i32);
+      pc += 1;
+      TS_DISPATCH();
+    }
     Value n;
     TS_GET(toNumberValue(regs[a_]), n);
     regs[a_] = normalizeNumber(
@@ -685,6 +1006,17 @@ L_BigIntNeg : {
 L_Neg : {
   TS_FIELDS();
   {
+    if (regs[a_].isSmi()) {
+      // Smi negation: 0 -> -0 (HeapNumber, Rule 72), INT32_MIN -> 2^31.
+      int32_t i = regs[a_].i32;
+      regs[a_] = i == 0
+                     ? Value::heapNumber(-0.0)
+                     : i == kSmiMin
+                           ? Value::heapNumber(-static_cast<double>(i))
+                           : Value::smi(-i);
+      pc += 1;
+      TS_DISPATCH();
+    }
     Value n;
     TS_GET(toNumericValue(regs[a_]), n);
     if (n.isBigInt()) {
@@ -701,6 +1033,19 @@ L_Neg : {
 L_Inc : {
   TS_FIELDS();
   {
+    if (regs[a_].isSmi()) {
+      int32_t i = regs[a_].i32;
+      regs[a_] = i == kSmiMax
+                     ? Value::heapNumber(static_cast<double>(kSmiMax) + 1.0)
+                     : Value::smi(i + 1);
+      pc += 1;
+      TS_DISPATCH();
+    }
+    if (regs[a_].isHeapNumber()) {
+      regs[a_] = tsSmiOrNumber(regs[a_].num + 1.0);
+      pc += 1;
+      TS_DISPATCH();
+    }
     Value n;
     TS_GET(toNumericValue(regs[a_]), n);
     if (n.isBigInt()) {
@@ -718,6 +1063,19 @@ L_Inc : {
 L_Dec : {
   TS_FIELDS();
   {
+    if (regs[a_].isSmi()) {
+      int32_t i = regs[a_].i32;
+      regs[a_] = i == kSmiMin
+                     ? Value::heapNumber(static_cast<double>(kSmiMin) - 1.0)
+                     : Value::smi(i - 1);
+      pc += 1;
+      TS_DISPATCH();
+    }
+    if (regs[a_].isHeapNumber()) {
+      regs[a_] = tsSmiOrNumber(regs[a_].num - 1.0);
+      pc += 1;
+      TS_DISPATCH();
+    }
     Value n;
     TS_GET(toNumericValue(regs[a_]), n);
     if (n.isBigInt()) {
@@ -732,22 +1090,88 @@ L_Dec : {
   pc += 1;
   TS_DISPATCH();
 }
-L_Lt :
-L_Le :
-L_Gt :
+L_Lt : {
+  TS_FIELDS();
+  {
+    if (tsBothSmi(regs[a_], regs[b_])) {
+      regs[a_] = Value::boolean(regs[a_].i32 < regs[b_].i32);
+      pc += 1;
+      TS_DISPATCH();
+    }
+    if (regs[a_].isNumber() && regs[b_].isNumber()) {
+      regs[a_] = Value::boolean(regs[a_].asDouble() < regs[b_].asDouble());
+      pc += 1;
+      TS_DISPATCH();
+    }
+    Relational rel = Relational::Unordered;
+    TS_GET(relationalCompare(regs[a_], regs[b_]), rel);
+    regs[a_] = Value::boolean(rel == Relational::Less);
+  }
+  pc += 1;
+  TS_DISPATCH();
+}
+L_Le : {
+  TS_FIELDS();
+  {
+    if (tsBothSmi(regs[a_], regs[b_])) {
+      regs[a_] = Value::boolean(regs[a_].i32 <= regs[b_].i32);
+      pc += 1;
+      TS_DISPATCH();
+    }
+    if (regs[a_].isNumber() && regs[b_].isNumber()) {
+      regs[a_] = Value::boolean(regs[a_].asDouble() <= regs[b_].asDouble());
+      pc += 1;
+      TS_DISPATCH();
+    }
+    Relational rel = Relational::Unordered;
+    TS_GET(relationalCompare(regs[a_], regs[b_]), rel);
+    // x <= y is !(x > y): false when Unordered (NaN) — v0.4 fix, the prior
+    // mapping (rel != Greater) returned true for NaN (Rule 96 defect).
+    regs[a_] = Value::boolean(rel == Relational::Less ||
+                              rel == Relational::Equal);
+  }
+  pc += 1;
+  TS_DISPATCH();
+}
+L_Gt : {
+  TS_FIELDS();
+  {
+    if (tsBothSmi(regs[a_], regs[b_])) {
+      regs[a_] = Value::boolean(regs[a_].i32 > regs[b_].i32);
+      pc += 1;
+      TS_DISPATCH();
+    }
+    if (regs[a_].isNumber() && regs[b_].isNumber()) {
+      regs[a_] = Value::boolean(regs[a_].asDouble() > regs[b_].asDouble());
+      pc += 1;
+      TS_DISPATCH();
+    }
+    Relational rel = Relational::Unordered;
+    TS_GET(relationalCompare(regs[a_], regs[b_]), rel);
+    regs[a_] = Value::boolean(rel == Relational::Greater);
+  }
+  pc += 1;
+  TS_DISPATCH();
+}
 L_Ge : {
   TS_FIELDS();
   {
+    if (tsBothSmi(regs[a_], regs[b_])) {
+      regs[a_] = Value::boolean(regs[a_].i32 >= regs[b_].i32);
+      pc += 1;
+      TS_DISPATCH();
+    }
+    if (regs[a_].isNumber() && regs[b_].isNumber()) {
+      regs[a_] = Value::boolean(regs[a_].asDouble() >= regs[b_].asDouble());
+      pc += 1;
+      TS_DISPATCH();
+    }
     Relational rel = Relational::Unordered;
     TS_GET(relationalCompare(regs[a_], regs[b_]), rel);
-    bool result;
-    switch (static_cast<Opcode>(w & 0xFF)) {
-      case Opcode::kLt: result = rel == Relational::Less; break;
-      case Opcode::kLe: result = rel != Relational::Greater; break;
-      case Opcode::kGt: result = rel == Relational::Greater; break;
-      default: result = rel != Relational::Less; break;  // Ge
-    }
-    regs[a_] = Value::boolean(result);
+    // x >= y is !(x < y): false when Unordered (NaN) — v0.4 fix, same
+    // mapping defect as Le (Rule 96).
+    regs[a_] = Value::boolean(rel == Relational::Greater ||
+                              rel == Relational::Equal);
   }
   pc += 1;
   TS_DISPATCH();
@@ -764,21 +1188,37 @@ L_AbstractEq : {
 }
 L_StrictEq : {
   TS_FIELDS();
-  if (fb != nullptr) recordBinarySite(&fb[fn->slotOfPc[pc]], regs[a_], regs[b_]);
-  regs[a_] = Value::boolean(pure::strictEquals(regs[a_], regs[b_]));
+  {
+    if (fb != nullptr)
+      recordBinarySite(&fb[slotMap[pc]], regs[a_], regs[b_]);
+    // v0.4 fast lanes: Smi==Smi, and different kinds that cannot both be
+    // numbers (5 === 5.0 is true across the Smi/HeapNumber split).
+    if (tsBothSmi(regs[a_], regs[b_])) {
+      regs[a_] = Value::boolean(regs[a_].i32 == regs[b_].i32);
+      pc += 1;
+      TS_DISPATCH();
+    }
+    if (regs[a_].kind != regs[b_].kind &&
+        !(regs[a_].isNumber() && regs[b_].isNumber())) {
+      regs[a_] = Value::boolean(false);
+      pc += 1;
+      TS_DISPATCH();
+    }
+    regs[a_] = Value::boolean(pure::strictEquals(regs[a_], regs[b_]));
+  }
   pc += 1;
   TS_DISPATCH();
 }
 L_SameValue : {
   TS_FIELDS();
-  if (fb != nullptr) recordBinarySite(&fb[fn->slotOfPc[pc]], regs[a_], regs[b_]);
+  if (fb != nullptr) recordBinarySite(&fb[slotMap[pc]], regs[a_], regs[b_]);
   regs[a_] = Value::boolean(pure::sameValue(regs[a_], regs[b_]));
   pc += 1;
   TS_DISPATCH();
 }
 L_SameValueZero : {
   TS_FIELDS();
-  if (fb != nullptr) recordBinarySite(&fb[fn->slotOfPc[pc]], regs[a_], regs[b_]);
+  if (fb != nullptr) recordBinarySite(&fb[slotMap[pc]], regs[a_], regs[b_]);
   regs[a_] = Value::boolean(pure::sameValueZero(regs[a_], regs[b_]));
   pc += 1;
   TS_DISPATCH();
@@ -858,6 +1298,13 @@ L_ToPrimitive : {
 L_StringConcat : {
   TS_FIELDS();
   {
+    // v0.4: both-strings fast lane (no conversion, single exact allocation).
+    if (regs[a_].isString() && regs[b_].isString()) {
+      regs[a_] = Value::string(
+          tsConcatStrings(regs[a_].str, regs[b_].str, heap_));
+      pc += 1;
+      TS_DISPATCH();
+    }
     Value ls;
     TS_GET(toStringValue(regs[a_]), ls);
     Value rs;
@@ -943,12 +1390,12 @@ L_JmpFalseWide : {
   TS_FIELDS();
   {
     Opcode op = static_cast<Opcode>(w & 0xFF);
-    bool cond = pure::toBoolean(regs[a_]);
+    bool cond = tsQuickTruthy(regs[a_]);  // v0.4: inlined fast lane
     bool jumps = (op == Opcode::kJmpTrue || op == Opcode::kJmpTrueWide)
                      ? cond
                      : !cond;
     if (fb != nullptr)
-      recordBranchSite(&fb[fn->slotOfPc[pc]], jumps);
+      recordBranchSite(&fb[slotMap[pc]], jumps);
     if (jumps) {
       if (op == Opcode::kJmpTrueWide || op == Opcode::kJmpFalseWide) {
         int32_t off = static_cast<int32_t>(c_ | (d_ << 8) | (e_ << 16));

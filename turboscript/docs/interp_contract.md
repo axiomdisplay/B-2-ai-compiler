@@ -1,8 +1,8 @@
 # TurboScript Tier 0 Interpreter Contract
 
-**Status:** Draft v0.3
+**Status:** Draft v0.4
 **Owner:** TurboScript Interp Team
-**Last Updated:** 2026-09-14
+**Last Updated:** 2026-09-15
 **Governing Laws:** `docs/laws/turboscript_compiler_laws.md`
 **Implements:** Part I Tier 0; Rules 4, 6, 7, 8, 9, 16, 23, 26, 32, 41, 47, 52, 58, 60, 72, 74, 83, 90, 96, 114, 119, 120, 124, 143
 
@@ -27,7 +27,7 @@ exactly (Rules 4 and 83 — implemented as the `enterAt` entry API, Section 6).
   exception slot used by `Rethrow`.
 - **Calls:** `Call`/`CallMethod`/`Construct` push a frame and recurse into
   the frame runner (C++ recursion). The JS call depth is bounded by
-  `kDefaultMaxCallDepth` (Rule 90): exceeding it raises a JavaScript
+  `kMaxCallDepth` (Rule 90): exceeding it raises a JavaScript
   `RangeError` ("Maximum call stack size exceeded"), never a native crash.
 
 ## 2. C++ Constraint Compliance
@@ -35,7 +35,7 @@ exactly (Rules 4 and 83 — implemented as the `enterAt` entry API, Section 6).
 | Law | Implementation |
 |---|---|
 | Rule 6 (no exceptions on hot path) | Built with `-fno-exceptions`. All fallible APIs return `TsResult<T>` (`std::expected`). JS exceptions are values flowing through the frame stack per `bytecode_spec.md` Section 7 — they are not C++ exceptions. |
-| Rule 7 (zero-allocation hot path) | The dispatch loop performs no C++ allocation on its steady path: register files are sized once at frame entry; property lookups use pre-interned keys; the heap uses arena ownership (see below). Deopt/enterAt materialization is a controlled, budgeted path. |
+| Rule 7 (zero-allocation hot path) | The dispatch loop performs no C++ allocation on its steady path: register files come from a bounded LIFO pool (`kRegPoolMax`, reused across frames); property lookups use pre-interned keys; the heap uses arena ownership (see below). Deopt/enterAt materialization is a controlled, budgeted path. |
 | Rule 8 (no RTTI) | Built with `-fno-rtti`. The value model is a tagged union; no `dynamic_cast` exists. |
 | Rule 9 (no shared_ptr/function in hot code) | Raw pointers + indices only inside the interpreter; ownership lives in the Heap. |
 | Rule 16 (interned symbols) | All property keys and global names are interned `SymbolId` (uint32). No `std::string` comparisons on the hot path. |
@@ -103,6 +103,28 @@ exactly (Rules 4 and 83 — implemented as the `enterAt` entry API, Section 6).
   ToString/FromString base 10. Mixed Number/BigInt arithmetic → TypeError;
   BigInt division/modulo by 0n → RangeError (Rule 72).
 
+### 3.4 Fast-Path Guard Discipline (v0.4)
+
+The dispatch handlers contain in-handler fast lanes (Smi arithmetic,
+number-pair arithmetic, dense element access, cached property keys,
+branch truthiness, closure call hops). Their contract, enforced by the
+differential corpus (`fastpath_smi_edges`, `fastpath_tostring`) and by
+the cross-engine bench checksums:
+
+- A fast path is a **guard in front of the semantic helper, never a
+  replacement** (Rule 96). Any input the lane does not provably cover
+  (overflow, -0, NaN, holes, hooks, uncached keys) executes the unchanged
+  helper the oracles verified.
+- Lanes preserve the slow path's observable results exactly, including
+  -0 vs +0 (Rule 72), Smi-range overflow to HeapNumber, IEEE remainder
+  sign rules, and ToInt32 shift semantics.
+- Feedback recording is identical on fast and slow lanes (Rule 124:
+  deterministic profiles regardless of which lane executed).
+- Relational comparison is `x < y` / `x > y` semantics: `Unordered` (NaN)
+  is false for ALL four comparison opcodes (v0.4 fix — Le/Ge previously
+  returned true for NaN, caught by the fast-path review against node and
+  quickjs).
+
 ## 4. Exception Handling
 
 Per `bytecode_spec.md` Section 7 (handler table). Guarantees:
@@ -163,7 +185,13 @@ TsResult<Value> enterAt(const Closure*, uint32_t pc,
   routing (`"1"` vs `"01"`), named properties on arrays, the 2^32
   boundaries (4294967294 sparse element, 4294967295 named property),
   sparse-shrink interaction, BigInt keys (`1n` -> element 1), and
-  Get/SetElement vs Get/SetProperty parity (Rule 96).
+  Get/SetElement vs Get/SetProperty parity (Rule 96). The v0.4
+  fast-path corpus (`fastpath_smi_edges`, `fastpath_tostring`) pins the
+  new in-handler lanes to goldens generated from node AND quickjs
+  agreement: Smi overflow lanes, -0 probes through `1/x`, IEEE remainder
+  signs (`INT32_MIN % -1` -> -0), ToInt32 shifts, `>>>` above kSmiMax,
+  the NaN relational fix, and the doubleToString integer fast path
+  (integral doubles < 2^53 vs shortest-round-trip exotics).
 - Test names encode the behavior proven (`bigint_mixed_number_add_throws`,
   ...) (Rule 41). The enterAt reconstruction guarantee (Rules 4/83) is
   proven by the `deopt_enter_at_reconstructs_registers` checks in

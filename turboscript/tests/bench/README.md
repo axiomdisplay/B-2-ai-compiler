@@ -1,8 +1,8 @@
 # tests/bench — Interpreter-Only Benchmark Suite
 
-Six kernels, each shipped twice: TSBC assembly (`.tsbc`) for TurboScript
+Seven kernels, each shipped twice: TSBC assembly (`.tsbc`) for TurboScript
 Tier 0 and JS (`.js`) for the comparison engines. Results and analysis:
-`../../docs/benchmarks_v0.2.md`.
+`../../docs/benchmarks_v0.4.md` (current), history: `benchmarks_v0.2/v0.3.md`.
 
 ## Run
 

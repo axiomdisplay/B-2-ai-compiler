@@ -1,0 +1,59 @@
+; v0.4 doubleToString fast-path differential (benchmarks_v0.3.md Section 5
+; #4): integral doubles < 2^53 take the hand-rolled digit path; everything
+; else keeps the shortest-round-trip algorithm. The golden .out is generated
+; from node AND quickjs (both must agree; Rule 36).
+.module fastpath_tostring
+.global @print
+.entry @main
+
+.const @cHalf = 0.5
+.const @cHundred = 100
+.const @c1e15 = 1000000000000000
+.const @cMax53 = 9007199254740991
+.const @c1e21 = 1e+21
+.const @cTenth = 0.1
+.const @cTiny = 2.5e-7
+.const @cBig = 123456789.25
+
+.function @main 0 12
+  LoadGlobal r11, @print
+
+  LoadConstS r1, 42
+  Call r11, r1, 1, r0         ; 42
+  LoadConstS r1, -42
+  Call r11, r1, 1, r0         ; -42
+  LoadConst r1, @cHalf
+  Call r11, r1, 1, r0         ; 0.5
+  LoadConst r1, @cHundred
+  Call r11, r1, 1, r0         ; 100
+  LoadConst r1, @c1e15
+  Call r11, r1, 1, r0         ; 1000000000000000
+  LoadConst r1, @cMax53
+  Call r11, r1, 1, r0         ; 9007199254740991
+  LoadConst r1, @c1e21
+  Call r11, r1, 1, r0         ; 1e+21
+  LoadConst r1, @cTenth
+  Call r11, r1, 1, r0         ; 0.1
+  LoadConst r1, @cTiny
+  Call r11, r1, 1, r0         ; 2.5e-7
+  LoadConst r1, @cBig
+  Call r11, r1, 1, r0         ; 123456789.25
+  LoadConstS r1, 1
+  LoadConstS r2, 3
+  Div r1, r2
+  Call r11, r1, 1, r0         ; 0.3333333333333333
+  LoadConstS r1, 0
+  LoadConstS r2, 0
+  Div r1, r2
+  Call r11, r1, 1, r0         ; NaN
+  LoadConstS r1, 1
+  LoadConstS r2, 0
+  Div r1, r2
+  Call r11, r1, 1, r0         ; Infinity
+  LoadConstS r1, -1
+  LoadConstS r2, 0
+  Div r1, r2
+  Call r11, r1, 1, r0         ; -Infinity
+
+  Return r0
+.end
