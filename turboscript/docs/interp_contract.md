@@ -1,8 +1,8 @@
 # TurboScript Tier 0 Interpreter Contract
 
-**Status:** Draft v0.4
+**Status:** Draft v0.5
 **Owner:** TurboScript Interp Team
-**Last Updated:** 2026-09-15
+**Last Updated:** 2026-09-16
 **Governing Laws:** `docs/laws/turboscript_compiler_laws.md`
 **Implements:** Part I Tier 0; Rules 4, 6, 7, 8, 9, 16, 23, 26, 32, 41, 47, 52, 58, 60, 72, 74, 83, 90, 96, 114, 119, 120, 124, 143
 
@@ -43,7 +43,54 @@ exactly (Rules 4 and 83 — implemented as the `enterAt` entry API, Section 6).
 | Rule 32 (bitmasked orthogonal state) | Object/property attribute state is `Flags<P propAttrs>` bitmasks; raw int flags are forbidden. |
 | Rule 48 (`[[nodiscard]]`) | All `TsResult` returns are `[[nodiscard]]`. |
 
-## 3. Value Model (strict-mode semantics, v0.3)
+## 3. Value Model (strict-mode semantics)
+
+### 3.0 64-bit NaN-boxed Representation (v0.5, normative)
+
+A `Value` slot is exactly 8 bytes (`sizeof(Value) == 8`, trivially copyable;
+frame reconstruction stays a plain memcpy). Normative encoding:
+
+- **double**: raw IEEE-754 bits, with one exception — every NaN is
+  canonicalized to +qNaN (`0x7FF8000000000000`) at boxing. A NaN's sign and
+  payload are unobservable through values (no TypedArray layer exists to
+  smuggle payloads; `Object.is`/`SameValue`/`SameValueZero` are payload-
+  blind; string conversion prints "NaN"), so canonicalization has no
+  semantic surface (Rule 72/-0 unaffected: -0.0 is not a NaN and stays raw).
+- **tagged**: `0x1FFF` (top 13 bits) | kind nibble (bits 50..47) | payload
+  (bits 46..0). The tag prefix forces sign=1, exponent=all-ones,
+  mantissa[51]=1 — only negative NaNs can match it, and boxing
+  canonicalization guarantees no stored double ever does. **The boundary is
+  13 bits, not 12, specifically so -Infinity (mantissa 0) stays a double**;
+  a 12-bit tag would have collided with it. Caught by the corpus
+  (Rule 36) during the v0.5 port and pinned by compile-time
+  `static_assert` proofs in `ts_value.h` (`value_enc` namespace: tag/NaN
+  disjointness including ±Inf, Smi round-trips, constant decodes).
+- Kind payloads: Undefined/Null/Hole = 0 (single-compare constants);
+  Boolean = 0/1; Smi = low 32 bits (kSmiMin/kSmiMax unchanged, sign-
+  extending unbox); pointer kinds = the full 47-bit heap pointer
+  (Linux user VA < 2^47; deque-backed stable addresses, no base+offset
+  arithmetic, no compressed-pointer cage).
+- All double boxing funnels through `Value::heapNumber` (the single
+  canonicalization point) or `normalizeNumber`/`tsSmiOrNumber` (same
+  contract). Fast lanes box results only through these.
+- `kind()` decodes doubles to `ValueKind::HeapNumber` (the phantom kind of
+  the untagged space); pointer-kind identity comparisons are u64 compares.
+- Why: every register read/write, slot load and Mov moves 8 bytes instead
+  of 16 — the dominant structural term measured in benchmarks_v0.4.md
+  Section 3 (closed: geomean 0.49x -> 0.65x vs Ignition, benchmarks_v0.5.md).
+
+### 3.0.1 Call-path structure (v0.5)
+
+- `Closure` caches its resolved `Function*` at creation; `callClosure`
+  does not walk the module function table per call.
+- `Isolate::CallSetup` (built once at `loadModule`) holds the per-function
+  feedback pointer, pc->slot map pointer and a has-feedback flag;
+  `runFrame`'s prologue is one indexed load plus one `recordFeedback_`
+  branch. The runtime `recordFeedback_` toggle stays live (Rule 124).
+- `frameStack_` is pre-reserved to `kMaxCallDepth` (Rule 90 bound).
+- Slot vectors grow with `kMinSlotCapacity` floor (geometric reserve at
+  transition pushes). Storage-only: `slotCount` is shape-driven and all
+  IC/lookup paths read shape->slotCount, never capacity (Rule 96).
 
 - Tagged values: Undefined, Null, Boolean, Smi (int32), HeapNumber (double),
   String (UTF-16), Object (incl. arrays), BigInt, **Symbol (v0.3)**,

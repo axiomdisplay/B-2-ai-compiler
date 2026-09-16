@@ -53,6 +53,10 @@ constexpr int32_t  kSmiMax = INT32_MAX;
 // v0.4: register-file pool depth (callClosure reuses freed frame register
 // vectors; single-threaded T0, Rule 119). Bounded per Rule 23.
 constexpr size_t kRegPoolMax = 128;
+// v0.5: slot-vector growth floor (shape-transition stores). A fresh k-slot
+// object (k <= floor) allocates its slot vector once instead of once per
+// transition. Storage-only: slotCount stays shape-driven.
+constexpr size_t kMinSlotCapacity = 4;
 
 // ---------------------------------------------------------------------------
 // Value kinds (Rule 8: no RTTI; the tag is the type).

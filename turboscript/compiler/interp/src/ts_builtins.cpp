@@ -21,8 +21,8 @@ namespace {
 // thisVal must be an array; TypeError otherwise (v0.3: no generic
 // array-likes — registered divergence).
 JsResult<Object*> requireArray(Isolate& iso, Value thisVal, const char* who) {
-  if (thisVal.kind == ValueKind::Object) {
-    Object* obj = static_cast<Object*>(thisVal.ptr);
+  if (thisVal.kind() == ValueKind::Object) {
+    Object* obj = static_cast<Object*>(thisVal.asPtr());
     if (obj->isArray) return obj;
   }
   return std::unexpected(iso.typeError(
@@ -71,7 +71,7 @@ Object* newArrayObject(Isolate& iso) {
 [[nodiscard]] JsResult<std::u16string> toStr(Isolate& iso, const Value& v) {
   JsResult<Value> s = iso.toStringValue(v);
   if (!s) return std::unexpected(s.error());
-  return s->str->data;
+  return s->asString()->data;
 }
 
 }  // namespace
@@ -84,8 +84,8 @@ namespace {
 JsResult<Value> builtinObjectToString(Isolate& iso, Value thisVal,
                                       const Value*, uint32_t) {
   const char* tag = "Object";
-  if (thisVal.kind == ValueKind::Object &&
-      static_cast<Object*>(thisVal.ptr)->isArray) {
+  if (thisVal.kind() == ValueKind::Object &&
+      static_cast<Object*>(thisVal.asPtr())->isArray) {
     tag = "Array";
   }
   std::u16string out = u"[object ";
@@ -331,9 +331,9 @@ JsResult<Value> builtinArrayConcat(Isolate& iso, Value thisVal,
   JsResult<bool> self = spread(*arrR);
   if (!self) return std::unexpected(self.error());
   for (uint32_t a = 0; a < argc; a++) {
-    if (args[a].kind == ValueKind::Object &&
-        static_cast<Object*>(args[a].ptr)->isArray) {
-      JsResult<bool> r = spread(static_cast<Object*>(args[a].ptr));
+    if (args[a].kind() == ValueKind::Object &&
+        static_cast<Object*>(args[a].asPtr())->isArray) {
+      JsResult<bool> r = spread(static_cast<Object*>(args[a].asPtr()));
       if (!r) return std::unexpected(r.error());
     } else {
       appendElement(res, count, args[a]);
@@ -692,8 +692,8 @@ JsResult<Value> builtinArrayIsArray(Isolate& iso, Value thisVal,
                                     const Value* args, uint32_t argc) {
   (void)iso;
   (void)thisVal;
-  bool isArray = argc >= 1 && args[0].kind == ValueKind::Object &&
-                 static_cast<Object*>(args[0].ptr)->isArray;
+  bool isArray = argc >= 1 && args[0].kind() == ValueKind::Object &&
+                 static_cast<Object*>(args[0].asPtr())->isArray;
   return Value::boolean(isArray);
 }
 
@@ -707,7 +707,7 @@ JsResult<Value> builtinSymbolCtor(Isolate& iso, Value thisVal,
   if (argc >= 1 && !args[0].isUndefined()) {
     JsResult<Value> s = iso.toStringValue(args[0]);
     if (!s) return std::unexpected(s.error());
-    desc = s->str->data;
+    desc = s->asString()->data;
   }
   return iso.makeSymbolValue(std::move(desc));
 }
@@ -718,7 +718,7 @@ JsResult<Value> builtinSymbolFor(Isolate& iso, Value thisVal,
   if (argc < 1) return iso.makeSymbolValue(u"");
   JsResult<Value> s = iso.toStringValue(args[0]);
   if (!s) return std::unexpected(s.error());
-  std::u16string key = s->str->data;
+  std::u16string key = s->asString()->data;
   if (SymbolObj* existing = iso.symbolForRegistry(key)) {
     return Value::raw(ValueKind::Symbol, existing);
   }

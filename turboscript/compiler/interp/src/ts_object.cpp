@@ -5,11 +5,11 @@
 namespace ts {
 
 Object* objectOfValue(const Value& v) {
-  if (v.kind == ValueKind::Object) {
-    return static_cast<Object*>(v.ptr);
+  if (v.kind() == ValueKind::Object) {
+    return static_cast<Object*>(v.asPtr());
   }
-  if (v.kind == ValueKind::Closure) {
-    return static_cast<Closure*>(v.ptr)->asObject;
+  if (v.kind() == ValueKind::Closure) {
+    return static_cast<Closure*>(v.asPtr())->asObject;
   }
   return nullptr;
 }
@@ -75,7 +75,7 @@ bool classifyOwn(Object* holder, SymbolId key, Value* slot,
   Shape* s = holder->shape;
   while (s != nullptr && s->key != key) s = s->parent;
   if (s != nullptr && s->attrs.has(PropAttr::IsAccessor)) {
-    out->accessor = static_cast<AccessorPair*>(slot->ptr);
+    out->accessor = static_cast<AccessorPair*>(slot->asPtr());
   } else {
     out->dataSlot = slot;
   }

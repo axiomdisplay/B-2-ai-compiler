@@ -516,7 +516,7 @@ JsResult<std::vector<Value>> Isolate::proxyOwnKeys(Value proxy) {
     }
   } else {
     for (const Value& k : targetKeys) {
-      if (k.isString() && k.str->data == u"length") continue;
+      if (k.isString() && k.asString()->data == u"length") continue;
       // Non-configurable target keys must be reported (descriptor probe).
       JsResult<SymbolId> ks = toPropertyKey(k);
       if (!ks) return std::unexpected(ks.error());

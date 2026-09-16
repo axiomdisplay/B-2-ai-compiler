@@ -367,19 +367,19 @@ std::u16string BigInt::toString() const {
 namespace pure {
 
 bool toBoolean(const Value& v) {
-  switch (v.kind) {
+  switch (v.kind()) {
     case ValueKind::Undefined:
     case ValueKind::Null:
       return false;
     case ValueKind::Boolean:
-      return v.b;
+      return v.asBool();
     case ValueKind::Smi:
-      return v.i32 != 0;
+      return v.asSmi() != 0;
     case ValueKind::HeapNumber:
       // NaN != 0.0 is true -> NaN is truthy (Boolean(NaN) === true, Part 0).
-      return v.num != 0.0;
+      return v.asDouble() != 0.0;
     case ValueKind::String:
-      return !v.str->data.empty();
+      return !v.asString()->data.empty();
     case ValueKind::BigInt:
       return !v.asBigInt()->isZero();
     case ValueKind::Object:
@@ -411,7 +411,7 @@ uint32_t toUint32(double v) {
 }
 
 std::string kindName(const Value& v) {
-  switch (v.kind) {
+  switch (v.kind()) {
     case ValueKind::Undefined: return "undefined";
     case ValueKind::Null: return "object";
     case ValueKind::Boolean: return "boolean";
@@ -627,7 +627,7 @@ double stringToNumber(std::u16string_view s) {
 }
 
 bool strictEquals(const Value& a, const Value& b) {
-  if (a.kind != b.kind) {
+  if (a.kind() != b.kind()) {
     // Number equality spans Smi/HeapNumber tags.
     if (a.isNumber() && b.isNumber()) {
       double x = a.asDouble();
@@ -636,19 +636,20 @@ bool strictEquals(const Value& a, const Value& b) {
     }
     return false;
   }
-  switch (a.kind) {
+  switch (a.kind()) {
     case ValueKind::Undefined:
     case ValueKind::Null:
       return true;
     case ValueKind::Boolean:
-      return a.b == b.b;
+      return a.asBool() == b.asBool();
     case ValueKind::Smi:
     case ValueKind::HeapNumber:
       return a.asDouble() == b.asDouble();
     case ValueKind::String: {
-      if (a.str->data.size() != b.str->data.size()) return false;
-      return std::equal(a.str->data.begin(), a.str->data.end(),
-                        b.str->data.begin());
+      const StringObj* x = a.asString();
+      const StringObj* y = b.asString();
+      if (x->data.size() != y->data.size()) return false;
+      return std::equal(x->data.begin(), x->data.end(), y->data.begin());
     }
     case ValueKind::BigInt: {
       const BigInt* x = a.asBigInt();
@@ -659,7 +660,7 @@ bool strictEquals(const Value& a, const Value& b) {
     case ValueKind::Object:
     case ValueKind::Closure:
     case ValueKind::Proxy:
-      return a.ptr == b.ptr;
+      return a.asPtr() == b.asPtr();
     default:
       return false;
   }
@@ -673,7 +674,7 @@ bool sameValue(const Value& a, const Value& b) {
     if (x == 0.0 && y == 0.0) return std::signbit(x) == std::signbit(y);
     return x == y;
   }
-  if (a.kind != b.kind) return false;
+  if (a.kind() != b.kind()) return false;
   if (a.isString() && b.isString()) return strictEquals(a, b);
   if (a.isBigInt() && b.isBigInt()) return strictEquals(a, b);
   if (a.isString() || a.isBigInt()) return false;

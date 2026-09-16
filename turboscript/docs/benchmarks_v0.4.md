@@ -1,7 +1,7 @@
 # TurboScript Tier 0 — Interpreter-Only Benchmark Results (v0.4)
 
-**Status:** v0.4 — fast-path dispatch milestone (Smi/number lanes, call pool,
-element fast path, fmt-table dispatch)
+**Status:** v0.4 — SUPERSEDED by benchmarks_v0.5.md (kept as the v0.4
+history; Section 5 register items #1/#2 resolved there)
 **Owner:** TurboScript Interp Team
 **Last Updated:** 2026-09-15
 **Governing Laws:** Rules 36 (differential testing), 55/64 (durable docs), 96

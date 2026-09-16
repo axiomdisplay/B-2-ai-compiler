@@ -80,6 +80,9 @@ Isolate::Isolate() : shapes_(heap_) {
   installStandardPrototypes();
   global_->proto = Value::raw(ValueKind::Object, objectPrototype_);
   opcodeCounts_.assign(kOpcodeSpace, 0);
+  // Rule 90 bound is the stack's hard depth; reserving it keeps the per-call
+  // frameStack_ push_back at a capacity-checked store.
+  frameStack_.reserve(kMaxCallDepth);
 }
 
 void Isolate::registerNative(const char* name, NativeFn fn) {
@@ -136,6 +139,17 @@ TsResult<bool> Isolate::loadModule(const Module& module,
       feedback_[fn->index][i].kind = fn->feedbackLayout[i];
     }
   }
+  // v0.5 call-setup cache (ts_interpreter.h CallSetup): pointers stay valid
+  // because feedback_ is not resized after this point and the slotOfPc
+  // vectors belong to the (outliving) module.
+  callSetups_.assign(module.functions.size(), CallSetup{});
+  for (const auto& fn : module.functions) {
+    CallSetup& cs = callSetups_[fn->index];
+    cs.hasFeedback = !feedback_[fn->index].empty() &&
+                     !fn->slotOfPc.empty();
+    cs.fb = cs.hasFeedback ? feedback_[fn->index].data() : nullptr;
+    cs.slotMap = cs.hasFeedback ? fn->slotOfPc.data() : nullptr;
+  }
   return true;
 }
 
@@ -184,6 +198,7 @@ Closure* Isolate::makeClosureFor(uint32_t funcIndex, Context* context) {
   }
   Closure* cl = heap_.makeClosure();
   cl->funcIndex = funcIndex;
+  cl->fn = module_->functions[funcIndex].get();
   cl->context = context;
   cl->asObject = newPlainObject();
   // v0.3: function objects chain to Function.prototype; each closure's
@@ -209,8 +224,8 @@ JsResult<Value> Isolate::callValue(const Value& callee, Value thisVal,
     // Proxy [[Call]] (v0.3).
     return proxyApply(callee, thisVal, args, argc);
   }
-  if (callee.kind == ValueKind::Closure) {
-    const Closure* cl = static_cast<const Closure*>(callee.ptr);
+  if (callee.kind() == ValueKind::Closure) {
+    const Closure* cl = static_cast<const Closure*>(callee.asPtr());
     if (cl->funcIndex >= kNativeFuncIndexBase) {
       uint32_t idx = cl->funcIndex - kNativeFuncIndexBase;
       if (idx < natives_.size()) {
@@ -227,15 +242,16 @@ JsResult<Value> Isolate::callValue(const Value& callee, Value thisVal,
 JsResult<Value> Isolate::callClosure(const Closure* closure, Value thisVal,
                                      const Value* args, uint32_t argc) {
   (void)thisVal;  // strict-mode v0.1: `this` reachable via CallMethod only.
-  if (module_ == nullptr ||
-      closure->funcIndex >= module_->functions.size()) {
+  // v0.5: fn resolved at closure creation (ts_object.h); module_/fn null is
+  // the same internal-error class the bounds check covered.
+  if (closure->fn == nullptr) {
     return std::unexpected(typeError("internal: function index out of range"));
   }
   if (callDepth_ >= kMaxCallDepth) {
     return std::unexpected(
         rangeError("Maximum call stack size exceeded"));  // Rule 90
   }
-  const Function* fn = module_->functions[closure->funcIndex].get();
+  const Function* fn = closure->fn;
   Frame frame;
   frame.fn = fn;
   frame.context = closure->context;
@@ -511,6 +527,18 @@ bool Isolate::hasAlongChain(Object* start, SymbolId key, bool isIndex,
   return false;
 }
 
+
+// v0.5 slot growth (kMinSlotCapacity, ts_core.h): geometric reserve before a
+// transition push. Pure storage strategy - slotCount is shape-driven and the
+// IC/lookup paths read shape->slotCount, never capacity. (Rule 96: no
+// semantic surface.)
+inline void reserveForSlotPush(std::vector<Value>& slots) {
+  if (slots.capacity() == slots.size()) {
+    slots.reserve(slots.size() < kMinSlotCapacity ? kMinSlotCapacity
+                                                  : slots.size() * 2);
+  }
+}
+
 JsResult<bool> Isolate::defineProperty(Object* obj, SymbolId key,
                                        const Value& val,
                                        PropertyAttrs attrs) {
@@ -527,6 +555,7 @@ JsResult<bool> Isolate::defineProperty(Object* obj, SymbolId key,
   // origin of every transition chain (interp_contract.md 3).
   Shape* from = obj->shape != nullptr ? obj->shape : shapes_.root();
   obj->shape = shapes_.transition(from, key, attrs);
+  reserveForSlotPush(obj->slots);
   obj->slots.push_back(val);
   return true;
 }
@@ -596,8 +625,8 @@ SymbolId Isolate::cachedIndexSymbol(uint32_t idx) {
 }
 
 JsResult<Value> Isolate::getElementValue(const Value& recv, const Value& key) {
-  if (key.isSmi() && key.i32 >= 0 && recv.isObjectLike()) {
-    const uint32_t idx = static_cast<uint32_t>(key.i32);
+  if (key.isSmi() && key.asSmi() >= 0 && recv.isObjectLike()) {
+    const uint32_t idx = static_cast<uint32_t>(key.asSmi());
     SymbolId keySym = kInvalidSymbol;  // resolved lazily, only on named probe
     for (Object* cur = objectOfValue(recv); cur != nullptr;
          cur = protoOfObject(cur)) {
@@ -626,8 +655,8 @@ JsResult<Value> Isolate::getElementValue(const Value& recv, const Value& key) {
 
 JsResult<bool> Isolate::setElementValue(const Value& recv, const Value& key,
                                         const Value& val) {
-  if (key.isSmi() && key.i32 >= 0 && recv.isObjectLike()) {
-    const uint32_t idx = static_cast<uint32_t>(key.i32);
+  if (key.isSmi() && key.asSmi() >= 0 && recv.isObjectLike()) {
+    const uint32_t idx = static_cast<uint32_t>(key.asSmi());
     Object* obj = objectOfValue(recv);
     // Own array receiver: mirrors setProperty's array pre-routing — the
     // element/length machinery runs before any chain walk.
@@ -749,26 +778,26 @@ JsResult<Value> Isolate::toPrimitive(const Value& v, bool hintString) {
 }
 
 JsResult<Value> Isolate::toNumberValue(const Value& v) {
-  switch (v.kind) {
+  switch (v.kind()) {
     case ValueKind::Undefined:
       return Value::heapNumber(std::numeric_limits<double>::quiet_NaN());
     case ValueKind::Null:
       return Value::smi(0);
     case ValueKind::Boolean:
-      return Value::smi(v.b ? 1 : 0);
+      return Value::smi(v.asBool() ? 1 : 0);
     case ValueKind::Smi:
     case ValueKind::HeapNumber:
       return v;
     case ValueKind::String:
-      return normalizeNumber(pure::stringToNumber(v.str->data));
+      return normalizeNumber(pure::stringToNumber(v.asString()->data));
     case ValueKind::BigInt:
       return std::unexpected(
           typeError("Cannot convert a BigInt value to a number"));
     default: {
       JsResult<Value> prim = toPrimitive(v, false);
       if (!prim) return std::unexpected(prim.error());
-      if (prim->kind == ValueKind::String) {
-        return normalizeNumber(pure::stringToNumber(prim->str->data));
+      if (prim->kind() == ValueKind::String) {
+        return normalizeNumber(pure::stringToNumber(prim->asString()->data));
       }
       return toNumberValue(*prim);
     }
@@ -781,13 +810,13 @@ JsResult<Value> Isolate::toNumericValue(const Value& v) {
 }
 
 JsResult<Value> Isolate::toStringValue(const Value& v) {
-  switch (v.kind) {
+  switch (v.kind()) {
     case ValueKind::Undefined:
       return Value::string(heap_.makeString(u"undefined"));
     case ValueKind::Null:
       return Value::string(heap_.makeString(u"null"));
     case ValueKind::Boolean:
-      return Value::string(heap_.makeString(v.b ? u"true" : u"false"));
+      return Value::string(heap_.makeString(v.asBool() ? u"true" : u"false"));
     case ValueKind::Smi:
     case ValueKind::HeapNumber: {
       std::string ascii = pure::doubleToString(v.asDouble());
@@ -823,12 +852,12 @@ JsResult<Value> Isolate::toStringValue(const Value& v) {
 }
 
 JsResult<Value> Isolate::toBigIntValue(const Value& v) {
-  switch (v.kind) {
+  switch (v.kind()) {
     case ValueKind::BigInt:
       return v;
     case ValueKind::Boolean:
       return Value::raw(ValueKind::BigInt,
-                        heap_.makeBigInt(BigInt::fromInt64(v.b ? 1 : 0)));
+                        heap_.makeBigInt(BigInt::fromInt64(v.asBool() ? 1 : 0)));
     case ValueKind::Smi:
     case ValueKind::HeapNumber: {
       double d = v.asDouble();
@@ -842,10 +871,10 @@ JsResult<Value> Isolate::toBigIntValue(const Value& v) {
     }
     case ValueKind::String: {
       BigInt big;
-      if (!BigInt::fromString(v.str->data, &big)) {
+      if (!BigInt::fromString(v.asString()->data, &big)) {
         return std::unexpected(
             syntaxError("Cannot convert '" +
-                        utf16ToUtf8(v.str->data) + "' to a BigInt"));
+                        utf16ToUtf8(v.asString()->data) + "' to a BigInt"));
       }
       return Value::raw(ValueKind::BigInt, heap_.makeBigInt(std::move(big)));
     }
@@ -866,9 +895,9 @@ JsResult<SymbolId> Isolate::toPropertyKey(const Value& v) {
   if (v.isString()) {
     // v0.3: const-pool strings carry their interned id after first use;
     // repeated string-keyed access skips the intern hash entirely.
-    if (v.str->cachedSymbol != kInvalidSymbol) return v.str->cachedSymbol;
-    SymbolId s = symbols_.intern(v.str->data);
-    v.str->cachedSymbol = s;
+    if (v.asString()->cachedSymbol != kInvalidSymbol) return v.asString()->cachedSymbol;
+    SymbolId s = symbols_.intern(v.asString()->data);
+    v.asString()->cachedSymbol = s;
     return s;
   }
   if (v.isSymbol()) {
@@ -883,17 +912,17 @@ JsResult<SymbolId> Isolate::toPropertyKey(const Value& v) {
   if (v.isSmi() || v.isHeapNumber()) {
     JsResult<Value> s = toStringValue(v);
     if (!s) return std::unexpected(s.error());
-    return symbols_.intern(s->str->data);
+    return symbols_.intern(s->asString()->data);
   }
   if (v.isBigInt()) {
     JsResult<Value> s = toStringValue(v);
     if (!s) return std::unexpected(s.error());
-    return symbols_.intern(s->str->data);
+    return symbols_.intern(s->asString()->data);
   }
   // Boolean / undefined / null keys are their ToString forms.
   JsResult<Value> s = toStringValue(v);
   if (!s) return std::unexpected(s.error());
-  return symbols_.intern(s->str->data);
+  return symbols_.intern(s->asString()->data);
 }
 
 // ---------------------------------------------------------------------------
@@ -920,7 +949,7 @@ JsResult<Value> Isolate::addValues(const Value& l, const Value& r,
     if (!ls) return std::unexpected(ls.error());
     JsResult<Value> rs = toStringValue(*rp);
     if (!rs) return std::unexpected(rs.error());
-    std::u16string out = ls->str->data + rs->str->data;
+    std::u16string out = ls->asString()->data + rs->asString()->data;
     return Value::string(heap_.makeString(std::move(out)));
   }
   JsResult<Value> ln = toNumericValue(*lp);
@@ -1065,7 +1094,7 @@ JsResult<Relational> Isolate::relationalCompare(const Value& l,
   JsResult<Value> rp = toPrimitive(r, false);
   if (!rp) return std::unexpected(rp.error());
   if (lp->isString() && rp->isString()) {
-    int c = pure::compareStrings(*lp->str, *rp->str);
+    int c = pure::compareStrings(*lp->asString(), *rp->asString());
     if (c < 0) return Relational::Less;
     if (c > 0) return Relational::Greater;
     return Relational::Equal;
@@ -1100,10 +1129,10 @@ JsResult<Relational> Isolate::relationalCompare(const Value& l,
 
 JsResult<bool> Isolate::abstractEquals(const Value& l, const Value& r) {
   // Same-type (or both-number) branch.
-  bool sameClass = l.kind == r.kind || (l.isNumber() && r.isNumber());
+  bool sameClass = l.kind() == r.kind() || (l.isNumber() && r.isNumber());
   if (sameClass) {
     if (l.isNumber()) return l.asDouble() == r.asDouble();
-    if (l.kind == ValueKind::String) return pure::strictEquals(l, r);
+    if (l.kind() == ValueKind::String) return pure::strictEquals(l, r);
     if (l.isBigInt()) return BigInt::compare(*l.asBigInt(), *r.asBigInt()) == 0;
     return pure::strictEquals(l, r);
   }
@@ -1113,29 +1142,29 @@ JsResult<bool> Isolate::abstractEquals(const Value& l, const Value& r) {
 
   // Number vs String.
   if (l.isNumber() && r.isString()) {
-    return l.asDouble() == pure::stringToNumber(r.str->data);
+    return l.asDouble() == pure::stringToNumber(r.asString()->data);
   }
   if (l.isString() && r.isNumber()) {
-    return pure::stringToNumber(l.str->data) == r.asDouble();
+    return pure::stringToNumber(l.asString()->data) == r.asDouble();
   }
   // BigInt vs String (invalid syntax -> false, never throws).
   if (l.isBigInt() && r.isString()) {
     BigInt big;
-    if (!BigInt::fromString(r.str->data, &big)) return false;
+    if (!BigInt::fromString(r.asString()->data, &big)) return false;
     return BigInt::compare(*l.asBigInt(), big) == 0;
   }
   if (l.isString() && r.isBigInt()) {
     BigInt big;
-    if (!BigInt::fromString(l.str->data, &big)) return false;
+    if (!BigInt::fromString(l.asString()->data, &big)) return false;
     return BigInt::compare(big, *r.asBigInt()) == 0;
   }
   // Boolean coerces to number first.
   if (l.isBoolean()) {
-    Value num = Value::smi(l.b ? 1 : 0);
+    Value num = Value::smi(l.asBool() ? 1 : 0);
     return abstractEquals(num, r);
   }
   if (r.isBoolean()) {
-    Value num = Value::smi(r.b ? 1 : 0);
+    Value num = Value::smi(r.asBool() ? 1 : 0);
     return abstractEquals(l, num);
   }
   // BigInt vs Number: exact mathematical comparison.
@@ -1304,6 +1333,7 @@ JsResult<bool> Isolate::definePropertyDescriptor(Object* obj, SymbolId key,
     }
     Shape* from = obj->shape != nullptr ? obj->shape : shapes_.root();
     obj->shape = shapes_.transition(from, key, attrs);
+    reserveForSlotPush(obj->slots);
     obj->slots.push_back(Value::raw(ValueKind::Accessor, pair));
     return true;
   }
@@ -1332,6 +1362,7 @@ JsResult<bool> Isolate::definePropertyDescriptor(Object* obj, SymbolId key,
   }
   Shape* from = obj->shape != nullptr ? obj->shape : shapes_.root();
   obj->shape = shapes_.transition(from, key, attrs);
+  reserveForSlotPush(obj->slots);
   obj->slots.push_back(d.hasValue ? d.value : Value::undefined());
   return true;
 }
@@ -1441,20 +1472,25 @@ void Isolate::recordElementSite(FeedbackSlot* s, const Value& recv) {
 
 void Isolate::recordBinarySite(FeedbackSlot* s, const Value& l, const Value& r) {
   if (s == nullptr) return;
+  // v0.5: branch-light classification on the NaN-boxed encoding. The hot
+  // answers (Smi, HeapNumber) are one shift+compare each; the pointer kinds
+  // fall to a switch only when neither holds. Same buckets, same counts
+  // (Rule 124: recording is semantic-adjacent and stays exact).
   auto classify = [](const Value& v) -> uint32_t {
-    switch (v.kind) {
-      case ValueKind::Smi: return static_cast<uint32_t>(ValueClass::Smi);
-      case ValueKind::HeapNumber:
-        return static_cast<uint32_t>(ValueClass::HeapNumber);
-      case ValueKind::String:
-        return static_cast<uint32_t>(ValueClass::String);
-      case ValueKind::BigInt:
-        return static_cast<uint32_t>(ValueClass::BigInt);
+    constexpr uint32_t kSmiC = static_cast<uint32_t>(ValueClass::Smi);
+    constexpr uint32_t kNumC = static_cast<uint32_t>(ValueClass::HeapNumber);
+    constexpr uint32_t kStrC = static_cast<uint32_t>(ValueClass::String);
+    constexpr uint32_t kBigC = static_cast<uint32_t>(ValueClass::BigInt);
+    constexpr uint32_t kObjC = static_cast<uint32_t>(ValueClass::Object);
+    constexpr uint32_t kOthC = static_cast<uint32_t>(ValueClass::Other);
+    if (v.isSmi()) return kSmiC;
+    if (v.isDouble()) return kNumC;
+    switch (v.kind()) {
+      case ValueKind::String: return kStrC;
+      case ValueKind::BigInt: return kBigC;
       case ValueKind::Object:
-      case ValueKind::Closure:
-        return static_cast<uint32_t>(ValueClass::Object);
-      default:
-        return static_cast<uint32_t>(ValueClass::Other);
+      case ValueKind::Closure: return kObjC;
+      default: return kOthC;
     }
   };
   if (s->classCounts[0] < UINT32_MAX) {
@@ -1477,7 +1513,7 @@ void Isolate::recordCallSite(FeedbackSlot* s, const Value& callee) {
   if (s->callCount < UINT32_MAX) s->callCount++;
   int32_t funcIdx = -1;
   if (callee.isClosure()) {
-    const Closure* cl = static_cast<const Closure*>(callee.ptr);
+    const Closure* cl = static_cast<const Closure*>(callee.asPtr());
     if (cl->funcIndex < kNativeFuncIndexBase) funcIdx = static_cast<int32_t>(cl->funcIndex);
   }
   if (funcIdx < 0) {
@@ -1554,7 +1590,7 @@ std::vector<Value> Isolate::ownKeysValues(Object* obj, bool includeLength) {
     bool dup = false;
     for (const Value& already : out) {
       if (already.isString() && !isUserSymbolId(named[i]) &&
-          already.str->data == symbols_.text(named[i])) {
+          already.asString()->data == symbols_.text(named[i])) {
         dup = true;
         break;
       }
@@ -1575,7 +1611,7 @@ std::vector<Value> Isolate::ownKeysValues(Object* obj, bool includeLength) {
 JsResult<std::u16string> Isolate::displayString(const Value& v) {
   JsResult<Value> s = toStringValue(v);
   if (!s) return std::unexpected(s.error());
-  return s->str->data;
+  return s->asString()->data;
 }
 
 std::u16string Isolate::formatUncaught(const Value& thrown) const {
@@ -1587,27 +1623,27 @@ std::u16string Isolate::formatUncaught(const Value& thrown) const {
     bool hasName = false;
     if (nameR.found && nameR.dataSlot != nullptr &&
         nameR.dataSlot->isString()) {
-      out += nameR.dataSlot->str->data;
+      out += nameR.dataSlot->asString()->data;
       hasName = true;
     }
     if (msgR.found && msgR.dataSlot != nullptr && msgR.dataSlot->isString()) {
       if (hasName) out += u": ";
-      out += msgR.dataSlot->str->data;
+      out += msgR.dataSlot->asString()->data;
     }
     if (hasName || (msgR.found && msgR.dataSlot != nullptr)) return out;
   }
   // Non-error values: ToString (best effort; internal failures degrade).
-  if (thrown.isString()) return thrown.str->data;
-  switch (thrown.kind) {
+  if (thrown.isString()) return thrown.asString()->data;
+  switch (thrown.kind()) {
     case ValueKind::Undefined: return u"undefined";
     case ValueKind::Null: return u"null";
-    case ValueKind::Boolean: return thrown.b ? u"true" : u"false";
+    case ValueKind::Boolean: return thrown.asBool() ? u"true" : u"false";
     case ValueKind::Smi: {
-      std::string a = std::to_string(thrown.i32);
+      std::string a = std::to_string(thrown.asSmi());
       return std::u16string(a.begin(), a.end());
     }
     case ValueKind::HeapNumber: {
-      std::string a = pure::doubleToString(thrown.num);
+      std::string a = pure::doubleToString(thrown.asDouble());
       return std::u16string(a.begin(), a.end());
     }
     case ValueKind::BigInt: return thrown.asBigInt()->toString();

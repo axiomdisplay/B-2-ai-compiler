@@ -377,6 +377,16 @@ class Isolate {
 
   const Module* module_ = nullptr;
   std::vector<Value> constants_;  // materialized
+  // v0.5 call path (benchmarks_v0.4.md register #2): per-function dispatch
+  // setup, built once at loadModule. runFrame's per-call prologue was two
+  // vector-of-vector indirections, two emptiness checks and three data()
+  // loads; it is now one indexed load plus one recordFeedback_ branch.
+  struct CallSetup {
+    FeedbackSlot* fb = nullptr;
+    const uint32_t* slotMap = nullptr;
+    bool hasFeedback = false;
+  };
+  std::vector<CallSetup> callSetups_;
   std::vector<std::vector<FeedbackSlot>> feedback_;
   std::vector<uint64_t> opcodeCounts_;
   bool countOpcodes_ = false;

@@ -98,17 +98,23 @@ struct ProxyObj {
 
 // Out-of-line member (ProxyObj lives here; Value lives in ts_value.h).
 inline ProxyObj* Value::asProxy() const {
-  return static_cast<ProxyObj*>(ptr);
+  return static_cast<ProxyObj*>(asPtr());
 }
 
 // ---------------------------------------------------------------------------
 // Closure — a function value. A closure IS an object for property purposes:
 // its `asObject` carries .prototype (fresh object per closure) etc.
 // ---------------------------------------------------------------------------
+struct Function;  // ts_module.h (resolved at closure creation, v0.5)
+
 struct Closure {
   uint32_t funcIndex = 0;
   Context* context = nullptr;
   Object* asObject = nullptr;  // function-object property storage (never null)
+  // v0.5 call path (benchmarks_v0.4.md register #2): the resolved Function
+  // pointer, cached at creation. callClosure no longer walks the module
+  // function table (unique_ptr indirection + bounds check) per call.
+  const struct Function* fn = nullptr;
 };
 
 // ---------------------------------------------------------------------------

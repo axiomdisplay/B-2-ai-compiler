@@ -51,11 +51,11 @@ inline Value tsSmiOrNumber(double v) {
 // Inline ToBoolean fast lane for branch handlers; pure::toBoolean remains the
 // semantic source for every kind the fast lane does not cover.
 inline bool tsQuickTruthy(const Value& v) {
-  switch (v.kind) {
+  switch (v.kind()) {
     case ValueKind::Boolean:
-      return v.b;
+      return v.asBool();
     case ValueKind::Smi:
-      return v.i32 != 0;
+      return v.asSmi() != 0;
     case ValueKind::Undefined:
     case ValueKind::Null:
       return false;
@@ -358,8 +358,8 @@ L_GetProperty : {
     const Value& kv = regs[c_];
     // v0.4: const-pool strings cache their interned key id after first use
     // (v0.3) — the hot lane reads it inline instead of calling toPropertyKey.
-    if (kv.isString() && kv.str->cachedSymbol != kInvalidSymbol) {
-      keySym = kv.str->cachedSymbol;
+    if (kv.isString() && kv.asString()->cachedSymbol != kInvalidSymbol) {
+      keySym = kv.asString()->cachedSymbol;
     } else {
       TS_GET(toPropertyKey(kv), keySym);
     }
@@ -393,8 +393,8 @@ L_SetProperty : {
     SymbolId keySym;
     const Value& kv = regs[b_];
     // v0.4: cached interned-key fast lane (same as GetProperty's).
-    if (kv.isString() && kv.str->cachedSymbol != kInvalidSymbol) {
-      keySym = kv.str->cachedSymbol;
+    if (kv.isString() && kv.asString()->cachedSymbol != kInvalidSymbol) {
+      keySym = kv.asString()->cachedSymbol;
     } else {
       TS_GET(toPropertyKey(kv), keySym);
     }
@@ -549,10 +549,10 @@ L_Call : {
     if (fb != nullptr) recordCallSite(&fb[slotMap[pc]], regs[a_]);
     // v0.4: direct closure hop — callValue's proxy/native routing only for
     // non-closure callees (identical semantics, one frame less of C++ calls).
-    if (regs[a_].kind == ValueKind::Closure &&
-        static_cast<const Closure*>(regs[a_].ptr)->funcIndex <
+    if (regs[a_].kind() == ValueKind::Closure &&
+        static_cast<const Closure*>(regs[a_].asPtr())->funcIndex <
             kNativeFuncIndexBase) {
-      TS_GET(callClosure(static_cast<const Closure*>(regs[a_].ptr),
+      TS_GET(callClosure(static_cast<const Closure*>(regs[a_].asPtr()),
                          Value::undefined(), &regs[b_], c_),
              regs[e_]);
     } else {
@@ -567,10 +567,10 @@ L_CallMethod : {
   TS_FIELDS();
   {
     if (fb != nullptr) recordCallSite(&fb[slotMap[pc]], regs[a_]);
-    if (regs[a_].kind == ValueKind::Closure &&
-        static_cast<const Closure*>(regs[a_].ptr)->funcIndex <
+    if (regs[a_].kind() == ValueKind::Closure &&
+        static_cast<const Closure*>(regs[a_].asPtr())->funcIndex <
             kNativeFuncIndexBase) {
-      TS_GET(callClosure(static_cast<const Closure*>(regs[a_].ptr),
+      TS_GET(callClosure(static_cast<const Closure*>(regs[a_].asPtr()),
                          regs[d_], &regs[b_], c_),
              regs[e_]);
     } else {
@@ -611,7 +611,7 @@ L_NewContext : {
   {
     Context* parent = nullptr;
     if (regs[b_].isContext()) {
-      parent = static_cast<Context*>(regs[b_].ptr);
+      parent = static_cast<Context*>(regs[b_].asPtr());
     } else if (!regs[b_].isNull()) {
       TS_RAISE(typeError("NewContext parent must be a context or null"));
     }
@@ -628,7 +628,7 @@ L_LoadContext : {
     if (!regs[b_].isContext()) {
       TS_RAISE(typeError("LoadContext operand is not a context"));
     }
-    Context* ctx = static_cast<Context*>(regs[b_].ptr);
+    Context* ctx = static_cast<Context*>(regs[b_].asPtr());
     if (c_ >= ctx->cells.size()) {
       TS_RAISE(referenceError("Context cell index out of range"));
     }
@@ -648,7 +648,7 @@ L_StoreContext : {
     if (!regs[a_].isContext()) {
       TS_RAISE(typeError("StoreContext operand is not a context"));
     }
-    Context* ctx = static_cast<Context*>(regs[a_].ptr);
+    Context* ctx = static_cast<Context*>(regs[a_].asPtr());
     if (b_ >= ctx->cells.size()) {
       TS_RAISE(referenceError("Context cell index out of range"));
     }
@@ -695,10 +695,10 @@ L_GetElement : {
     FeedbackSlot* fs = fb != nullptr ? &fb[slotMap[pc]] : nullptr;
     recordElementSite(fs, recv);
     const Value& key = regs[c_];
-    if (recv.kind == ValueKind::Object && key.isSmi() && key.i32 >= 0) {
-      Object* obj = static_cast<Object*>(recv.ptr);
+    if (recv.kind() == ValueKind::Object && key.isSmi() && key.asSmi() >= 0) {
+      Object* obj = static_cast<Object*>(recv.asPtr());
       if (obj->isArray) {
-        uint32_t idx = static_cast<uint32_t>(key.i32);
+        uint32_t idx = static_cast<uint32_t>(key.asSmi());
         if (idx < obj->elements.size()) {
           Value v = obj->elements[idx];
           if (!v.isHole()) {
@@ -725,10 +725,10 @@ L_SetElement : {
     FeedbackSlot* fs = fb != nullptr ? &fb[slotMap[pc]] : nullptr;
     recordElementSite(fs, recv);
     const Value& key = regs[b_];
-    if (recv.kind == ValueKind::Object && key.isSmi() && key.i32 >= 0) {
-      Object* obj = static_cast<Object*>(recv.ptr);
+    if (recv.kind() == ValueKind::Object && key.isSmi() && key.asSmi() >= 0) {
+      Object* obj = static_cast<Object*>(recv.asPtr());
       if (obj->isArray) {
-        uint32_t idx = static_cast<uint32_t>(key.i32);
+        uint32_t idx = static_cast<uint32_t>(key.asSmi());
         if (idx < obj->elements.size() && !obj->elements[idx].isHole()) {
           widenElementsFor(obj, regs[c_]);
           obj->elements[idx] = regs[c_];
@@ -765,7 +765,7 @@ L_Add : {
     // BigInt, user hooks — falls through to addValues unchanged (Rule 96:
     // the fast path is a guard in front of the semantic source).
     if (tsBothSmi(regs[a_], regs[b_])) {
-      int64_t sum = static_cast<int64_t>(regs[a_].i32) + regs[b_].i32;
+      int64_t sum = static_cast<int64_t>(regs[a_].asSmi()) + regs[b_].asSmi();
       if (sum >= kSmiMin && sum <= kSmiMax) {
         regs[a_] = Value::smi(static_cast<int32_t>(sum));
         pc += 1;
@@ -788,7 +788,7 @@ L_Sub : {
   TS_FIELDS();
   {
     if (tsBothSmi(regs[a_], regs[b_])) {
-      int64_t diff = static_cast<int64_t>(regs[a_].i32) - regs[b_].i32;
+      int64_t diff = static_cast<int64_t>(regs[a_].asSmi()) - regs[b_].asSmi();
       if (diff >= kSmiMin && diff <= kSmiMax) {
         regs[a_] = Value::smi(static_cast<int32_t>(diff));
         pc += 1;
@@ -809,8 +809,8 @@ L_Mul : {
   TS_FIELDS();
   {
     if (tsBothSmi(regs[a_], regs[b_])) {
-      int64_t prod = static_cast<int64_t>(regs[a_].i32) *
-                     static_cast<int64_t>(regs[b_].i32);
+      int64_t prod = static_cast<int64_t>(regs[a_].asSmi()) *
+                     static_cast<int64_t>(regs[b_].asSmi());
       if (prod >= kSmiMin && prod <= kSmiMax) {
         regs[a_] = Value::smi(static_cast<int32_t>(prod));
         pc += 1;
@@ -858,8 +858,8 @@ L_Mod : {
       TS_DISPATCH();
     }
     if (tsBothSmi(regs[a_], regs[b_])) {
-      int32_t l = regs[a_].i32;
-      int32_t r = regs[b_].i32;
+      int32_t l = regs[a_].asSmi();
+      int32_t r = regs[b_].asSmi();
       if (!(l == kSmiMin && r == -1)) {
         int32_t m = l % r;
         if (m != 0) {
@@ -888,7 +888,7 @@ L_BitAnd : {
   TS_FIELDS();
   {
     if (tsBothSmi(regs[a_], regs[b_])) {
-      regs[a_] = Value::smi(regs[a_].i32 & regs[b_].i32);
+      regs[a_] = Value::smi(regs[a_].asSmi() & regs[b_].asSmi());
       pc += 1;
       TS_DISPATCH();
     }
@@ -901,7 +901,7 @@ L_BitOr : {
   TS_FIELDS();
   {
     if (tsBothSmi(regs[a_], regs[b_])) {
-      regs[a_] = Value::smi(regs[a_].i32 | regs[b_].i32);
+      regs[a_] = Value::smi(regs[a_].asSmi() | regs[b_].asSmi());
       pc += 1;
       TS_DISPATCH();
     }
@@ -914,7 +914,7 @@ L_BitXor : {
   TS_FIELDS();
   {
     if (tsBothSmi(regs[a_], regs[b_])) {
-      regs[a_] = Value::smi(regs[a_].i32 ^ regs[b_].i32);
+      regs[a_] = Value::smi(regs[a_].asSmi() ^ regs[b_].asSmi());
       pc += 1;
       TS_DISPATCH();
     }
@@ -928,7 +928,7 @@ L_Shl : {
   {
     if (tsBothSmi(regs[a_], regs[b_])) {
       // ToInt32(x) << (y & 31); Smis are already int32 (Rule 72).
-      regs[a_] = Value::smi(regs[a_].i32 << (regs[b_].i32 & 31));
+      regs[a_] = Value::smi(regs[a_].asSmi() << (regs[b_].asSmi() & 31));
       pc += 1;
       TS_DISPATCH();
     }
@@ -943,7 +943,7 @@ L_Shr : {
     if (tsBothSmi(regs[a_], regs[b_])) {
       // Arithmetic shift right of a negative value is value-defined for
       // int32 in C++20 and later (matches ToInt32(x) >> (y & 31)).
-      regs[a_] = Value::smi(regs[a_].i32 >> (regs[b_].i32 & 31));
+      regs[a_] = Value::smi(regs[a_].asSmi() >> (regs[b_].asSmi() & 31));
       pc += 1;
       TS_DISPATCH();
     }
@@ -956,8 +956,8 @@ L_UShr : {
   TS_FIELDS();
   {
     if (tsBothSmi(regs[a_], regs[b_])) {
-      uint32_t u = static_cast<uint32_t>(regs[a_].i32) >>
-                   (regs[b_].i32 & 31);
+      uint32_t u = static_cast<uint32_t>(regs[a_].asSmi()) >>
+                   (regs[b_].asSmi() & 31);
       regs[a_] = u <= static_cast<uint32_t>(kSmiMax)
                      ? Value::smi(static_cast<int32_t>(u))
                      : Value::heapNumber(static_cast<double>(u));
@@ -974,7 +974,7 @@ L_BitNot : {
   {
     if (regs[a_].isSmi()) {
       // ~ on int32 is exact and stays in range.
-      regs[a_] = Value::smi(~regs[a_].i32);
+      regs[a_] = Value::smi(~regs[a_].asSmi());
       pc += 1;
       TS_DISPATCH();
     }
@@ -1008,7 +1008,7 @@ L_Neg : {
   {
     if (regs[a_].isSmi()) {
       // Smi negation: 0 -> -0 (HeapNumber, Rule 72), INT32_MIN -> 2^31.
-      int32_t i = regs[a_].i32;
+      int32_t i = regs[a_].asSmi();
       regs[a_] = i == 0
                      ? Value::heapNumber(-0.0)
                      : i == kSmiMin
@@ -1034,7 +1034,7 @@ L_Inc : {
   TS_FIELDS();
   {
     if (regs[a_].isSmi()) {
-      int32_t i = regs[a_].i32;
+      int32_t i = regs[a_].asSmi();
       regs[a_] = i == kSmiMax
                      ? Value::heapNumber(static_cast<double>(kSmiMax) + 1.0)
                      : Value::smi(i + 1);
@@ -1042,7 +1042,7 @@ L_Inc : {
       TS_DISPATCH();
     }
     if (regs[a_].isHeapNumber()) {
-      regs[a_] = tsSmiOrNumber(regs[a_].num + 1.0);
+      regs[a_] = tsSmiOrNumber(regs[a_].asDouble() + 1.0);
       pc += 1;
       TS_DISPATCH();
     }
@@ -1064,7 +1064,7 @@ L_Dec : {
   TS_FIELDS();
   {
     if (regs[a_].isSmi()) {
-      int32_t i = regs[a_].i32;
+      int32_t i = regs[a_].asSmi();
       regs[a_] = i == kSmiMin
                      ? Value::heapNumber(static_cast<double>(kSmiMin) - 1.0)
                      : Value::smi(i - 1);
@@ -1072,7 +1072,7 @@ L_Dec : {
       TS_DISPATCH();
     }
     if (regs[a_].isHeapNumber()) {
-      regs[a_] = tsSmiOrNumber(regs[a_].num - 1.0);
+      regs[a_] = tsSmiOrNumber(regs[a_].asDouble() - 1.0);
       pc += 1;
       TS_DISPATCH();
     }
@@ -1094,7 +1094,7 @@ L_Lt : {
   TS_FIELDS();
   {
     if (tsBothSmi(regs[a_], regs[b_])) {
-      regs[a_] = Value::boolean(regs[a_].i32 < regs[b_].i32);
+      regs[a_] = Value::boolean(regs[a_].asSmi() < regs[b_].asSmi());
       pc += 1;
       TS_DISPATCH();
     }
@@ -1114,7 +1114,7 @@ L_Le : {
   TS_FIELDS();
   {
     if (tsBothSmi(regs[a_], regs[b_])) {
-      regs[a_] = Value::boolean(regs[a_].i32 <= regs[b_].i32);
+      regs[a_] = Value::boolean(regs[a_].asSmi() <= regs[b_].asSmi());
       pc += 1;
       TS_DISPATCH();
     }
@@ -1137,7 +1137,7 @@ L_Gt : {
   TS_FIELDS();
   {
     if (tsBothSmi(regs[a_], regs[b_])) {
-      regs[a_] = Value::boolean(regs[a_].i32 > regs[b_].i32);
+      regs[a_] = Value::boolean(regs[a_].asSmi() > regs[b_].asSmi());
       pc += 1;
       TS_DISPATCH();
     }
@@ -1157,7 +1157,7 @@ L_Ge : {
   TS_FIELDS();
   {
     if (tsBothSmi(regs[a_], regs[b_])) {
-      regs[a_] = Value::boolean(regs[a_].i32 >= regs[b_].i32);
+      regs[a_] = Value::boolean(regs[a_].asSmi() >= regs[b_].asSmi());
       pc += 1;
       TS_DISPATCH();
     }
@@ -1194,11 +1194,11 @@ L_StrictEq : {
     // v0.4 fast lanes: Smi==Smi, and different kinds that cannot both be
     // numbers (5 === 5.0 is true across the Smi/HeapNumber split).
     if (tsBothSmi(regs[a_], regs[b_])) {
-      regs[a_] = Value::boolean(regs[a_].i32 == regs[b_].i32);
+      regs[a_] = Value::boolean(regs[a_].asSmi() == regs[b_].asSmi());
       pc += 1;
       TS_DISPATCH();
     }
-    if (regs[a_].kind != regs[b_].kind &&
+    if (regs[a_].kind() != regs[b_].kind() &&
         !(regs[a_].isNumber() && regs[b_].isNumber())) {
       regs[a_] = Value::boolean(false);
       pc += 1;
@@ -1301,7 +1301,7 @@ L_StringConcat : {
     // v0.4: both-strings fast lane (no conversion, single exact allocation).
     if (regs[a_].isString() && regs[b_].isString()) {
       regs[a_] = Value::string(
-          tsConcatStrings(regs[a_].str, regs[b_].str, heap_));
+          tsConcatStrings(regs[a_].asString(), regs[b_].asString(), heap_));
       pc += 1;
       TS_DISPATCH();
     }
@@ -1310,7 +1310,7 @@ L_StringConcat : {
     Value rs;
     TS_GET(toStringValue(regs[b_]), rs);
     regs[a_] =
-        Value::string(heap_.makeString(ls.str->data + rs.str->data));
+        Value::string(heap_.makeString(ls.asString()->data + rs.asString()->data));
   }
   pc += 1;
   TS_DISPATCH();
@@ -1321,7 +1321,7 @@ L_StringLength : {
     if (!regs[a_].isString()) {
       TS_RAISE(typeError("StringLength operand is not a string"));
     }
-    regs[a_] = Value::smi(static_cast<int32_t>(regs[a_].str->data.size()));
+    regs[a_] = Value::smi(static_cast<int32_t>(regs[a_].asString()->data.size()));
   }
   pc += 1;
   TS_DISPATCH();
@@ -1332,7 +1332,7 @@ L_CharCodeAt : {
     if (!regs[b_].isString()) {
       TS_RAISE(typeError("CharCodeAt operand is not a string"));
     }
-    const std::u16string& str = regs[b_].str->data;
+    const std::u16string& str = regs[b_].asString()->data;
     Value idxVal;
     TS_GET(toNumberValue(regs[c_]), idxVal);
     double d = idxVal.asDouble();

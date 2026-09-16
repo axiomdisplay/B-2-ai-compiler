@@ -78,7 +78,7 @@ int main() {
     regs[0] = ts::Value::smi(2);
     regs[1] = ts::Value::smi(3);
     ts::JsResult<ts::Value> r = isolate.enterAt(closure, 0, regs);
-    check(r && r->i32 == 50, "enterAt at entry pc computes (2+3)*10 = 50");
+    check(r && r->asSmi() == 50, "enterAt at entry pc computes (2+3)*10 = 50");
   }
 
   // 2. Mid-frame entry at pc 3 (Mul): a deoptimizer hands back the exact
@@ -89,7 +89,7 @@ int main() {
     regs[0] = ts::Value::smi(5);   // a + b, already computed
     regs[2] = ts::Value::smi(10);  // constant, already loaded
     ts::JsResult<ts::Value> r = isolate.enterAt(closure, 3, regs);
-    check(r && r->i32 == 50, "enterAt at Mul pc reconstructs registers -> 50");
+    check(r && r->asSmi() == 50, "enterAt at Mul pc reconstructs registers -> 50");
   }
 
   // 3. Non-boundary pc (2 is LoadConst's suffix word) is rejected (Rule 105).
