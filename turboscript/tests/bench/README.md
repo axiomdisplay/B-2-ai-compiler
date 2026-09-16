@@ -2,7 +2,7 @@
 
 Seven kernels, each shipped twice: TSBC assembly (`.tsbc`) for TurboScript
 Tier 0 and JS (`.js`) for the comparison engines. Results and analysis:
-`../../docs/benchmarks_v0.5.md` (current), history: `benchmarks_v0.2/v0.3/v0.4.md`.
+`../../docs/benchmarks_v0.6.md` (current), history: `benchmarks_v0.2/v0.3/v0.4/v0.5.md`.
 
 ## Run
 

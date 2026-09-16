@@ -362,6 +362,41 @@ std::u16string BigInt::toString() const {
 }
 
 // ---------------------------------------------------------------------------
+// StringObj::flat — in-place materialization of cons nodes (v0.6).
+// Iterative DFS with an explicit stack: `s += piece` loops build left-
+// leaning trees of depth == iteration count, so a recursive flatten would
+// overflow the machine stack long before kMaxCallDepth matters. After this
+// runs, the node is flat (kind == kFlat, links nulled) and every other node
+// that referenced it observes the materialized text — flattening is a
+// representation change with zero semantic surface (Rule 96).
+// ---------------------------------------------------------------------------
+const std::u16string& StringObj::flat() const {
+  if (kind == kFlat) return data;
+  StringObj* self = const_cast<StringObj*>(this);
+  std::u16string out;
+  out.reserve(length);
+  std::vector<const StringObj*> stack;
+  stack.reserve(16);
+  stack.push_back(self);
+  while (!stack.empty()) {
+    const StringObj* n = stack.back();
+    stack.pop_back();
+    if (n->kind == kFlat) {
+      out.append(n->data);
+    } else {
+      // Push right first so the left subtree materializes first (text order).
+      stack.push_back(n->right);
+      stack.push_back(n->left);
+    }
+  }
+  self->left = nullptr;
+  self->right = nullptr;
+  self->kind = kFlat;
+  self->data = std::move(out);
+  return self->data;
+}
+
+// ---------------------------------------------------------------------------
 // Pure value helpers.
 // ---------------------------------------------------------------------------
 namespace pure {
@@ -379,7 +414,8 @@ bool toBoolean(const Value& v) {
       // NaN != 0.0 is true -> NaN is truthy (Boolean(NaN) === true, Part 0).
       return v.asDouble() != 0.0;
     case ValueKind::String:
-      return !v.asString()->data.empty();
+      // v0.6: header length — emptiness never flattens a cons node.
+      return v.asString()->length != 0;
     case ValueKind::BigInt:
       return !v.asBigInt()->isZero();
     case ValueKind::Object:
@@ -648,8 +684,10 @@ bool strictEquals(const Value& a, const Value& b) {
     case ValueKind::String: {
       const StringObj* x = a.asString();
       const StringObj* y = b.asString();
-      if (x->data.size() != y->data.size()) return false;
-      return std::equal(x->data.begin(), x->data.end(), y->data.begin());
+      // v0.6: header-length early-out first (cons nodes flatten only when
+      // their lengths actually match).
+      if (x->length != y->length) return false;
+      return x->flat() == y->flat();
     }
     case ValueKind::BigInt: {
       const BigInt* x = a.asBigInt();
@@ -692,12 +730,16 @@ bool sameValueZero(const Value& a, const Value& b) {
 }
 
 int compareStrings(const StringObj& a, const StringObj& b) {
-  size_t n = std::min(a.data.size(), b.data.size());
+  // v0.6: materialize both operands (in place; repeated comparisons of the
+  // same nodes stay O(1) after the first). Code-unit-wise order unchanged.
+  const std::u16string& x = a.flat();
+  const std::u16string& y = b.flat();
+  size_t n = std::min(x.size(), y.size());
   for (size_t i = 0; i < n; i++) {
-    if (a.data[i] != b.data[i]) return a.data[i] < b.data[i] ? -1 : 1;
+    if (x[i] != y[i]) return x[i] < y[i] ? -1 : 1;
   }
-  if (a.data.size() == b.data.size()) return 0;
-  return a.data.size() < b.data.size() ? -1 : 1;
+  if (x.size() == y.size()) return 0;
+  return x.size() < y.size() ? -1 : 1;
 }
 
 bool doubleIsIntegral(double v) {

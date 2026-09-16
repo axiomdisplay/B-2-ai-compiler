@@ -1,5 +1,10 @@
 # TurboScript Tier 0 — Interpreter-Only Benchmark Results (v0.5)
 
+> **SUPERSEDED by `benchmarks_v0.6.md`** (2026-09-16): register items #1
+> (bump-allocated objects + Object shrink) and #2 (cons-strings) closed
+> there; Section 5 items re-scoped in the v0.6 register. Kept as the v0.5
+> history (Rule 64: docs are the durable record).
+
 **Status:** v0.5 — 64-bit NaN-boxed Value milestone (register item #1 closed;
 call-path prologue + slot-growth work from item #2)
 **Owner:** TurboScript Interp Team

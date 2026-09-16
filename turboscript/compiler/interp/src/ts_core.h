@@ -38,6 +38,10 @@ constexpr uint32_t kMaxGlobalNames = 1u << 24;
 constexpr uint32_t kOpcodeSpace = 256;
 constexpr uint32_t kMaxCallDepth = 2048;         // Rule 90 recursion limit.
 constexpr uint32_t kMaxStringCodeUnits = 1u << 26;  // 64M UTF-16 units.
+// v0.6: concatenations shorter than this build flat eagerly (cons-node
+// overhead is not worth it for tiny results — same discipline as the
+// reference engines). Representation-only: text/length are identical.
+constexpr uint32_t kMinConsLength = 13;
 constexpr uint32_t kMaxBigIntBits = 1u << 20;    // 1Mbit BigInt magnitude.
 constexpr uint32_t kMaxModuleCodeWords = 1u << 26;
 constexpr uint32_t kMaxHandlerTable = 1u << 16;

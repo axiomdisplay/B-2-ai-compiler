@@ -1,6 +1,6 @@
 # TurboScript Tier 0 Interpreter Contract
 
-**Status:** Draft v0.5
+**Status:** Draft v0.6
 **Owner:** TurboScript Interp Team
 **Last Updated:** 2026-09-16
 **Governing Laws:** `docs/laws/turboscript_compiler_laws.md`
@@ -78,6 +78,10 @@ frame reconstruction stays a plain memcpy). Normative encoding:
 - Why: every register read/write, slot load and Mov moves 8 bytes instead
   of 16 — the dominant structural term measured in benchmarks_v0.4.md
   Section 3 (closed: geomean 0.49x -> 0.65x vs Ignition, benchmarks_v0.5.md).
+- v0.6 address-stability note: pointer payloads target the Heap's stable
+  storage — `BumpArena<Object>` for objects, deques for the rest
+  (Section 3.0.2). The "deque-backed" phrasing above now reads
+  "arena/deque-backed"; the contract (never-moving addresses) is unchanged.
 
 ### 3.0.1 Call-path structure (v0.5)
 
@@ -89,8 +93,64 @@ frame reconstruction stays a plain memcpy). Normative encoding:
   branch. The runtime `recordFeedback_` toggle stays live (Rule 124).
 - `frameStack_` is pre-reserved to `kMaxCallDepth` (Rule 90 bound).
 - Slot vectors grow with `kMinSlotCapacity` floor (geometric reserve at
-  transition pushes). Storage-only: `slotCount` is shape-driven and all
+  transition pushes; v0.6: the floor is shared by the dispatch transition-IC
+  lane AND the `defineProperty` slow path — both push fresh slots).
+  Storage-only: `slotCount` is shape-driven and all
   IC/lookup paths read shape->slotCount, never capacity (Rule 96).
+
+### 3.0.2 Heap representation (v0.6, normative)
+
+- **Objects live in `BumpArena<Object>`** (ts_object.h): segment-chained
+  bump allocation, `kPerSegment = 256` objects per segment, placement-new
+  construction, addresses stable for the Isolate lifetime. Nothing is
+  ever collected (bytecode_spec.md Section 11 divergence unchanged) — the
+  arena is a drop-in for the deque it replaced, with O(1) non-allocating
+  allocation. Segment storage is `max_align_t`-aligned (pinned by
+  `static_assert` in `BumpArena`).
+- **`Object` layout:** shape pointer, prototype value, slot vector,
+  extensibility flag, array state (kind/length/dense elements) and an
+  OUT-OF-LINE sparse map (`unique_ptr<std::map>`; `sparseMap()` reads a
+  shared empty map when unallocated, `ensureSparse()` allocates on first
+  write). Plain objects never allocate the sparse map; arrays allocate it
+  only for indices >= `kMaxDenseElements`. Result: ~136 -> ~80 bytes per
+  object (benchmarks_v0.6.md Section 1 #1).
+- **Strings have two representations** (`StringObj::Kind`):
+  `kFlat` (materialized UTF-16 payload, `data.size() == length`) and
+  `kCons` (concat node: `left`/`right` operands, both non-null, non-owning;
+  Heap-owned like every node). Invariants:
+  - `length` is the UTF-16 code-unit count for BOTH kinds, maintained at
+    construction; length/emptiness/bounds checks read the header and never
+    materialize.
+  - `flat()` materializes IN PLACE: the node becomes `kFlat`, keeps its
+    identity/address, and every other node referencing it observes the
+    materialized text. Iterative (explicit stack) — concat loops build
+    left-leaning trees of depth == iteration count.
+  - `Heap::makeCons(l, r)` builds a node without copying; results shorter
+    than `kMinConsLength` (13) build flat eagerly; combined length above
+    `kMaxStringCodeUnits` returns nullptr and call sites raise a JS
+    RangeError (Rule 74; previously a latent native `std::length_error`
+    abort path under -fno-exceptions — now a semantic exception).
+  - A cons node interns its key symbol only after its first flattening
+    (key text must be canonical); `cachedSymbol` semantics are unchanged.
+  - Representation is unobservable (Rule 96): every text consumer funnels
+    through `flat()`; the corpus pins text equality across the whole
+    string/property surface on both dispatch paths.
+- **Transition-IC accessor epoch (v0.6):** `Isolate::accessorEpoch_`
+  (u64) is bumped on every accessor definition (`defineProperty` with
+  IsAccessor, `definePropertyDescriptor` accessor paths — replace-in-place
+  and fresh-slot). A transition-IC hit re-validates the no-accessor claim
+  with `fs->icEpoch == accessorEpoch_` (one load+compare) instead of a
+  prototype-chain walk. The epoch guard is strictly more conservative than
+  the walk: ANY accessor add anywhere retires EVERY transition IC until a
+  re-install re-proves the claim through the real slow path. Ordinary-
+  object [[Prototype]] swaps do not exist in the v0.1 ISA
+  (bytecode_spec.md Section 11), so accessor definition is the only
+  invalidation trigger; if a proto-swap opcode ever lands, its handler MUST
+  bump `accessorEpoch_` (pinned in ts_interpreter.h, Rule 81 discipline).
+- **FeedbackSlot field order** is hot -> cold (kind + IC fields + binary
+  histogram + branch counters first; transition-IC shapes + epoch last).
+  Feedback layout is internal (no observable surface); the order exists so
+  each opcode family's hot fields share the first cache line.
 
 - Tagged values: Undefined, Null, Boolean, Smi (int32), HeapNumber (double),
   String (UTF-16), Object (incl. arrays), BigInt, **Symbol (v0.3)**,

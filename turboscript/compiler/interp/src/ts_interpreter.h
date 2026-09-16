@@ -17,13 +17,13 @@
 namespace ts {
 
 // Feedback slot (bytecode_spec.md Section 8). Saturating counters (Rule 114).
+// v0.6 layout: fields are ordered hot -> cold (Rule 23 discipline for data
+// layout) so that each opcode family's hot fields share the first cache
+// line: binary ops touch kind+classCounts, property ops kind+icShape/icSlot,
+// branches kind+takenCount. The transition-IC shapes + epoch (touched only
+// on fresh-property stores) live at the tail.
 struct FeedbackSlot {
   FeedbackKind kind = FeedbackKind::Binary;
-  // Property: distinct shapes seen (<= kMegamorphicThreshold), then mega.
-  uint32_t shapeIds[kMegamorphicThreshold] = {0, 0, 0, 0};
-  uint32_t shapeCounts[kMegamorphicThreshold] = {0, 0, 0, 0};
-  uint32_t distinctShapes = 0;
-  uint32_t propertyHits = 0;
   // Monomorphic IC (v0.3, bytecode_spec.md 8.1): valid when icShape is a
   // concrete shape id (shape ids start at 1; 0 = no IC installed) and the
   // receiver's shape id matches. icSlot indexes holder->slots; icAttrs is
@@ -31,24 +31,34 @@ struct FeedbackSlot {
   uint32_t icShape = 0;
   uint32_t icSlot = 0;
   uint8_t icAttrs = 0;
-  // Shape-transition IC (v0.3, store sites): when the receiver's shape is
-  // exactly icTransFrom and the key matches, the store is a fresh own
-  // property whose transition result is icTransTo (verified when installed:
-  // no accessor anywhere on the prototype chain claims the key). Shape
-  // pointers are stable (deque-backed, ts_object.h).
-  Shape* icTransFrom = nullptr;
-  Shape* icTransTo = nullptr;
-  uint32_t icTransKey = 0;  // SymbolId of the transition key
   // Binary: per-class histogram (left and right operands both counted).
   uint32_t classCounts[8] = {0, 0, 0, 0, 0, 0, 0, 0};
   // Branch.
   uint32_t takenCount = 0;
   uint32_t notTakenCount = 0;
+  // Property: distinct shapes seen (<= kMegamorphicThreshold), then mega.
+  uint32_t shapeIds[kMegamorphicThreshold] = {0, 0, 0, 0};
+  uint32_t shapeCounts[kMegamorphicThreshold] = {0, 0, 0, 0};
+  uint32_t distinctShapes = 0;
+  uint32_t propertyHits = 0;
   // Call: ring of callee function indices (-1 = non-TS callee).
   int32_t callees[kCallProfileRing] = {-1, -1, -1, -1};
   uint32_t calleeCounts[kCallProfileRing] = {0, 0, 0, 0};
   uint32_t unknownCallees = 0;
   uint32_t callCount = 0;
+  // Shape-transition IC (v0.3, store sites): when the receiver's shape is
+  // exactly icTransFrom and the key matches, the store is a fresh own
+  // property whose transition result is icTransTo (verified when installed:
+  // no accessor anywhere on the prototype chain claims the key). Shape
+  // pointers are stable (v0.6 bump arena / deque-backed, ts_object.h).
+  // v0.6 guard (accessorEpoch_): the no-accessor claim is re-validated per
+  // hit with one u64 compare instead of a prototype-chain walk; any accessor
+  // definition anywhere bumps the epoch and conservatively retires every
+  // transition IC until re-installation re-proves the semantics.
+  Shape* icTransFrom = nullptr;
+  Shape* icTransTo = nullptr;
+  uint32_t icTransKey = 0;  // SymbolId of the transition key
+  uint64_t icEpoch = 0;     // accessorEpoch_ snapshot at install time
 };
 
 // Value class buckets for binary-op histograms.
@@ -400,6 +410,13 @@ class Isolate {
 
   std::vector<Frame*> frameStack_;  // for stack traces (Rule 75)
   uint32_t callDepth_ = 0;
+  // v0.6: bumped on every accessor definition (defineProperty /
+  // definePropertyDescriptor). Transition-IC hits compare their installed
+  // icEpoch against this — an O(1) replacement for per-hit chainHasAccessor
+  // walks (which stay at install-verification sites). Conservative: ANY
+  // accessor add retires ALL transition ICs; accessors are rare, so the
+  // steady-state cost is one load+compare per transition-IC hit.
+  uint64_t accessorEpoch_ = 0;
   // v0.4 (benchmarks_v0.3.md Section 5 #2): freed frame register files,
   // reused LIFO by callClosure to avoid a heap allocation per call.
   std::vector<std::vector<Value>> regPool_;

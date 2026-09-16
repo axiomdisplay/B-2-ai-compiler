@@ -64,17 +64,11 @@ inline bool tsQuickTruthy(const Value& v) {
   }
 }
 
-// String concatenation backend for the L_StringConcat fast lane: one exact
-// allocation, both operands appended (kept out of the handler so handler
-// scopes stay trivially destructible across computed-goto targets).
-inline StringObj* tsConcatStrings(const StringObj* l, const StringObj* r,
-                                  Heap& heap) {
-  std::u16string out;
-  out.reserve(l->data.size() + r->data.size());
-  out.append(l->data);
-  out.append(r->data);
-  return heap.makeString(std::move(out));
-}
+// String concatenation backend (v0.6): Heap::makeCons builds a lazily-
+// flattened cons node (or flat for short results); text materializes only
+// when a consumer reads it. Kept in the Heap (allocation + RangeError
+// signaling belongs there, Rule 74); call sites convert nullptr to the
+// exception.
 
 JsResult<Value> Isolate::enterAt(const Closure* closure, uint32_t pc,
                                  const std::vector<Value>& registers) {
@@ -415,11 +409,16 @@ L_SetProperty : {
       }
       // Transition IC (v0.3): fresh own property on a known prior shape.
       // Guards re-verified per hit (Rule 81: proto mutation must not be
-      // observed through a stale IC): extensibility + no chain accessor.
+      // observed through a stale IC). v0.6: the no-accessor claim is a
+      // single epoch compare (any accessor definition bumps accessorEpoch_
+      // and retires the IC until re-install re-proves it) — replacing the
+      // per-hit prototype-chain walk, which had dominated transition-heavy
+      // kernels (benchmarks_v0.5.md Section 3 #1).
       if (fs != nullptr && fs->icTransTo != nullptr &&
           obj->shape == fs->icTransFrom && keySym == fs->icTransKey &&
-          obj->extensible && !chainHasAccessor(obj, keySym)) {
+          obj->extensible && fs->icEpoch == accessorEpoch_) {
         obj->shape = fs->icTransTo;
+        reserveForSlotPush(obj->slots);  // v0.6: shared growth floor
         obj->slots.push_back(regs[c_]);
         pc += 2;
         TS_DISPATCH();
@@ -439,6 +438,7 @@ L_SetProperty : {
         fs->icTransFrom = beforeShape;
         fs->icTransTo = obj->shape;
         fs->icTransKey = keySym;
+        fs->icEpoch = accessorEpoch_;
       }
     }
   }
@@ -1298,19 +1298,22 @@ L_ToPrimitive : {
 L_StringConcat : {
   TS_FIELDS();
   {
-    // v0.4: both-strings fast lane (no conversion, single exact allocation).
+    // v0.4: both-strings fast lane (no conversion); v0.6: cons node (no
+    // copy, no flatten — text materializes on first consumer read).
+    StringObj* out = nullptr;
     if (regs[a_].isString() && regs[b_].isString()) {
-      regs[a_] = Value::string(
-          tsConcatStrings(regs[a_].asString(), regs[b_].asString(), heap_));
-      pc += 1;
-      TS_DISPATCH();
+      out = heap_.makeCons(regs[a_].asString(), regs[b_].asString());
+    } else {
+      Value ls;
+      TS_GET(toStringValue(regs[a_]), ls);
+      Value rs;
+      TS_GET(toStringValue(regs[b_]), rs);
+      out = heap_.makeCons(ls.asString(), rs.asString());
     }
-    Value ls;
-    TS_GET(toStringValue(regs[a_]), ls);
-    Value rs;
-    TS_GET(toStringValue(regs[b_]), rs);
-    regs[a_] =
-        Value::string(heap_.makeString(ls.asString()->data + rs.asString()->data));
+    if (out == nullptr) {
+      TS_RAISE(rangeError("Invalid string length"));
+    }
+    regs[a_] = Value::string(out);
   }
   pc += 1;
   TS_DISPATCH();
@@ -1321,7 +1324,8 @@ L_StringLength : {
     if (!regs[a_].isString()) {
       TS_RAISE(typeError("StringLength operand is not a string"));
     }
-    regs[a_] = Value::smi(static_cast<int32_t>(regs[a_].asString()->data.size()));
+    // v0.6: header length — O(1) for cons nodes, no flattening.
+    regs[a_] = Value::smi(static_cast<int32_t>(regs[a_].asString()->length));
   }
   pc += 1;
   TS_DISPATCH();
@@ -1332,7 +1336,7 @@ L_CharCodeAt : {
     if (!regs[b_].isString()) {
       TS_RAISE(typeError("CharCodeAt operand is not a string"));
     }
-    const std::u16string& str = regs[b_].asString()->data;
+    const StringObj* sobj = regs[b_].asString();
     Value idxVal;
     TS_GET(toNumberValue(regs[c_]), idxVal);
     double d = idxVal.asDouble();
@@ -1344,10 +1348,13 @@ L_CharCodeAt : {
     } else {
       idx = static_cast<int64_t>(std::trunc(d));
     }
-    if (idx < 0 || idx >= static_cast<int64_t>(str.size())) {
+    // v0.6: bounds check against the header length first — a cons node
+    // flattens only when the index is actually in range.
+    if (idx < 0 || idx >= static_cast<int64_t>(sobj->length)) {
       regs[a_] =
           Value::heapNumber(std::numeric_limits<double>::quiet_NaN());
     } else {
+      const std::u16string& str = sobj->flat();
       regs[a_] = Value::smi(static_cast<int32_t>(
           static_cast<uint16_t>(str[static_cast<size_t>(idx)])));
     }

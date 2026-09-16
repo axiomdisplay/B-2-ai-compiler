@@ -53,13 +53,46 @@ struct BigInt {
 
 // ---------------------------------------------------------------------------
 // String — UTF-16 code units (Rule: StringLength counts UTF-16 code units).
+// Two representations (v0.6, benchmarks_v0.5.md register #2):
+//   kFlat — materialized UTF-16 payload in `data`.
+//   kCons — a concat node (`left`/`right` operands, both non-null, non-
+//           owning: every node is owned by the Heap). Text materializes
+//           lazily via `flat()`, which flattens IN PLACE (the node becomes
+//           flat and keeps its identity/address — values are shared, so
+//           in-place mutation is required, exactly like cachedSymbol).
+// `length` is the UTF-16 code-unit count for BOTH kinds, maintained at
+// construction: length/emptiness checks never flatten. Every node's
+// invariant: flat <=> kind==kFlat <=> (left==nullptr && right==nullptr) and
+// data.size() == length.
 // cachedSymbol (v0.3): the interned property-key SymbolId of this exact
-// string, after its first use as a key (kInvalidSymbol until then). Const-
-// pool strings are shared, so one intern per literal serves every site.
+// string, after its first use as a key (kInvalidSymbol until then). A cons
+// node interns only after its first flattening (key text must be canonical).
+// Const-pool strings are shared, so one intern per literal serves every site.
 // ---------------------------------------------------------------------------
 struct StringObj {
-  std::u16string data;
+  enum Kind : uint8_t { kFlat = 0, kCons = 1 };
+  Kind kind = kFlat;
   mutable SymbolId cachedSymbol = kInvalidSymbol;
+  uint32_t length = 0;  // UTF-16 code units (both kinds)
+  // Flat payload (kind == kFlat).
+  std::u16string data;
+  // Cons operands (kind == kCons); non-owning pointers into the Heap.
+  StringObj* left = nullptr;
+  StringObj* right = nullptr;
+
+  StringObj() = default;
+  explicit StringObj(std::u16string d)
+      : length(static_cast<uint32_t>(d.size())), data(std::move(d)) {}
+  StringObj(Kind k, StringObj* l, StringObj* r, uint32_t combinedLength)
+      : kind(k), length(combinedLength), left(l), right(r) {}
+
+  // Materialize in place: a cons node (or any node reached from it) becomes
+  // flat with the exact concatenated text. Iterative (explicit stack):
+  // concat loops build left-leaning trees of depth == iteration count, so
+  // recursion would overflow the machine stack (Rule 90 discipline for
+  // unbounded input depth). Returns the (now) flat payload.
+  [[nodiscard]] const std::u16string& flat() const;
+  [[nodiscard]] bool isCons() const { return kind == kCons; }
 };
 
 // ---------------------------------------------------------------------------

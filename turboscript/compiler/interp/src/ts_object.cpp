@@ -14,6 +14,16 @@ Object* objectOfValue(const Value& v) {
   return nullptr;
 }
 
+const std::map<uint32_t, Value>& Object::sparseMap() const {
+  static const std::map<uint32_t, Value> kEmpty;  // read-only shared empty
+  return sparse != nullptr ? *sparse : kEmpty;
+}
+
+std::map<uint32_t, Value>& Object::ensureSparse() {
+  if (sparse == nullptr) sparse = std::make_unique<std::map<uint32_t, Value>>();
+  return *sparse;
+}
+
 int32_t Object::findOwnSlot(SymbolId key) const {
   Shape* s = shape;
   while (s != nullptr) {

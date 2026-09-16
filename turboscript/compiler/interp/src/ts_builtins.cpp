@@ -44,7 +44,7 @@ JsResult<Object*> requireArray(Isolate& iso, Value thisVal, const char* who) {
 // widening is the caller's duty via Isolate::widenElementsFor).
 void appendElement(Object* arr, uint32_t idx, const Value& v) {
   if (idx >= kMaxDenseElements) {
-    arr->sparse[idx] = v;
+    arr->ensureSparse()[idx] = v;
     arr->elementsKind = ElementsKind::HoleyTagged;
     if (arr->length <= idx) arr->length = idx + 1;
     return;
@@ -71,7 +71,7 @@ Object* newArrayObject(Isolate& iso) {
 [[nodiscard]] JsResult<std::u16string> toStr(Isolate& iso, const Value& v) {
   JsResult<Value> s = iso.toStringValue(v);
   if (!s) return std::unexpected(s.error());
-  return s->asString()->data;
+  return s->asString()->flat();
 }
 
 }  // namespace
@@ -146,7 +146,7 @@ JsResult<Value> builtinArrayPop(Isolate& iso, Value thisVal, const Value*,
     arr->elements[idx] = Value::hole();
     arr->elementsKind = holeyOf(arr->elementsKind);
   } else {
-    arr->sparse.erase(idx);
+    arr->ensureSparse().erase(idx);
   }
   arr->length = idx;
   return v.isHole() ? Value::undefined() : v;
@@ -162,12 +162,12 @@ JsResult<Value> builtinArrayShift(Isolate& iso, Value thisVal, const Value*,
   if (!arr->elements.empty()) {
     arr->elements.erase(arr->elements.begin());
   }
-  if (!arr->sparse.empty()) {
+  if (!arr->sparseMap().empty()) {
     std::map<uint32_t, Value> shifted;
-    for (const auto& kv : arr->sparse) {
+    for (const auto& kv : arr->sparseMap()) {
       if (kv.first > 0 && kv.first < arr->length) shifted[kv.first - 1] = kv.second;
     }
-    arr->sparse = std::move(shifted);
+    arr->ensureSparse() = std::move(shifted);
   }
   arr->length -= 1;
   return first.isHole() ? Value::undefined() : first;
@@ -189,10 +189,10 @@ JsResult<Value> builtinArrayUnshift(Isolate& iso, Value thisVal,
     arr->elements.resize(argc, Value::hole());
     for (uint32_t i = 0; i < argc; i++) arr->elements[i] = args[i];
   }
-  if (!arr->sparse.empty() && argc > 0) {
+  if (!arr->sparseMap().empty() && argc > 0) {
     std::map<uint32_t, Value> shifted;
-    for (const auto& kv : arr->sparse) shifted[kv.first + argc] = kv.second;
-    arr->sparse = std::move(shifted);
+    for (const auto& kv : arr->sparseMap()) shifted[kv.first + argc] = kv.second;
+    arr->ensureSparse() = std::move(shifted);
   }
   arr->length += argc;
   return iso.arrayLengthValue(arr);
@@ -707,7 +707,7 @@ JsResult<Value> builtinSymbolCtor(Isolate& iso, Value thisVal,
   if (argc >= 1 && !args[0].isUndefined()) {
     JsResult<Value> s = iso.toStringValue(args[0]);
     if (!s) return std::unexpected(s.error());
-    desc = s->asString()->data;
+    desc = s->asString()->flat();
   }
   return iso.makeSymbolValue(std::move(desc));
 }
@@ -718,7 +718,7 @@ JsResult<Value> builtinSymbolFor(Isolate& iso, Value thisVal,
   if (argc < 1) return iso.makeSymbolValue(u"");
   JsResult<Value> s = iso.toStringValue(args[0]);
   if (!s) return std::unexpected(s.error());
-  std::u16string key = s->asString()->data;
+  std::u16string key = s->asString()->flat();
   if (SymbolObj* existing = iso.symbolForRegistry(key)) {
     return Value::raw(ValueKind::Symbol, existing);
   }
