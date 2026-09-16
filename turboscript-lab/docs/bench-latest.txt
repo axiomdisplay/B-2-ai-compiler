@@ -1,0 +1,7 @@
+bench               ts T0   Ignition    QuickJS   ts vs Ignition | ts vs QJS
+------------------------------------------------------------------------------
+fib                86.4ms     82.5ms     54.5ms     0.95x faster |   0.63x faster
+nbody             306.3ms    236.1ms    163.8ms     0.77x faster |   0.53x faster
+binarytrees      1125.8ms    542.8ms   1401.2ms     0.48x faster |   1.24x faster
+bubble            485.8ms    234.7ms    242.9ms     0.48x faster |   0.50x faster
+properties        442.9ms    240.2ms    338.6ms     0.54x faster |   0.76x faster
