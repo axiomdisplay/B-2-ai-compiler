@@ -1166,7 +1166,28 @@ bool lowerGraph(LowerState& s) {
     }
     if (ifFalse != ir::kInvalidNodeId) {
       auto lab=s.labelOf.find(ifFalse); s.em.patchRel32(patchOff, lab!=s.labelOf.end()?lab->second:s.normalEpilogue);
-    } else { s.em.patchRel32(patchOff, s.normalEpilogue); }
+    } else {
+      // WHY: IfFalse is dead (SCCP folded the branch). Check the If's
+      // condition: if it's ConstantI 0 (always false), the je IS taken
+      // → jump to the epilogue (the IfTrue branch is dead code). If it's
+      // ConstantI 1 (always true), the je is NOT taken → patch to the
+      // next instruction (no-op, fall through to the code after the If).
+      const ir::Node& ifNd = s.g.node(ifNode);
+      bool alwaysTrue = false;
+      if (ifNd.numInputs >= 2) {
+        ir::NodeId cond = s.g.input(ifNode, 1);
+        if (cond < s.g.nodeCount() && !s.g.node(cond).isDead() &&
+            s.g.node(cond).kind == K::ConstantI &&
+            s.g.node(cond).constValue != 0) {
+          alwaysTrue = true;
+        }
+      }
+      if (alwaysTrue) {
+        s.em.patchRel32(patchOff, patchOff + 4);
+      } else {
+        s.em.patchRel32(patchOff, s.normalEpilogue);
+      }
+    }
   }
   for (auto& [patchOff, loopEnd] : s.pendingBackedge) {
     ir::NodeId loopBegin = ir::kInvalidNodeId;
